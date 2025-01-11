@@ -22,6 +22,18 @@ func main() {
 			log.Fatal("Erreur d'acceptation de connexion:", err)
 		}
 
-		go communication.HandleConnection(conn)
+		go handleConnection(conn)
 	}
+}
+
+func handleConnection(conn net.Conn) {
+	defer conn.Close()
+
+	sharedKey, err := communication.PerformKeyExchange(conn)
+	if err != nil {
+		fmt.Println("Erreur d'échange de clés:", err)
+		return
+	}
+
+	fmt.Println("Clé partagée générée:", sharedKey)
 }

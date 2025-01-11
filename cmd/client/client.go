@@ -27,7 +27,16 @@ func main() {
 	}
 	defer conn.Close()
 
-	err = communication.SendMessage(conn, *message)
+	sharedKey, err := communication.PerformKeyExchange(conn)
+	if err != nil {
+		log.Fatal("Erreur d'échange de clés:", err)
+	}
+
+	sharedKeySlice := sharedKey[:]
+
+	fmt.Println("Clé partagée générée:", sharedKeySlice)
+
+	err = communication.SendMessage(conn, *message, sharedKeySlice)
 	if err != nil {
 		log.Fatal("Erreur d'envoi de message:", err)
 	}
