@@ -16,8 +16,9 @@ var (
 	mu             sync.Mutex
 )
 
+// SendMessage envoie un message sécurisé via TCP
 func SendMessage(conn net.Conn, message string, sharedKey []byte, sequenceNumber uint64) error {
-	timestamp := time.Now().Unix() // Horodatage du message
+	timestamp := time.Now().Unix()
 	formattedMessage := fmt.Sprintf("%d|%d|%s", sequenceNumber, timestamp, message)
 
 	encryptedMessage, err := EncryptAESGCM([]byte(formattedMessage), sharedKey)
@@ -35,6 +36,7 @@ func SendMessage(conn net.Conn, message string, sharedKey []byte, sequenceNumber
 	return nil
 }
 
+// ReceiveMessage reçoit et valide un message sécurisé via TCP
 func ReceiveMessage(conn net.Conn, sharedKey []byte) (string, error) {
 	buffer := make([]byte, 4096)
 	n, err := conn.Read(buffer)
@@ -61,7 +63,12 @@ func ReceiveMessage(conn net.Conn, sharedKey []byte) (string, error) {
 		return "", fmt.Errorf("erreur de déchiffrement: %v", err)
 	}
 
-	messageParts := strings.SplitN(string(decryptedMessage), "|", 3)
+	return validateAndStoreMessage(decryptedMessage)
+}
+
+// Fonction privée pour valider et stocker les messages en fonction de l'horodatage
+func validateAndStoreMessage(message []byte) (string, error) {
+	messageParts := strings.SplitN(string(message), "|", 3)
 	if len(messageParts) != 3 {
 		return "", fmt.Errorf("format du message incorrect")
 	}
@@ -82,6 +89,7 @@ func ReceiveMessage(conn net.Conn, sharedKey []byte) (string, error) {
 	return messageContent, nil
 }
 
+// Vérifie si un message est un rejet en se basant sur son horodatage et son numéro de séquence
 func isReplayAttack(sequenceNumber string, timestamp int64) bool {
 	mu.Lock()
 	defer mu.Unlock()

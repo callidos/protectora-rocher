@@ -1,4 +1,4 @@
-module protocole-comm
+module protectora-rocher
 
 go 1.21
 
