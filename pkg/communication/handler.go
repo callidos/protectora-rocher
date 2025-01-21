@@ -4,12 +4,13 @@ import (
 	"bufio"
 	"fmt"
 	"net"
-	"protocole-comm/pkg/utils"
+	"protectora-rocher/pkg/utils"
 	"strings"
 )
 
+// HandleConnection gère la connexion client et traite les messages entrants.
 func HandleConnection(conn net.Conn, sharedKey []byte) {
-	defer conn.Close()
+	defer conn.Close() // Assurer que la connexion sera fermée à la fin de la fonction
 
 	utils.LogInfo("Nouvelle connexion acceptée", map[string]interface{}{
 		"remote_addr": conn.RemoteAddr().String(),
@@ -38,8 +39,17 @@ func HandleConnection(conn net.Conn, sharedKey []byte) {
 		return
 	}
 
+	messageCount := 0
+	maxMessages := 10 // Limiter à 10 messages
 	for scanner.Scan() {
 		receivedMessage := strings.TrimSpace(scanner.Text())
+		if receivedMessage == "exit" {
+			utils.LogInfo("Déconnexion demandée par l'utilisateur", map[string]interface{}{
+				"username": username,
+				"remote":   conn.RemoteAddr().String(),
+			})
+			break
+		}
 
 		err := processIncomingMessage(receivedMessage, sharedKey, conn, username)
 		if err != nil {
@@ -47,10 +57,20 @@ func HandleConnection(conn net.Conn, sharedKey []byte) {
 				"error": err.Error(),
 				"user":  username,
 			})
+			break
+		}
+
+		messageCount++
+		if messageCount >= maxMessages {
+			utils.LogInfo("Limite de messages atteinte, fermeture de la connexion", map[string]interface{}{
+				"username": username,
+				"remote":   conn.RemoteAddr().String(),
+			})
+			break
 		}
 	}
 
-	utils.LogInfo("Utilisateur déconnecté", map[string]interface{}{
+	utils.LogInfo("Fin de communication avec le client", map[string]interface{}{
 		"username": username,
 		"remote":   conn.RemoteAddr().String(),
 	})
@@ -98,6 +118,10 @@ func sendWelcomeMessage(conn net.Conn, sharedKey []byte, username string) error 
 	if err != nil {
 		return fmt.Errorf("erreur d'envoi du message de bienvenue: %v", err)
 	}
+
+	utils.LogInfo("Message de bienvenue envoyé avec succès", map[string]interface{}{
+		"username": username,
+	})
 
 	return nil
 }

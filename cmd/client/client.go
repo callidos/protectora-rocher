@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"protocole-comm/pkg/communication"
-	"protocole-comm/pkg/utils"
+	"protectora-rocher/pkg/communication"
+	"protectora-rocher/pkg/utils"
 	"strings"
 	"sync"
 )

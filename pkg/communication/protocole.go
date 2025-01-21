@@ -16,8 +16,9 @@ var (
 	mu             sync.Mutex
 )
 
+// SendMessage envoie un message sécurisé via TCP
 func SendMessage(conn net.Conn, message string, sharedKey []byte, sequenceNumber uint64) error {
-	timestamp := time.Now().Unix() // Horodatage du message
+	timestamp := time.Now().Unix()
 	formattedMessage := fmt.Sprintf("%d|%d|%s", sequenceNumber, timestamp, message)
 
 	encryptedMessage, err := EncryptAESGCM([]byte(formattedMessage), sharedKey)
@@ -35,6 +36,7 @@ func SendMessage(conn net.Conn, message string, sharedKey []byte, sequenceNumber
 	return nil
 }
 
+// ReceiveMessage reçoit et valide un message sécurisé via TCP
 func ReceiveMessage(conn net.Conn, sharedKey []byte) (string, error) {
 	buffer := make([]byte, 4096)
 	n, err := conn.Read(buffer)
@@ -61,7 +63,12 @@ func ReceiveMessage(conn net.Conn, sharedKey []byte) (string, error) {
 		return "", fmt.Errorf("erreur de déchiffrement: %v", err)
 	}
 
-	messageParts := strings.SplitN(string(decryptedMessage), "|", 3)
+	return validateAndStoreMessage(decryptedMessage)
+}
+
+// Fonction privée pour valider et stocker les messages (anti-rejeu)
+func validateAndStoreMessage(message []byte) (string, error) {
+	messageParts := strings.SplitN(string(message), "|", 3)
 	if len(messageParts) != 3 {
 		return "", fmt.Errorf("format du message incorrect")
 	}
@@ -82,21 +89,32 @@ func ReceiveMessage(conn net.Conn, sharedKey []byte) (string, error) {
 	return messageContent, nil
 }
 
+// Vérifie si un message est un rejet (replay) via son horodatage et son numéro de séquence
 func isReplayAttack(sequenceNumber string, timestamp int64) bool {
 	mu.Lock()
 	defer mu.Unlock()
 
 	currentTime := time.Now().Unix()
+	// Vérifier si le timestamp est trop vieux ou trop futur
 	if timestamp < (currentTime-int64(replayWindow.Seconds())) || timestamp > currentTime {
 		fmt.Println("Message rejeté : horodatage invalide ou expiré")
 		return true
 	}
 
+	// Vérifier si la séquence existe déjà
 	if _, exists := messageHistory[sequenceNumber]; exists {
 		fmt.Println("Message rejeté : numéro de séquence déjà utilisé")
 		return true
 	}
 
+	// Enregistrer cette séquence pour la bloquer plus tard
 	messageHistory[sequenceNumber] = time.Now()
 	return false
+}
+
+// ResetMessageHistory réinitialise l'historique des messages pour les tests.
+func ResetMessageHistory() {
+	mu.Lock()
+	defer mu.Unlock()
+	messageHistory = make(map[string]time.Time)
 }
