@@ -3,18 +3,24 @@ package communication
 import (
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
+	"sync"
+	"time"
+)
+
+const replayWindow = 5 * time.Minute
+
+var (
+	messageHistory = make(map[string]time.Time)
+	mu             sync.Mutex
 )
 
 func SendMessage(conn net.Conn, message string, sharedKey []byte, sequenceNumber uint64) error {
-	formattedMessage := fmt.Sprintf("%d|%s", sequenceNumber, message)
+	timestamp := time.Now().Unix() // Horodatage du message
+	formattedMessage := fmt.Sprintf("%d|%d|%s", sequenceNumber, timestamp, message)
 
-	compressedMessage, err := CompressData([]byte(formattedMessage))
-	if err != nil {
-		return fmt.Errorf("erreur de compression: %v", err)
-	}
-
-	encryptedMessage, err := EncryptAESGCM(compressedMessage, sharedKey)
+	encryptedMessage, err := EncryptAESGCM([]byte(formattedMessage), sharedKey)
 	if err != nil {
 		return fmt.Errorf("erreur de chiffrement: %v", err)
 	}
@@ -36,10 +42,10 @@ func ReceiveMessage(conn net.Conn, sharedKey []byte) (string, error) {
 		return "", fmt.Errorf("erreur de lecture du message: %v", err)
 	}
 
-	receivedMessage := string(buffer[:n])
+	receivedMessage := strings.TrimSpace(string(buffer[:n]))
 	parts := strings.SplitN(receivedMessage, "|", 2)
 	if len(parts) != 2 {
-		return "", fmt.Errorf("message malformé")
+		return "", fmt.Errorf("message mal formé")
 	}
 
 	encryptedMessage := parts[0]
@@ -47,7 +53,7 @@ func ReceiveMessage(conn net.Conn, sharedKey []byte) (string, error) {
 
 	expectedHMAC := GenerateHMAC(encryptedMessage, sharedKey)
 	if receivedHMAC != expectedHMAC {
-		return "", fmt.Errorf("HMAC invalide")
+		return "", fmt.Errorf("HMAC invalide, message rejeté")
 	}
 
 	decryptedMessage, err := DecryptAESGCM(encryptedMessage, sharedKey)
@@ -55,10 +61,42 @@ func ReceiveMessage(conn net.Conn, sharedKey []byte) (string, error) {
 		return "", fmt.Errorf("erreur de déchiffrement: %v", err)
 	}
 
-	uncompressedMessage, err := DecompressData(decryptedMessage)
-	if err != nil {
-		return "", fmt.Errorf("erreur de décompression: %v", err)
+	messageParts := strings.SplitN(string(decryptedMessage), "|", 3)
+	if len(messageParts) != 3 {
+		return "", fmt.Errorf("format du message incorrect")
 	}
 
-	return string(uncompressedMessage), nil
+	sequenceNumber := messageParts[0]
+	timestampStr := messageParts[1]
+	messageContent := messageParts[2]
+
+	timestamp, err := strconv.ParseInt(timestampStr, 10, 64)
+	if err != nil {
+		return "", fmt.Errorf("horodatage invalide")
+	}
+
+	if isReplayAttack(sequenceNumber, timestamp) {
+		return "", fmt.Errorf("message rejeté en raison d'une attaque par rejeu détectée")
+	}
+
+	return messageContent, nil
+}
+
+func isReplayAttack(sequenceNumber string, timestamp int64) bool {
+	mu.Lock()
+	defer mu.Unlock()
+
+	currentTime := time.Now().Unix()
+	if timestamp < (currentTime-int64(replayWindow.Seconds())) || timestamp > currentTime {
+		fmt.Println("Message rejeté : horodatage invalide ou expiré")
+		return true
+	}
+
+	if _, exists := messageHistory[sequenceNumber]; exists {
+		fmt.Println("Message rejeté : numéro de séquence déjà utilisé")
+		return true
+	}
+
+	messageHistory[sequenceNumber] = time.Now()
+	return false
 }
