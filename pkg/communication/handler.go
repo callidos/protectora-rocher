@@ -32,13 +32,13 @@ func HandleConnection(conn net.Conn) {
 	encryptedMessage := parts[0]
 	receivedHMAC := parts[1][:len(parts[1])-1]
 
-	expectedHMAC := generateHMAC(encryptedMessage, sharedKeySlice)
+	expectedHMAC := GenerateHMAC(encryptedMessage, sharedKeySlice)
 	if receivedHMAC != expectedHMAC {
 		fmt.Println("Erreur : HMAC invalide")
 		return
 	}
 
-	decryptedMessage, err := decryptAES(encryptedMessage, sharedKeySlice)
+	decryptedMessage, err := DecryptAES(encryptedMessage, sharedKeySlice)
 	if err != nil {
 		fmt.Println("Erreur de déchiffrement:", err)
 		return

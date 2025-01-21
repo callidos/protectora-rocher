@@ -32,27 +32,34 @@ func GenerateSharedKey(privateKey [curve25519.ScalarSize]byte, otherPublicKey [c
 	return sharedKey, nil
 }
 
-func PerformKeyExchange(conn net.Conn) ([curve25519.ScalarSize]byte, error) {
-	clientPrivateKey, clientPublicKey, err := GenerateKeyPair()
+func PerformKeyExchange(conn net.Conn) ([32]byte, error) {
+	privateKey := [32]byte{}
+	_, err := rand.Read(privateKey[:])
 	if err != nil {
-		return [curve25519.ScalarSize]byte{}, fmt.Errorf("erreur de génération des clés du client: %v", err)
+		return [32]byte{}, fmt.Errorf("erreur de génération de clé privée: %v", err)
 	}
 
-	_, err = conn.Write(clientPublicKey[:])
+	publicKey := [32]byte{}
+	curve25519.ScalarBaseMult(&publicKey, &privateKey)
+
+	_, err = conn.Write(publicKey[:])
 	if err != nil {
-		return [curve25519.ScalarSize]byte{}, fmt.Errorf("erreur d'envoi de la clé publique du client: %v", err)
+		return [32]byte{}, fmt.Errorf("erreur d'envoi de clé publique: %v", err)
 	}
 
-	serverPublicKey := [curve25519.PointSize]byte{}
-	_, err = conn.Read(serverPublicKey[:])
+	peerPublicKey := [32]byte{}
+	_, err = conn.Read(peerPublicKey[:])
 	if err != nil {
-		return [curve25519.ScalarSize]byte{}, fmt.Errorf("erreur de lecture de la clé publique du serveur: %v", err)
+		return [32]byte{}, fmt.Errorf("erreur de réception de clé publique: %v", err)
 	}
 
-	sharedKey, err := GenerateSharedKey(clientPrivateKey, serverPublicKey)
+	sharedKey, err := curve25519.X25519(privateKey[:], peerPublicKey[:])
 	if err != nil {
-		return [curve25519.ScalarSize]byte{}, err
+		return [32]byte{}, fmt.Errorf("erreur de génération de la clé partagée: %v", err)
 	}
 
-	return sharedKey, nil
+	var finalKey [32]byte
+	copy(finalKey[:], sharedKey)
+
+	return finalKey, nil
 }

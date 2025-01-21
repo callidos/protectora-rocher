@@ -11,7 +11,7 @@ import (
 	"io"
 )
 
-func encryptAES(plaintext []byte, key []byte) (string, error) {
+func EncryptAES(plaintext []byte, key []byte) (string, error) {
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return "", err
@@ -29,7 +29,7 @@ func encryptAES(plaintext []byte, key []byte) (string, error) {
 	return base64.StdEncoding.EncodeToString(ciphertext), nil
 }
 
-func decryptAES(ciphertext string, key []byte) ([]byte, error) {
+func DecryptAES(ciphertext string, key []byte) ([]byte, error) {
 	ciphertextBytes, err := base64.StdEncoding.DecodeString(ciphertext)
 	if err != nil {
 		return nil, err
@@ -52,7 +52,7 @@ func decryptAES(ciphertext string, key []byte) ([]byte, error) {
 	return ciphertextBytes, nil
 }
 
-func generateHMAC(message string, key []byte) string {
+func GenerateHMAC(message string, key []byte) string {
 	h := hmac.New(sha256.New, key)
 	h.Write([]byte(message))
 	return base64.StdEncoding.EncodeToString(h.Sum(nil))
