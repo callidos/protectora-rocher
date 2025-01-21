@@ -11,7 +11,6 @@ import (
 	"io"
 )
 
-// DeriveKeys extrait les clés de chiffrement et HMAC à partir d'une clé maître.
 func DeriveKeys(masterKey []byte) ([]byte, []byte) {
 	hash := sha256.Sum256(masterKey)
 	encryptionKey := hash[:16]
@@ -19,7 +18,6 @@ func DeriveKeys(masterKey []byte) ([]byte, []byte) {
 	return encryptionKey, hmacKey
 }
 
-// EncryptAESGCM chiffre les données en utilisant AES-GCM avec une clé maître.
 func EncryptAESGCM(plaintext []byte, masterKey []byte) (string, error) {
 	encryptionKey, hmacKey := DeriveKeys(masterKey)
 
@@ -50,7 +48,6 @@ func EncryptAESGCM(plaintext []byte, masterKey []byte) (string, error) {
 	return base64.StdEncoding.EncodeToString(finalMessage), nil
 }
 
-// DecryptAESGCM déchiffre les données en utilisant AES-GCM et vérifie l'intégrité via HMAC.
 func DecryptAESGCM(ciphertextBase64 string, masterKey []byte) ([]byte, error) {
 	encryptionKey, hmacKey := DeriveKeys(masterKey)
 
@@ -81,7 +78,6 @@ func DecryptAESGCM(ciphertextBase64 string, masterKey []byte) ([]byte, error) {
 		return nil, fmt.Errorf("erreur de déchiffrement: %v", err)
 	}
 
-	// Vérification de l'intégrité
 	expectedHMAC := decryptedData[:sha256.Size]
 	plaintext := decryptedData[sha256.Size:]
 
@@ -96,7 +92,6 @@ func DecryptAESGCM(ciphertextBase64 string, masterKey []byte) ([]byte, error) {
 	return plaintext, nil
 }
 
-// GenerateHMAC génère un HMAC à partir d'un message et d'une clé.
 func GenerateHMAC(message string, key []byte) string {
 	mac := hmac.New(sha256.New, key)
 	mac.Write([]byte(message))

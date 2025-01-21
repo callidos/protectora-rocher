@@ -8,9 +8,8 @@ import (
 	"strings"
 )
 
-// HandleConnection gère la connexion client et traite les messages entrants.
 func HandleConnection(conn net.Conn, sharedKey []byte) {
-	defer conn.Close() // Assurer que la connexion sera fermée à la fin de la fonction
+	defer conn.Close()
 
 	utils.LogInfo("Nouvelle connexion acceptée", map[string]interface{}{
 		"remote_addr": conn.RemoteAddr().String(),
@@ -40,7 +39,7 @@ func HandleConnection(conn net.Conn, sharedKey []byte) {
 	}
 
 	messageCount := 0
-	maxMessages := 10 // Limiter à 10 messages
+	maxMessages := 10
 	for scanner.Scan() {
 		receivedMessage := strings.TrimSpace(scanner.Text())
 		if receivedMessage == "exit" {

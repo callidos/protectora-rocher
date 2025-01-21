@@ -7,7 +7,6 @@ import (
 	"io"
 )
 
-// CompressData compresse les données en utilisant Gzip
 func CompressData(data []byte) ([]byte, error) {
 	var buffer bytes.Buffer
 	writer := gzip.NewWriter(&buffer)
@@ -22,7 +21,6 @@ func CompressData(data []byte) ([]byte, error) {
 	return buffer.Bytes(), nil
 }
 
-// DecompressData décompresse les données Gzip
 func DecompressData(data []byte) ([]byte, error) {
 	reader, err := gzip.NewReader(bytes.NewReader(data))
 	if err != nil {

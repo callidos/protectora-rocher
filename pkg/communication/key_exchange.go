@@ -19,7 +19,6 @@ var (
 	lastKeyTime time.Time
 )
 
-// GenerateEd25519KeyPair génère une paire de clés Ed25519
 func GenerateEd25519KeyPair() (ed25519.PublicKey, ed25519.PrivateKey, error) {
 	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -28,7 +27,6 @@ func GenerateEd25519KeyPair() (ed25519.PublicKey, ed25519.PrivateKey, error) {
 	return publicKey, privateKey, nil
 }
 
-// PerformAuthenticatedKeyExchange effectue un échange de clés sécurisé
 func PerformAuthenticatedKeyExchange(conn net.Conn, privateKey ed25519.PrivateKey, publicKey ed25519.PublicKey) ([32]byte, error) {
 	mutex.Lock()
 	defer mutex.Unlock()
@@ -101,7 +99,6 @@ func exchangeNewSessionKey(conn net.Conn, privateKey ed25519.PrivateKey, publicK
 	return nil
 }
 
-// ResetKeyExchangeState réinitialise l'état interne pour les tests
 func ResetKeyExchangeState() {
 	mutex.Lock()
 	defer mutex.Unlock()
