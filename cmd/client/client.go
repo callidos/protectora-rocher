@@ -19,14 +19,10 @@ func main() {
 	}
 	defer conn.Close()
 
-	log.Println("Connexion établie avec le serveur...")
-
 	sharedKey, err := communication.PerformKeyExchange(conn)
 	if err != nil {
 		log.Fatalf("Erreur d'échange de clés : %v\n", err)
 	}
-
-	log.Printf("Échange de clés réussi. Clé partagée : %x\n", sharedKey)
 
 	fmt.Print("Entrez votre nom d'utilisateur : ")
 	scanner := bufio.NewScanner(os.Stdin)
@@ -39,7 +35,6 @@ func main() {
 		message := strings.TrimSpace(scanner.Text())
 
 		if message == "exit" {
-			log.Println("Déconnexion du serveur...")
 			break
 		}
 
@@ -47,16 +42,11 @@ func main() {
 		if err != nil {
 			log.Fatalf("Erreur de chiffrement : %v\n", err)
 		}
-		log.Println("Message chiffré (base64) :", encryptedMessage)
 
 		header := fmt.Sprintf("%s: %s", username, encryptedMessage)
-		log.Println("Header construit (nom d'utilisateur + message chiffré) :", header)
-
 		hmacValue := communication.GenerateHMAC(header, sharedKey[:])
-		log.Println("HMAC généré :", hmacValue)
 
 		fullMessage := fmt.Sprintf("%s|%s", header, hmacValue)
-		log.Println("Message complet envoyé :", fullMessage)
 
 		_, err = fmt.Fprintf(conn, "%s\n", fullMessage)
 		if err != nil {

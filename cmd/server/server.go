@@ -32,45 +32,30 @@ func main() {
 func handleConnection(conn net.Conn) {
 	defer conn.Close()
 
-	log.Println("Nouvelle connexion acceptée...")
-
 	sharedKey, err := communication.PerformKeyExchange(conn)
 	if err != nil {
-		log.Println("Erreur d'échange de clés :", err)
 		return
 	}
-	log.Printf("Échange de clés réussi. Clé partagée : %x\n", sharedKey)
 
 	scanner := bufio.NewScanner(conn)
 	for scanner.Scan() {
 		fullMessage := strings.TrimSpace(scanner.Text())
 
-		log.Println("Message brut reçu :", fullMessage)
-
 		parts := strings.Split(fullMessage, "|")
 		if len(parts) != 2 {
-			log.Println("Message malformé (pas de séparateur '|' trouvé). Reçu :", fullMessage)
 			continue
 		}
 
 		header := strings.TrimSpace(parts[0])
 		receivedHMAC := strings.TrimSpace(parts[1])
 
-		log.Println("Header reçu (avant HMAC) :", header)
-		log.Println("HMAC reçu :", receivedHMAC)
-
 		expectedHMAC := communication.GenerateHMAC(header, sharedKey[:])
-		log.Println("HMAC attendu :", expectedHMAC)
-
 		if receivedHMAC != expectedHMAC {
-			log.Println("ERREUR: HMAC invalide. Le message a peut-être été altéré.")
 			continue
 		}
-		log.Println("HMAC vérifié avec succès.")
 
 		headerParts := strings.SplitN(header, ": ", 2)
 		if len(headerParts) != 2 {
-			log.Println("Format du message incorrect. Reçu :", header)
 			continue
 		}
 
@@ -79,11 +64,9 @@ func handleConnection(conn net.Conn) {
 
 		decryptedMessage, err := communication.DecryptAES(encryptedMessage, sharedKey[:])
 		if err != nil {
-			log.Println("Erreur de déchiffrement du message :", err)
 			continue
 		}
 
-		log.Printf("[%s] %s\n", username, string(decryptedMessage))
 		fmt.Printf("[%s] %s\n", username, string(decryptedMessage))
 	}
 
