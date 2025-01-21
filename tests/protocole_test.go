@@ -31,10 +31,14 @@ func TestReceiveMessage(t *testing.T) {
 	sharedKey := []byte("thisisaverysecurekey!")
 	message := "Test message"
 
-	// Simuler un message chiffré et authentifié
-	encryptedMessage, _ := communication.EncryptAESGCM([]byte("1|1700000000|"+message), sharedKey)
-	hmac := communication.GenerateHMAC(encryptedMessage, sharedKey)
-	mockConn.Buffer.WriteString(encryptedMessage + "|" + hmac + "\n")
+	// Générer un timestamp "valide" pour éviter l'erreur d'expiration
+	timestamp := time.Now().Unix()
+
+	formattedMessage := "1|" + strconv.FormatInt(timestamp, 10) + "|" + message
+	encryptedMessage, _ := communication.EncryptAESGCM([]byte(formattedMessage), sharedKey)
+	hmacVal := communication.GenerateHMAC(encryptedMessage, sharedKey)
+
+	mockConn.Buffer.WriteString(encryptedMessage + "|" + hmacVal + "\n")
 
 	receivedMessage, err := communication.ReceiveMessage(mockConn, sharedKey)
 	if err != nil {
@@ -42,29 +46,39 @@ func TestReceiveMessage(t *testing.T) {
 	}
 
 	if receivedMessage != message {
-		t.Errorf("Le message reçu ne correspond pas au message envoyé")
+		t.Errorf("Le message reçu ne correspond pas à l'original. Attendu=%q, Reçu=%q", message, receivedMessage)
 	}
 }
 
 // Test de la détection d'une attaque par rejeu
 func TestReplayAttack(t *testing.T) {
+	// On réinitialise l'historique pour éviter la pollution d'autres tests
+	communication.ResetMessageHistory()
+
 	mockConn := &MockConnection{}
 	sharedKey := []byte("thisisaverysecurekey!")
+
+	// Générer un timestamp valide
 	timestamp := time.Now().Unix()
 
-	// Convertir le timestamp correctement
+	// Construire le message (même sequenceNumber "1")
 	message := "1|" + strconv.FormatInt(timestamp, 10) + "|Replay attack test"
+
 	encryptedMessage, _ := communication.EncryptAESGCM([]byte(message), sharedKey)
-	hmac := communication.GenerateHMAC(encryptedMessage, sharedKey)
+	hmacVal := communication.GenerateHMAC(encryptedMessage, sharedKey)
 
-	mockConn.Buffer.WriteString(encryptedMessage + "|" + hmac + "\n")
-	mockConn.Buffer.WriteString(encryptedMessage + "|" + hmac + "\n")
-
+	// 1) Premier envoi : le message doit être accepté
+	mockConn.Buffer.WriteString(encryptedMessage + "|" + hmacVal + "\n")
 	_, err := communication.ReceiveMessage(mockConn, sharedKey)
 	if err != nil {
 		t.Fatalf("Erreur inattendue lors de la première réception : %v", err)
 	}
 
+	// Vider le buffer pour la deuxième réception (facultatif)
+	mockConn.Buffer.Reset()
+
+	// 2) Second envoi (même message) : le message doit être rejeté (rejeu)
+	mockConn.Buffer.WriteString(encryptedMessage + "|" + hmacVal + "\n")
 	_, err = communication.ReceiveMessage(mockConn, sharedKey)
 	if err == nil {
 		t.Errorf("Le message en double aurait dû être rejeté en tant qu'attaque par rejeu")

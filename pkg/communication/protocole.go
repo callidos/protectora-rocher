@@ -66,7 +66,7 @@ func ReceiveMessage(conn net.Conn, sharedKey []byte) (string, error) {
 	return validateAndStoreMessage(decryptedMessage)
 }
 
-// Fonction privée pour valider et stocker les messages en fonction de l'horodatage
+// Fonction privée pour valider et stocker les messages (anti-rejeu)
 func validateAndStoreMessage(message []byte) (string, error) {
 	messageParts := strings.SplitN(string(message), "|", 3)
 	if len(messageParts) != 3 {
@@ -89,22 +89,32 @@ func validateAndStoreMessage(message []byte) (string, error) {
 	return messageContent, nil
 }
 
-// Vérifie si un message est un rejet en se basant sur son horodatage et son numéro de séquence
+// Vérifie si un message est un rejet (replay) via son horodatage et son numéro de séquence
 func isReplayAttack(sequenceNumber string, timestamp int64) bool {
 	mu.Lock()
 	defer mu.Unlock()
 
 	currentTime := time.Now().Unix()
+	// Vérifier si le timestamp est trop vieux ou trop futur
 	if timestamp < (currentTime-int64(replayWindow.Seconds())) || timestamp > currentTime {
 		fmt.Println("Message rejeté : horodatage invalide ou expiré")
 		return true
 	}
 
+	// Vérifier si la séquence existe déjà
 	if _, exists := messageHistory[sequenceNumber]; exists {
 		fmt.Println("Message rejeté : numéro de séquence déjà utilisé")
 		return true
 	}
 
+	// Enregistrer cette séquence pour la bloquer plus tard
 	messageHistory[sequenceNumber] = time.Now()
 	return false
+}
+
+// ResetMessageHistory réinitialise l'historique des messages pour les tests.
+func ResetMessageHistory() {
+	mu.Lock()
+	defer mu.Unlock()
+	messageHistory = make(map[string]time.Time)
 }

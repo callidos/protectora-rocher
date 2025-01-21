@@ -20,7 +20,6 @@ func TestHandleConnection(t *testing.T) {
 	go communication.HandleConnection(mockConn, sharedKey)
 
 	// Attendre un peu avant de vérifier que le message de bienvenue a été envoyé
-	// Le délai peut être ajusté en fonction de la performance du système
 	time.Sleep(1 * time.Second)
 
 	// Vérification de la présence d'un message de bienvenue dans la sortie du buffer
@@ -33,11 +32,9 @@ func TestHandleConnection(t *testing.T) {
 		t.Fatalf("Le message reçu est mal formé : %s", output)
 	}
 
-	// Le message chiffré et l'HMAC
 	encryptedMessage := parts[0]
-	receivedHMAC := strings.TrimSpace(parts[1]) // Trimming potential spaces
+	receivedHMAC := strings.TrimSpace(parts[1]) // on enlève les espaces
 
-	// Affichage pour le débogage
 	t.Logf("Encrypted Message: %s", encryptedMessage)
 	t.Logf("Received HMAC: %s", receivedHMAC)
 
@@ -45,8 +42,7 @@ func TestHandleConnection(t *testing.T) {
 	expectedHMAC := communication.GenerateHMAC(encryptedMessage, sharedKey)
 	t.Logf("Expected HMAC: %s", expectedHMAC)
 
-	// Comparaison byte par byte des HMACs pour voir si des différences invisibles existent
-	// Removing extra spaces before comparison
+	// Comparaison stricte
 	if !bytes.Equal([]byte(strings.TrimSpace(receivedHMAC)), []byte(strings.TrimSpace(expectedHMAC))) {
 		t.Fatalf("HMAC invalide, le message est corrompu. Attendu: %s, Reçu: %s", expectedHMAC, receivedHMAC)
 	}
@@ -73,13 +69,26 @@ func TestProcessIncomingMessage(t *testing.T) {
 	mockConn := &MockConnection{}
 	sharedKey := []byte("thisisaverysecurekey!")
 
-	// Simuler un message encrypté
+	// 1) Écrire la première ligne pour simuler le username
+	mockConn.Buffer.WriteString("testuser\n")
+
+	// 2) Simuler un message chiffré
 	message := "Hello, World!"
 	encryptedMessage, _ := communication.EncryptAESGCM([]byte(message), sharedKey)
 	hmac := communication.GenerateHMAC(encryptedMessage, sharedKey)
+
+	// Le message va être la deuxième ligne, traitée comme le "receivedMessage"
 	mockConn.Buffer.WriteString(encryptedMessage + "|" + hmac + "\n")
 
+	// 3) Ajouter la commande "exit" (troisième ligne) pour clore la boucle
+	mockConn.Buffer.WriteString("exit\n")
+
+	// On lance l'handle
 	communication.HandleConnection(mockConn, sharedKey)
+
+	// Si nécessaire, on peut vérifier dans mockConn.Buffer l'ack envoyé par le serveur
+	output := mockConn.Buffer.String()
+	t.Logf("Output buffer after message processed: %s", output)
 }
 
 // Test du rejet des messages corrompus
@@ -87,8 +96,20 @@ func TestRejectCorruptedMessage(t *testing.T) {
 	mockConn := &MockConnection{}
 	sharedKey := []byte("thisisaverysecurekey!")
 
-	// Simuler un message corrompu
+	// 1) Écrire la première ligne pour simuler le username
+	mockConn.Buffer.WriteString("testuser\n")
+
+	// 2) Simuler un message corrompu
 	mockConn.Buffer.WriteString("données corrompues|mauvaisHMAC\n")
 
+	// 3) Ajouter la commande "exit"
+	mockConn.Buffer.WriteString("exit\n")
+
+	// On lance l'handle
 	communication.HandleConnection(mockConn, sharedKey)
+
+	// Ici, on ne reçoit pas la confirmation de message puisqu'il est corrompu
+	// mais on peut analyser le Buffer ou vérifier les logs si besoin.
+	output := mockConn.Buffer.String()
+	t.Logf("Output buffer for corrupted message: %s", output)
 }
