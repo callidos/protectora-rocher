@@ -22,58 +22,35 @@ func main() {
 	defer conn.Close()
 	fmt.Println("Connecté au serveur.")
 
-	sharedKey, err := communication.PerformKeyExchange(conn)
+	publicKey, privateKey, err := communication.GenerateEd25519KeyPair()
+	if err != nil {
+		log.Fatalf("Erreur lors de la génération des clés : %v", err)
+	}
+
+	sharedKey, err := communication.PerformAuthenticatedKeyExchange(conn, privateKey, publicKey)
 	if err != nil {
 		log.Fatalf("Erreur d'échange de clés : %v\n", err)
 	}
+	fmt.Println("Échange de clés réussi, communication sécurisée établie.")
 
 	fmt.Print("Entrez votre nom d'utilisateur : ")
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Scan()
 	username := strings.TrimSpace(scanner.Text())
 
-	fmt.Fprintf(conn, "%s\n", username)
+	_, err = fmt.Fprintf(conn, "%s\n", username)
+	if err != nil {
+		log.Fatalf("Erreur lors de l'envoi du nom d'utilisateur : %v\n", err)
+	}
 
-	printMessageHistory(conn, sharedKey)
+	err = receiveWelcomeMessage(conn, sharedKey[:])
+	if err != nil {
+		log.Fatalf("Erreur de réception du message de bienvenue : %v\n", err)
+	}
 
 	fmt.Println("Vous pouvez maintenant envoyer des messages. Tapez 'exit' pour quitter.")
-	startMessaging(conn, sharedKey, username)
-	fmt.Println("Déconnexion du serveur.")
-}
 
-func printMessageHistory(conn net.Conn, sharedKey [32]byte) {
-	reader := bufio.NewReader(conn)
-
-	for {
-		historyLine, err := reader.ReadString('\n')
-		if err != nil {
-			log.Fatalf("Erreur de lecture de l'historique : %v\n", err)
-		}
-		historyLine = strings.TrimSpace(historyLine)
-		if historyLine == "==========================" {
-			break
-		}
-
-		parts := strings.SplitN(historyLine, ": ", 2)
-		if len(parts) != 2 {
-			continue
-		}
-
-		sender := parts[0]
-		encryptedMessage := parts[1]
-
-		decryptedMessage, err := communication.DecryptAES(encryptedMessage, sharedKey[:])
-		if err != nil {
-			continue
-		}
-
-		fmt.Printf("Message de %s : %s\n", sender, string(decryptedMessage))
-	}
-}
-
-func startMessaging(conn net.Conn, sharedKey [32]byte, username string) {
-	scanner := bufio.NewScanner(os.Stdin)
-
+	sequenceNumber := uint64(0)
 	for {
 		fmt.Print("Destinataire : ")
 		scanner.Scan()
@@ -91,22 +68,97 @@ func startMessaging(conn net.Conn, sharedKey [32]byte, username string) {
 			break
 		}
 
-		messageFormat := fmt.Sprintf("%s|%s|%s", username, recipient, message)
-
-		encryptedMessage, err := communication.EncryptAES([]byte(messageFormat), sharedKey[:])
+		sequenceNumber++
+		fullMessage := fmt.Sprintf("%s|%s", recipient, message)
+		err := sendMessage(conn, sharedKey[:], fullMessage, sequenceNumber)
 		if err != nil {
-			log.Fatalf("Erreur de chiffrement : %v\n", err)
+			log.Println("Erreur lors de l'envoi du message :", err)
+			continue
 		}
 
-		header := fmt.Sprintf("%s: %s", username, encryptedMessage)
-		hmacValue := communication.GenerateHMAC(header, sharedKey[:])
-		fullMessage := fmt.Sprintf("%s|%s", header, hmacValue)
-
-		_, err = fmt.Fprintf(conn, "%s\n", fullMessage)
-		if err != nil {
-			log.Fatalf("Erreur d'envoi du message : %v\n", err)
-		}
-
-		fmt.Printf("Message envoyé à %s.\n", recipient)
+		fmt.Println("Message envoyé.")
 	}
+
+	fmt.Println("Déconnexion du serveur.")
+}
+
+func sendMessage(conn net.Conn, sharedKey []byte, message string, sequenceNumber uint64) error {
+	formattedMessage := fmt.Sprintf("%d|%s", sequenceNumber, message)
+
+	encryptedMessage, err := communication.EncryptAESGCM([]byte(formattedMessage), sharedKey)
+	if err != nil {
+		return fmt.Errorf("erreur de chiffrement: %v", err)
+	}
+
+	hmac := communication.GenerateHMAC(encryptedMessage, sharedKey)
+
+	_, err = fmt.Fprintf(conn, "%s|%s\n", encryptedMessage, hmac)
+	if err != nil {
+		return fmt.Errorf("erreur d'envoi du message: %v", err)
+	}
+
+	err = receiveAcknowledgment(conn, sharedKey)
+	if err != nil {
+		return fmt.Errorf("erreur de réception de l'accusé de réception: %v", err)
+	}
+
+	return nil
+}
+
+func receiveWelcomeMessage(conn net.Conn, sharedKey []byte) error {
+	scanner := bufio.NewScanner(conn)
+
+	if scanner.Scan() {
+		receivedMessage := scanner.Text()
+		parts := strings.SplitN(receivedMessage, "|", 2)
+		if len(parts) != 2 {
+			return fmt.Errorf("message de bienvenue mal formé")
+		}
+
+		encryptedMessage := parts[0]
+		receivedHMAC := parts[1]
+
+		expectedHMAC := communication.GenerateHMAC(encryptedMessage, sharedKey)
+		if receivedHMAC != expectedHMAC {
+			return fmt.Errorf("HMAC invalide pour le message de bienvenue")
+		}
+
+		decryptedMessage, err := communication.DecryptAESGCM(encryptedMessage, sharedKey)
+		if err != nil {
+			return fmt.Errorf("erreur de déchiffrement du message de bienvenue : %v", err)
+		}
+
+		fmt.Println("Serveur :", string(decryptedMessage))
+	}
+
+	return nil
+}
+
+func receiveAcknowledgment(conn net.Conn, sharedKey []byte) error {
+	scanner := bufio.NewScanner(conn)
+
+	if scanner.Scan() {
+		receivedMessage := scanner.Text()
+		parts := strings.SplitN(receivedMessage, "|", 2)
+		if len(parts) != 2 {
+			return fmt.Errorf("accusé de réception mal formé")
+		}
+
+		encryptedMessage := parts[0]
+		receivedHMAC := parts[1]
+
+		expectedHMAC := communication.GenerateHMAC(encryptedMessage, sharedKey)
+		if receivedHMAC != expectedHMAC {
+			return fmt.Errorf("HMAC invalide pour l'accusé de réception")
+		}
+
+		decryptedMessage, err := communication.DecryptAESGCM(encryptedMessage, sharedKey)
+		if err != nil {
+			return fmt.Errorf("erreur de déchiffrement de l'accusé de réception : %v", err)
+		}
+
+		fmt.Println("Serveur :", string(decryptedMessage))
+	}
+
+	return nil
 }

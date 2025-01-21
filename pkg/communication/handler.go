@@ -7,42 +7,49 @@ import (
 	"strings"
 )
 
-func HandleConnection(conn net.Conn) {
+func HandleConnection(conn net.Conn, sharedKey []byte) {
 	defer conn.Close()
 
-	sharedKey, err := PerformKeyExchange(conn)
-	if err != nil {
-		fmt.Println("Erreur d'échange de clés:", err)
-		return
+	scanner := bufio.NewScanner(conn)
+
+	for scanner.Scan() {
+		receivedMessage := strings.TrimSpace(scanner.Text())
+		parts := strings.SplitN(receivedMessage, "|", 2)
+		if len(parts) != 2 {
+			fmt.Println("Message malformé")
+			continue
+		}
+
+		encryptedMessage := parts[0]
+		receivedHMAC := parts[1]
+
+		expectedHMAC := GenerateHMAC(encryptedMessage, sharedKey)
+		if receivedHMAC != expectedHMAC {
+			fmt.Println("Erreur : HMAC invalide, message rejeté")
+			continue
+		}
+
+		decryptedMessage, err := DecryptAESGCM(encryptedMessage, sharedKey)
+		if err != nil {
+			fmt.Println("Erreur de déchiffrement:", err)
+			continue
+		}
+
+		uncompressedMessage, err := DecompressData(decryptedMessage)
+		if err != nil {
+			fmt.Println("Erreur de décompression:", err)
+			continue
+		}
+
+		messageParts := strings.SplitN(string(uncompressedMessage), "|", 2)
+		if len(messageParts) != 2 {
+			fmt.Println("Format du message incorrect")
+			continue
+		}
+
+		sequenceNumber := messageParts[0]
+		messageContent := messageParts[1]
+
+		fmt.Printf("Message reçu [%s]: %s\n", sequenceNumber, messageContent)
 	}
-
-	sharedKeySlice := sharedKey[:]
-
-	message, err := bufio.NewReader(conn).ReadString('\n')
-	if err != nil {
-		fmt.Println("Erreur de lecture:", err)
-		return
-	}
-
-	parts := strings.Split(message, "|")
-	if len(parts) != 2 {
-		fmt.Println("Message malformé")
-		return
-	}
-	encryptedMessage := parts[0]
-	receivedHMAC := parts[1][:len(parts[1])-1]
-
-	expectedHMAC := GenerateHMAC(encryptedMessage, sharedKeySlice)
-	if receivedHMAC != expectedHMAC {
-		fmt.Println("Erreur : HMAC invalide")
-		return
-	}
-
-	decryptedMessage, err := DecryptAES(encryptedMessage, sharedKeySlice)
-	if err != nil {
-		fmt.Println("Erreur de déchiffrement:", err)
-		return
-	}
-
-	fmt.Println("Message reçu :", string(decryptedMessage))
 }

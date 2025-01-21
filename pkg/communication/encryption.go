@@ -11,26 +11,30 @@ import (
 	"io"
 )
 
-func EncryptAES(plaintext []byte, key []byte) (string, error) {
+func EncryptAESGCM(plaintext []byte, key []byte) (string, error) {
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return "", err
 	}
 
-	ciphertext := make([]byte, aes.BlockSize+len(plaintext))
-	iv := ciphertext[:aes.BlockSize]
-	if _, err := io.ReadFull(rand.Reader, iv); err != nil {
+	aesGCM, err := cipher.NewGCM(block)
+	if err != nil {
 		return "", err
 	}
 
-	stream := cipher.NewCFBEncrypter(block, iv)
-	stream.XORKeyStream(ciphertext[aes.BlockSize:], plaintext)
+	nonce := make([]byte, aesGCM.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return "", err
+	}
 
-	return base64.StdEncoding.EncodeToString(ciphertext), nil
+	ciphertext := aesGCM.Seal(nil, nonce, plaintext, nil)
+	finalData := append(nonce, ciphertext...)
+
+	return base64.StdEncoding.EncodeToString(finalData), nil
 }
 
-func DecryptAES(ciphertext string, key []byte) ([]byte, error) {
-	ciphertextBytes, err := base64.StdEncoding.DecodeString(ciphertext)
+func DecryptAESGCM(ciphertextBase64 string, key []byte) ([]byte, error) {
+	data, err := base64.StdEncoding.DecodeString(ciphertextBase64)
 	if err != nil {
 		return nil, err
 	}
@@ -40,16 +44,25 @@ func DecryptAES(ciphertext string, key []byte) ([]byte, error) {
 		return nil, err
 	}
 
-	if len(ciphertextBytes) < aes.BlockSize {
-		return nil, fmt.Errorf("le message est trop court")
+	aesGCM, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
 	}
-	iv := ciphertextBytes[:aes.BlockSize]
-	ciphertextBytes = ciphertextBytes[aes.BlockSize:]
 
-	stream := cipher.NewCFBDecrypter(block, iv)
-	stream.XORKeyStream(ciphertextBytes, ciphertextBytes)
+	nonceSize := aesGCM.NonceSize()
+	if len(data) < nonceSize {
+		return nil, fmt.Errorf("données trop courtes")
+	}
 
-	return ciphertextBytes, nil
+	nonce := data[:nonceSize]
+	ciphertext := data[nonceSize:]
+
+	plaintext, err := aesGCM.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return plaintext, nil
 }
 
 func GenerateHMAC(message string, key []byte) string {
