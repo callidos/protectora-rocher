@@ -9,16 +9,15 @@ import (
 	"time"
 )
 
-const replayWindow = 5 * time.Minute
-
-var (
-	messageHistory = make(map[string]time.Time)
-	mu             sync.Mutex
-)
-
 const (
+	replayWindow      = 5 * time.Minute
+	messageSizeLimit  = 8192
 	SessionEphemeral  = "ephemeral"
 	SessionPersistent = "persistent"
+)
+
+var (
+	messageHistory = sync.Map{}
 )
 
 func SetSessionMode(mode string) error {
@@ -38,9 +37,9 @@ func SendMessage(conn net.Conn, message string, sharedKey []byte, sequenceNumber
 		return fmt.Errorf("erreur de chiffrement: %v", err)
 	}
 
-	hmac := GenerateHMAC(encryptedMessage, sharedKey)
+	hmacValue := GenerateHMAC(encryptedMessage, sharedKey)
 
-	_, err = fmt.Fprintf(conn, "%s|%s\n", encryptedMessage, hmac)
+	_, err = fmt.Fprintf(conn, "%s|%s\n", encryptedMessage, hmacValue)
 	if err != nil {
 		return fmt.Errorf("erreur d'envoi du message: %v", err)
 	}
@@ -49,7 +48,7 @@ func SendMessage(conn net.Conn, message string, sharedKey []byte, sequenceNumber
 }
 
 func ReceiveMessage(conn net.Conn, sharedKey []byte) (string, error) {
-	buffer := make([]byte, 4096)
+	buffer := make([]byte, messageSizeLimit)
 	n, err := conn.Read(buffer)
 	if err != nil {
 		return "", fmt.Errorf("erreur de lecture du message: %v", err)
@@ -65,6 +64,7 @@ func ReceiveMessage(conn net.Conn, sharedKey []byte) (string, error) {
 	receivedHMAC := parts[1]
 
 	expectedHMAC := GenerateHMAC(encryptedMessage, sharedKey)
+
 	if receivedHMAC != expectedHMAC {
 		return "", fmt.Errorf("HMAC invalide, message rejeté")
 	}
@@ -110,26 +110,27 @@ func validateAndStoreMessage(message []byte) (string, error) {
 }
 
 func isReplayAttack(sequenceNumber string, timestamp int64) bool {
-	mu.Lock()
-	defer mu.Unlock()
-
 	currentTime := time.Now().Unix()
 	if timestamp < (currentTime-int64(replayWindow.Seconds())) || timestamp > currentTime {
 		fmt.Println("Message rejeté : horodatage invalide ou expiré")
 		return true
 	}
 
-	if _, exists := messageHistory[sequenceNumber]; exists {
+	if _, exists := messageHistory.Load(sequenceNumber); exists {
 		fmt.Println("Message rejeté : numéro de séquence déjà utilisé")
 		return true
 	}
 
-	messageHistory[sequenceNumber] = time.Now()
+	messageHistory.Store(sequenceNumber, time.Now())
+
+	go func(seq string) {
+		time.Sleep(replayWindow)
+		messageHistory.Delete(seq)
+	}(sequenceNumber)
+
 	return false
 }
 
 func ResetMessageHistory() {
-	mu.Lock()
-	defer mu.Unlock()
-	messageHistory = make(map[string]time.Time)
+	messageHistory = sync.Map{}
 }

@@ -2,6 +2,7 @@ package tests
 
 import (
 	"bytes"
+	"net"
 	"protectora-rocher/pkg/communication"
 	"strings"
 	"testing"
@@ -112,4 +113,23 @@ func TestRejectCorruptedMessage(t *testing.T) {
 	// mais on peut analyser le Buffer ou vérifier les logs si besoin.
 	output := mockConn.Buffer.String()
 	t.Logf("Output buffer for corrupted message: %s", output)
+}
+
+func TestHandleConnectionWithError(t *testing.T) {
+	listener, _ := net.Listen("tcp", "localhost:8081")
+	defer listener.Close()
+
+	go func() {
+		conn, _ := listener.Accept()
+		conn.Close() // Simule une coupure de connexion immédiate
+	}()
+
+	conn, err := net.Dial("tcp", "localhost:8081")
+	if err != nil {
+		t.Fatalf("Erreur de connexion au serveur : %v", err)
+	}
+
+	sharedKey := []byte("testsharedkey123")
+	communication.HandleConnection(conn, sharedKey)
+	t.Log("Test de gestion des connexions avec interruption")
 }
