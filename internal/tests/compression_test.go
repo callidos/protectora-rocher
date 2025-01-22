@@ -72,3 +72,65 @@ func TestCompressLargeData(t *testing.T) {
 		t.Errorf("Les données décompressées ne correspondent pas à la taille originale")
 	}
 }
+
+// Test des cas limites de compression/décompression
+func TestCompressionEdgeCases(t *testing.T) {
+	testCases := []struct {
+		input      []byte
+		shouldFail bool
+	}{
+		{[]byte(""), false},              // Données vides
+		{[]byte("Short"), false},         // Petite chaîne
+		{make([]byte, 10), false},        // Données courtes
+		{make([]byte, 1024), false},      // Données de taille normale
+		{make([]byte, 1000000), false},   // Données volumineuses
+		{[]byte("corrupted-data"), true}, // Données corrompues
+	}
+
+	for _, tc := range testCases {
+		compressedData, err := communication.CompressData(tc.input)
+
+		if err != nil {
+			t.Fatalf("Erreur de compression pour les données d'entrée : %v", err)
+		}
+
+		if tc.shouldFail {
+			corruptedData := compressedData[:len(compressedData)-1] // Corrompre les données
+			_, err = communication.DecompressData(corruptedData)
+			if err == nil {
+				t.Errorf("Expected failure for corrupted input, but decompression succeeded")
+			}
+		} else {
+			decompressedData, err := communication.DecompressData(compressedData)
+			if err != nil {
+				t.Errorf("Erreur lors de la décompression des données d'entrée : %v", err)
+			}
+
+			if !bytes.Equal(tc.input, decompressedData) {
+				t.Errorf("Les données décompressées ne correspondent pas aux originales")
+			}
+		}
+	}
+}
+
+// Test de performance de la compression/décompression
+func TestCompressionPerformance(t *testing.T) {
+	largeData := make([]byte, 10<<20) // 10 Mo de données
+
+	compressedData, err := communication.CompressData(largeData)
+	if err != nil {
+		t.Fatalf("Erreur lors de la compression de grandes données : %v", err)
+	}
+
+	t.Logf("Taille des données originales : %d octets", len(largeData))
+	t.Logf("Taille des données compressées : %d octets", len(compressedData))
+
+	decompressedData, err := communication.DecompressData(compressedData)
+	if err != nil {
+		t.Fatalf("Erreur lors de la décompression de grandes données : %v", err)
+	}
+
+	if !bytes.Equal(largeData, decompressedData) {
+		t.Errorf("Les données décompressées ne correspondent pas aux données d'origine")
+	}
+}

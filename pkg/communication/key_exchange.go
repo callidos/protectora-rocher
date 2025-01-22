@@ -23,6 +23,12 @@ var (
 	lastKeyTime time.Time
 )
 
+// Resultat pour les échanges de clé
+type KeyExchangeResult struct {
+	Key [32]byte
+	Err error
+}
+
 func GenerateEd25519KeyPair() (ed25519.PublicKey, ed25519.PrivateKey, error) {
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -31,26 +37,35 @@ func GenerateEd25519KeyPair() (ed25519.PublicKey, ed25519.PrivateKey, error) {
 	return pub, priv, nil
 }
 
-func PerformAuthenticatedKeyExchange(conn net.Conn,
+func PerformAuthenticatedKeyExchange(
+	conn net.Conn,
 	privateEd25519 ed25519.PrivateKey,
 	publicEd25519 ed25519.PublicKey,
-) ([32]byte, error) {
+) (<-chan KeyExchangeResult, error) {
 
-	mutex.Lock()
-	defer mutex.Unlock()
+	resultChan := make(chan KeyExchangeResult, 1)
 
-	if time.Since(lastKeyTime) > keyRotationInterval || currentKey == [32]byte{} {
-		if err := exchangeNewKyberSessionKey(conn, privateEd25519); err != nil {
-			return [32]byte{}, fmt.Errorf("échec de l'échange de clé Kyber : %v", err)
+	go func() {
+		defer close(resultChan)
+
+		mutex.Lock()
+		defer mutex.Unlock()
+
+		if time.Since(lastKeyTime) > keyRotationInterval || currentKey == [32]byte{} {
+			if err := exchangeNewKyberSessionKey(conn, privateEd25519); err != nil {
+				resultChan <- KeyExchangeResult{Err: fmt.Errorf("échec de l'échange de clé Kyber : %v", err)}
+				return
+			}
+			lastKeyTime = time.Now()
 		}
-		lastKeyTime = time.Now()
-	}
 
-	return currentKey, nil
+		resultChan <- KeyExchangeResult{Key: currentKey}
+	}()
+
+	return resultChan, nil
 }
 
 func exchangeNewKyberSessionKey(conn net.Conn, privateEd25519 ed25519.PrivateKey) error {
-
 	pkServer, skServer, err := kyber768.GenerateKeyPair(rand.Reader)
 	if err != nil {
 		return fmt.Errorf("erreur de génération de paire Kyber768 : %v", err)

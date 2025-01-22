@@ -2,14 +2,16 @@ package tests
 
 import (
 	"bytes"
+	"log"
 	"net"
 	"time"
 )
 
 // MockConnection est une structure simulant une connexion réseau pour les tests.
 type MockConnection struct {
-	Buffer bytes.Buffer
-	Remote net.Addr
+	Buffer        bytes.Buffer
+	Remote        net.Addr
+	EnableLogging bool // Ajout d'un flag pour activer/désactiver les logs
 }
 
 func (m *MockConnection) Read(b []byte) (n int, err error) {
@@ -17,6 +19,10 @@ func (m *MockConnection) Read(b []byte) (n int, err error) {
 }
 
 func (m *MockConnection) Write(b []byte) (n int, err error) {
+	// Log de l'envoi dans le buffer seulement si EnableLogging est activé
+	if m.EnableLogging {
+		log.Printf("Message écrit dans le buffer: %s", string(b))
+	}
 	return m.Buffer.Write(b)
 }
 

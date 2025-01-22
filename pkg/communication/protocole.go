@@ -3,6 +3,7 @@ package communication
 import (
 	"fmt"
 	"net"
+	"protectora-rocher/pkg/utils"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,6 +30,10 @@ func SetSessionMode(mode string) error {
 }
 
 func SendMessage(conn net.Conn, message string, sharedKey []byte, sequenceNumber uint64, duration int) error {
+	if duration < 0 {
+		return fmt.Errorf("la durée ne peut pas être négative")
+	}
+
 	timestamp := time.Now().Unix()
 	formattedMessage := fmt.Sprintf("%d|%d|%d|%s", sequenceNumber, timestamp, duration, message)
 
@@ -39,42 +44,84 @@ func SendMessage(conn net.Conn, message string, sharedKey []byte, sequenceNumber
 
 	hmacValue := GenerateHMAC(encryptedMessage, sharedKey)
 
-	_, err = fmt.Fprintf(conn, "%s|%s\n", encryptedMessage, hmacValue)
-	if err != nil {
+	errChan := make(chan error, 1)
+	go func() {
+		_, err := fmt.Fprintf(conn, "%s|%s\n", encryptedMessage, hmacValue)
+		errChan <- err
+	}()
+
+	if err := <-errChan; err != nil {
 		return fmt.Errorf("erreur d'envoi du message: %v", err)
 	}
+
+	utils.LogInfo("Message envoyé avec succès", map[string]interface{}{
+		"sequence": sequenceNumber,
+		"duration": duration,
+	})
 
 	return nil
 }
 
 func ReceiveMessage(conn net.Conn, sharedKey []byte) (string, error) {
-	buffer := make([]byte, messageSizeLimit)
-	n, err := conn.Read(buffer)
-	if err != nil {
-		return "", fmt.Errorf("erreur de lecture du message: %v", err)
-	}
+	resultChan := make(chan struct {
+		message string
+		err     error
+	}, 1)
 
-	receivedMessage := strings.TrimSpace(string(buffer[:n]))
-	parts := strings.SplitN(receivedMessage, "|", 2)
-	if len(parts) != 2 {
-		return "", fmt.Errorf("message mal formé")
-	}
+	go func() {
+		defer close(resultChan)
 
-	encryptedMessage := parts[0]
-	receivedHMAC := parts[1]
+		buffer := make([]byte, messageSizeLimit)
+		n, err := conn.Read(buffer)
+		if err != nil {
+			resultChan <- struct {
+				message string
+				err     error
+			}{"", fmt.Errorf("erreur de lecture du message: %v", err)}
+			return
+		}
 
-	expectedHMAC := GenerateHMAC(encryptedMessage, sharedKey)
+		receivedMessage := strings.TrimSpace(string(buffer[:n]))
+		parts := strings.SplitN(receivedMessage, "|", 2)
+		if len(parts) != 2 {
+			resultChan <- struct {
+				message string
+				err     error
+			}{"", fmt.Errorf("message mal formé")}
+			return
+		}
 
-	if receivedHMAC != expectedHMAC {
-		return "", fmt.Errorf("HMAC invalide, message rejeté")
-	}
+		encryptedMessage := parts[0]
+		receivedHMAC := parts[1]
 
-	decryptedMessage, err := DecryptAESGCM(encryptedMessage, sharedKey)
-	if err != nil {
-		return "", fmt.Errorf("erreur de déchiffrement: %v", err)
-	}
+		expectedHMAC := GenerateHMAC(encryptedMessage, sharedKey)
 
-	return validateAndStoreMessage(decryptedMessage)
+		if receivedHMAC != expectedHMAC {
+			resultChan <- struct {
+				message string
+				err     error
+			}{"", fmt.Errorf("HMAC invalide, message rejeté")}
+			return
+		}
+
+		decryptedMessage, err := DecryptAESGCM(encryptedMessage, sharedKey)
+		if err != nil {
+			resultChan <- struct {
+				message string
+				err     error
+			}{"", fmt.Errorf("erreur de déchiffrement: %v", err)}
+			return
+		}
+
+		messageContent, err := validateAndStoreMessage(decryptedMessage)
+		resultChan <- struct {
+			message string
+			err     error
+		}{messageContent, err}
+	}()
+
+	result := <-resultChan
+	return result.message, result.err
 }
 
 func validateAndStoreMessage(message []byte) (string, error) {

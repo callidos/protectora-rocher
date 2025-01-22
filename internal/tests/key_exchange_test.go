@@ -7,7 +7,6 @@ import (
 	"net"
 	"protectora-rocher/pkg/communication"
 	"testing"
-	"time"
 
 	"github.com/cloudflare/circl/kem/kyber/kyber768"
 )
@@ -15,53 +14,36 @@ import (
 // TestGenerateEd25519KeyPair et TestKeyRotation peuvent rester comme avant.
 // Ci-dessous, un test plus complet qui simule vraiment un client et un serveur.
 func TestFullKyberExchange(t *testing.T) {
-	// 1) Générer une paire Ed25519 (serveur)
 	serverPubEd25519, serverPrivEd25519, err := communication.GenerateEd25519KeyPair()
 	if err != nil {
 		t.Fatalf("Impossible de générer les clés Ed25519 du serveur: %v", err)
 	}
 
-	// 2) Créer deux connexions interconnectées (serverConn, clientConn)
 	serverConn, clientConn := net.Pipe()
 
-	// 3) On va exécuter la logique serveur dans une goroutine
-	//    (ceci appelle PerformAuthenticatedKeyExchange).
-	var serverSharedKey [32]byte
-	var serverErr error
+	resultChan, err := communication.PerformAuthenticatedKeyExchange(
+		serverConn,
+		serverPrivEd25519,
+		serverPubEd25519,
+	)
+	if err != nil {
+		t.Fatalf("Erreur lors de la configuration du serveur : %v", err)
+	}
 
-	go func() {
-		defer serverConn.Close()
-		communication.ResetKeyExchangeState()
-
-		serverSharedKey, serverErr = communication.PerformAuthenticatedKeyExchange(
-			serverConn,
-			serverPrivEd25519,
-			serverPubEd25519,
-		)
-	}()
-
-	// 4) Côté "client" : on lit la clé publique Kyber + signature, on vérifie,
-	//    puis on encapsule et envoie le ciphertext.
 	clientSharedKey, clientErr := simulateClientSide(clientConn, serverPubEd25519)
 	if clientErr != nil {
 		t.Fatalf("Erreur côté client: %v", clientErr)
 	}
-
-	// À ce stade, la goroutine serveur a (normalement) lu le ciphertext du client,
-	// décapsulé, et mis la clé dans serverSharedKey. On ferme la connexion côté client.
 	clientConn.Close()
 
-	// 5) Attendre que la goroutine se termine
-	time.Sleep(100 * time.Millisecond)
-
-	if serverErr != nil {
-		t.Fatalf("Erreur côté serveur: %v", serverErr)
+	result := <-resultChan
+	if result.Err != nil {
+		t.Fatalf("Erreur côté serveur: %v", result.Err)
 	}
 
-	// 6) Vérifier que le serveur et le client ont la même clé (32 octets).
-	if !bytes.Equal(serverSharedKey[:], clientSharedKey) {
+	if !bytes.Equal(result.Key[:], clientSharedKey) {
 		t.Fatalf("Les clés échangées ne correspondent pas.\nServeur : %x\nClient  : %x",
-			serverSharedKey[:], clientSharedKey)
+			result.Key[:], clientSharedKey)
 	}
 }
 
