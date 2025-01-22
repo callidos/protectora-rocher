@@ -102,7 +102,7 @@ func sendMessages(conn net.Conn, sharedKey []byte, username string) {
 		fullMessage := fmt.Sprintf("%s|%s|%s", username, recipient, message)
 		sequenceNumber++
 
-		err := communication.SendMessage(conn, fullMessage, sharedKey, sequenceNumber)
+		err := communication.SendMessage(conn, fullMessage, sharedKey, sequenceNumber, 0)
 		if err != nil {
 			utils.LogError("Erreur lors de l'envoi du message", map[string]interface{}{
 				"error": err.Error(),

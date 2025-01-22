@@ -16,9 +16,22 @@ var (
 	mu             sync.Mutex
 )
 
-func SendMessage(conn net.Conn, message string, sharedKey []byte, sequenceNumber uint64) error {
+const (
+	SessionEphemeral  = "ephemeral"
+	SessionPersistent = "persistent"
+)
+
+func SetSessionMode(mode string) error {
+	if mode != SessionEphemeral && mode != SessionPersistent {
+		return fmt.Errorf("mode de session invalide")
+	}
+	fmt.Println("Mode de session reçu :", mode)
+	return nil
+}
+
+func SendMessage(conn net.Conn, message string, sharedKey []byte, sequenceNumber uint64, duration int) error {
 	timestamp := time.Now().Unix()
-	formattedMessage := fmt.Sprintf("%d|%d|%s", sequenceNumber, timestamp, message)
+	formattedMessage := fmt.Sprintf("%d|%d|%d|%s", sequenceNumber, timestamp, duration, message)
 
 	encryptedMessage, err := EncryptAESGCM([]byte(formattedMessage), sharedKey)
 	if err != nil {
@@ -65,18 +78,28 @@ func ReceiveMessage(conn net.Conn, sharedKey []byte) (string, error) {
 }
 
 func validateAndStoreMessage(message []byte) (string, error) {
-	messageParts := strings.SplitN(string(message), "|", 3)
-	if len(messageParts) != 3 {
+	messageParts := strings.SplitN(string(message), "|", 4)
+	if len(messageParts) != 4 {
 		return "", fmt.Errorf("format du message incorrect")
 	}
 
 	sequenceNumber := messageParts[0]
 	timestampStr := messageParts[1]
-	messageContent := messageParts[2]
+	durationStr := messageParts[2]
+	messageContent := messageParts[3]
 
 	timestamp, err := strconv.ParseInt(timestampStr, 10, 64)
 	if err != nil {
 		return "", fmt.Errorf("horodatage invalide")
+	}
+
+	duration, err := strconv.Atoi(durationStr)
+	if err != nil {
+		return "", fmt.Errorf("durée invalide")
+	}
+
+	if duration > 0 && time.Now().Unix() > (timestamp+int64(duration)) {
+		return "", fmt.Errorf("message expiré, rejeté")
 	}
 
 	if isReplayAttack(sequenceNumber, timestamp) {
