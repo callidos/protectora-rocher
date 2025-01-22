@@ -1,17 +1,21 @@
 package communication
 
 import (
+	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/binary"
 	"fmt"
+	"io"
 	"net"
 	"sync"
 	"time"
 
-	"golang.org/x/crypto/curve25519"
-	"golang.org/x/crypto/ed25519"
+	"github.com/cloudflare/circl/kem/kyber/kyber768"
 )
 
-const keyRotationInterval = 10 * time.Minute
+const (
+	keyRotationInterval = 10 * time.Minute
+)
 
 var (
 	mutex       sync.Mutex
@@ -20,83 +24,93 @@ var (
 )
 
 func GenerateEd25519KeyPair() (ed25519.PublicKey, ed25519.PrivateKey, error) {
-	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
-		return nil, nil, fmt.Errorf("erreur de génération de clé Ed25519 : %v", err)
+		return nil, nil, fmt.Errorf("erreur de génération Ed25519 : %v", err)
 	}
-	return publicKey, privateKey, nil
+	return pub, priv, nil
 }
 
-func PerformAuthenticatedKeyExchange(conn net.Conn, privateKey ed25519.PrivateKey, publicKey ed25519.PublicKey) ([32]byte, error) {
+func PerformAuthenticatedKeyExchange(conn net.Conn,
+	privateEd25519 ed25519.PrivateKey,
+	publicEd25519 ed25519.PublicKey,
+) ([32]byte, error) {
+
 	mutex.Lock()
 	defer mutex.Unlock()
 
 	if time.Since(lastKeyTime) > keyRotationInterval || currentKey == [32]byte{} {
-		err := exchangeNewSessionKey(conn, privateKey, publicKey)
-		if err != nil {
-			return [32]byte{}, err
+		if err := exchangeNewKyberSessionKey(conn, privateEd25519); err != nil {
+			return [32]byte{}, fmt.Errorf("échec de l'échange de clé Kyber : %v", err)
 		}
 		lastKeyTime = time.Now()
 	}
+
 	return currentKey, nil
 }
 
-func exchangeNewSessionKey(conn net.Conn, privateKey ed25519.PrivateKey, publicKey ed25519.PublicKey) error {
-	var privateCurve25519 [32]byte
-	_, err := rand.Read(privateCurve25519[:])
+func exchangeNewKyberSessionKey(conn net.Conn, privateEd25519 ed25519.PrivateKey) error {
+
+	pkServer, skServer, err := kyber768.GenerateKeyPair(rand.Reader)
 	if err != nil {
-		return fmt.Errorf("erreur de génération de clé privée Curve25519 : %v", err)
+		return fmt.Errorf("erreur de génération de paire Kyber768 : %v", err)
 	}
 
-	var publicCurve25519 [32]byte
-	curve25519.ScalarBaseMult(&publicCurve25519, &privateCurve25519)
-
-	_, err = conn.Write(publicCurve25519[:])
+	pkBytes, err := pkServer.MarshalBinary()
 	if err != nil {
-		return fmt.Errorf("erreur d'envoi de la clé publique")
+		return fmt.Errorf("erreur de sérialisation pk Kyber : %v", err)
 	}
 
-	var peerPublicKey [32]byte
-	_, err = conn.Read(peerPublicKey[:])
+	signature := ed25519.Sign(privateEd25519, pkBytes)
+
+	if err := sendBytesWithLength(conn, pkBytes); err != nil {
+		return fmt.Errorf("erreur lors de l'envoi de pkKyber : %v", err)
+	}
+	if err := sendBytesWithLength(conn, signature); err != nil {
+		return fmt.Errorf("erreur lors de l'envoi de la signature Ed25519 : %v", err)
+	}
+
+	ctClient, err := receiveBytesWithLength(conn)
 	if err != nil {
-		return fmt.Errorf("erreur de réception de la clé publique")
+		return fmt.Errorf("erreur de réception du ciphertext Kyber : %v", err)
+	}
+	if len(ctClient) != kyber768.CiphertextSize {
+		return fmt.Errorf("taille invalide de ciphertext Kyber, reçu %d octets", len(ctClient))
 	}
 
-	_, err = conn.Write(publicKey)
-	if err != nil {
-		return fmt.Errorf("erreur d'envoi de la clé publique Ed25519")
-	}
+	sharedSecret := make([]byte, kyber768.SharedKeySize)
+	skServer.DecapsulateTo(sharedSecret, ctClient)
 
-	peerEd25519Key := make([]byte, ed25519.PublicKeySize)
-	_, err = conn.Read(peerEd25519Key)
-	if err != nil {
-		return fmt.Errorf("erreur de réception de la clé publique Ed25519")
-	}
-
-	signature := ed25519.Sign(privateKey, peerPublicKey[:])
-	_, err = conn.Write(signature)
-	if err != nil {
-		return fmt.Errorf("erreur d'envoi de la signature")
-	}
-
-	signatureReceived := make([]byte, ed25519.SignatureSize)
-	_, err = conn.Read(signatureReceived)
-	if err != nil {
-		return fmt.Errorf("erreur de réception de la signature")
-	}
-
-	if !ed25519.Verify(peerEd25519Key, publicCurve25519[:], signatureReceived) {
-		return fmt.Errorf("échec de la vérification de la signature")
-	}
-
-	sharedKey, err := curve25519.X25519(privateCurve25519[:], peerPublicKey[:])
-	if err != nil {
-		return fmt.Errorf("erreur de génération de la clé partagée")
-	}
-
-	copy(currentKey[:], sharedKey)
+	copy(currentKey[:], sharedSecret)
 
 	return nil
+}
+
+func sendBytesWithLength(conn net.Conn, data []byte) error {
+	var lengthBytes [4]byte
+	binary.BigEndian.PutUint32(lengthBytes[:], uint32(len(data)))
+
+	if _, err := conn.Write(lengthBytes[:]); err != nil {
+		return err
+	}
+	if _, err := conn.Write(data); err != nil {
+		return err
+	}
+	return nil
+}
+
+func receiveBytesWithLength(conn net.Conn) ([]byte, error) {
+	var lengthBytes [4]byte
+	if _, err := io.ReadFull(conn, lengthBytes[:]); err != nil {
+		return nil, err
+	}
+	length := binary.BigEndian.Uint32(lengthBytes[:])
+
+	buf := make([]byte, length)
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		return nil, err
+	}
+	return buf, nil
 }
 
 func ResetKeyExchangeState() {

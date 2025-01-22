@@ -6,10 +6,13 @@ import (
 	"net"
 	"protectora-rocher/pkg/utils"
 	"strings"
+	"time"
 )
 
 func HandleConnection(conn net.Conn, sharedKey []byte) {
 	defer conn.Close()
+
+	conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
 
 	utils.LogInfo("Nouvelle connexion acceptée", map[string]interface{}{
 		"remote_addr": conn.RemoteAddr().String(),
@@ -38,12 +41,11 @@ func HandleConnection(conn net.Conn, sharedKey []byte) {
 		return
 	}
 
-	messageCount := 0
-	maxMessages := 10
 	for scanner.Scan() {
 		receivedMessage := strings.TrimSpace(scanner.Text())
-		if receivedMessage == "exit" {
-			utils.LogInfo("Déconnexion demandée par l'utilisateur", map[string]interface{}{
+
+		if receivedMessage == "FIN_SESSION" {
+			utils.LogInfo("Fin de session demandée par l'utilisateur", map[string]interface{}{
 				"username": username,
 				"remote":   conn.RemoteAddr().String(),
 			})
@@ -59,14 +61,14 @@ func HandleConnection(conn net.Conn, sharedKey []byte) {
 			break
 		}
 
-		messageCount++
-		if messageCount >= maxMessages {
-			utils.LogInfo("Limite de messages atteinte, fermeture de la connexion", map[string]interface{}{
-				"username": username,
-				"remote":   conn.RemoteAddr().String(),
-			})
-			break
-		}
+		conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
+	}
+
+	if err := scanner.Err(); err != nil {
+		utils.LogError("Erreur de lecture de la connexion", map[string]interface{}{
+			"error": err.Error(),
+			"user":  username,
+		})
 	}
 
 	utils.LogInfo("Fin de communication avec le client", map[string]interface{}{

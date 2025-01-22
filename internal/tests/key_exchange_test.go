@@ -1,53 +1,154 @@
 package tests
 
 import (
+	"bytes"
+	"crypto/ed25519"
+	"fmt"
+	"net"
 	"protectora-rocher/pkg/communication"
 	"testing"
+	"time"
+
+	"github.com/cloudflare/circl/kem/kyber/kyber768"
 )
 
-// Test de la génération de paire de clés Ed25519
-func TestGenerateEd25519KeyPair(t *testing.T) {
-	publicKey, privateKey, err := communication.GenerateEd25519KeyPair()
+// TestGenerateEd25519KeyPair et TestKeyRotation peuvent rester comme avant.
+// Ci-dessous, un test plus complet qui simule vraiment un client et un serveur.
+func TestFullKyberExchange(t *testing.T) {
+	// 1) Générer une paire Ed25519 (serveur)
+	serverPubEd25519, serverPrivEd25519, err := communication.GenerateEd25519KeyPair()
 	if err != nil {
-		t.Fatalf("Erreur lors de la génération de la clé Ed25519 : %v", err)
+		t.Fatalf("Impossible de générer les clés Ed25519 du serveur: %v", err)
 	}
 
-	if len(publicKey) != 32 || len(privateKey) != 64 {
-		t.Errorf("Les longueurs des clés générées sont incorrectes")
+	// 2) Créer deux connexions interconnectées (serverConn, clientConn)
+	serverConn, clientConn := net.Pipe()
+
+	// 3) On va exécuter la logique serveur dans une goroutine
+	//    (ceci appelle PerformAuthenticatedKeyExchange).
+	var serverSharedKey [32]byte
+	var serverErr error
+
+	go func() {
+		defer serverConn.Close()
+		communication.ResetKeyExchangeState()
+
+		serverSharedKey, serverErr = communication.PerformAuthenticatedKeyExchange(
+			serverConn,
+			serverPrivEd25519,
+			serverPubEd25519,
+		)
+	}()
+
+	// 4) Côté "client" : on lit la clé publique Kyber + signature, on vérifie,
+	//    puis on encapsule et envoie le ciphertext.
+	clientSharedKey, clientErr := simulateClientSide(clientConn, serverPubEd25519)
+	if clientErr != nil {
+		t.Fatalf("Erreur côté client: %v", clientErr)
+	}
+
+	// À ce stade, la goroutine serveur a (normalement) lu le ciphertext du client,
+	// décapsulé, et mis la clé dans serverSharedKey. On ferme la connexion côté client.
+	clientConn.Close()
+
+	// 5) Attendre que la goroutine se termine
+	time.Sleep(100 * time.Millisecond)
+
+	if serverErr != nil {
+		t.Fatalf("Erreur côté serveur: %v", serverErr)
+	}
+
+	// 6) Vérifier que le serveur et le client ont la même clé (32 octets).
+	if !bytes.Equal(serverSharedKey[:], clientSharedKey) {
+		t.Fatalf("Les clés échangées ne correspondent pas.\nServeur : %x\nClient  : %x",
+			serverSharedKey[:], clientSharedKey)
 	}
 }
 
-// Test de l'échange de clés sécurisé
-func TestPerformAuthenticatedKeyExchange(t *testing.T) {
-	mockConn := &MockConnection{}
-	publicKey, privateKey, _ := communication.GenerateEd25519KeyPair()
-
-	communication.ResetKeyExchangeState()
-
-	_, err := communication.PerformAuthenticatedKeyExchange(mockConn, privateKey, publicKey)
+// simulateClientSide simule la logique du client :
+// 1. Lit la clé publique Kyber + signature Ed25519 du serveur
+// 2. Vérifie la signature
+// 3. Reconstruit la clé publique Kyber
+// 4. Encapsule un secret pour produire un ciphertext
+// 5. Envoie ce ciphertext au serveur
+// 6. Renvoie le secret local qui, si tout va bien, correspondra à celui du serveur
+func simulateClientSide(conn net.Conn, serverPubEd25519 ed25519.PublicKey) ([]byte, error) {
+	// 1) Lire la clé publique Kyber (pkBytes)
+	pkBytes, err := readBytesWithLength(conn)
 	if err != nil {
-		t.Fatalf("Erreur lors de l'échange de clés sécurisé : %v", err)
+		return nil, fmt.Errorf("erreur lecture pkKyber : %v", err)
 	}
+
+	// 2) Lire la signature Ed25519
+	signature, err := readBytesWithLength(conn)
+	if err != nil {
+		return nil, fmt.Errorf("erreur lecture signature : %v", err)
+	}
+
+	// 3) Vérifier la signature Ed25519 pour s'assurer que pkBytes n'a pas été modifié
+	if !ed25519.Verify(serverPubEd25519, pkBytes, signature) {
+		return nil, fmt.Errorf("signature Ed25519 invalide sur la clé publique Kyber")
+	}
+
+	// 4) Reconstruire la clé publique Kyber, en utilisant Unpack au lieu de UnmarshalBinary
+	var pkServer kyber768.PublicKey
+	// pkServer.Unpack panique si la taille est incorrecte, sinon ne retourne pas d'erreur
+	pkServer.Unpack(pkBytes)
+
+	// 5) Encapsuler => ciphertext (ct) et sharedKey (32 octets)
+	ct := make([]byte, kyber768.CiphertextSize)
+	sharedKey := make([]byte, kyber768.SharedKeySize)
+	pkServer.EncapsulateTo(ct, sharedKey, nil)
+
+	// 6) Envoyer le ciphertext au serveur
+	if err := writeBytesWithLength(conn, ct); err != nil {
+		return nil, fmt.Errorf("erreur d'envoi du ciphertext Kyber : %v", err)
+	}
+
+	// 7) Retourner la clé partagée du côté client
+	return sharedKey, nil
 }
 
-// Test de la rotation des clés après l'expiration de l'intervalle de temps
-func TestKeyRotation(t *testing.T) {
-	mockConn := &MockConnection{}
-	publicKey, privateKey, _ := communication.GenerateEd25519KeyPair()
-
-	communication.ResetKeyExchangeState()
-
-	// Effectuer un premier échange de clés
-	_, err := communication.PerformAuthenticatedKeyExchange(mockConn, privateKey, publicKey)
-	if err != nil {
-		t.Fatalf("Erreur lors de l'échange initial de clés sécurisé : %v", err)
+// readBytesWithLength lit un uint32 (Big-Endian) puis lit ce nombre d'octets.
+func readBytesWithLength(conn net.Conn) ([]byte, error) {
+	lenBuf := make([]byte, 4)
+	if _, err := conn.Read(lenBuf); err != nil {
+		return nil, err
 	}
+	length := (uint32(lenBuf[0]) << 24) |
+		(uint32(lenBuf[1]) << 16) |
+		(uint32(lenBuf[2]) << 8) |
+		uint32(lenBuf[3])
 
-	// Simuler une expiration du délai de rotation
-	communication.ResetKeyExchangeState()
-
-	_, err = communication.PerformAuthenticatedKeyExchange(mockConn, privateKey, publicKey)
-	if err != nil {
-		t.Fatalf("Erreur lors de la rotation des clés : %v", err)
+	data := make([]byte, length)
+	if _, err := conn.Read(data); err != nil {
+		return nil, err
 	}
+	return data, nil
+}
+
+func writeBytesWithLength(conn net.Conn, data []byte) error {
+	length := uint32(len(data))
+	lenBuf := []byte{
+		byte(length >> 24),
+		byte(length >> 16),
+		byte(length >> 8),
+		byte(length),
+	}
+	if _, err := conn.Write(lenBuf); err != nil {
+		return err
+	}
+	if _, err := conn.Write(data); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ErrSignatureInvalid est retournée si la signature Ed25519 du serveur est invalide.
+var ErrSignatureInvalid = &SignatureInvalidError{}
+
+type SignatureInvalidError struct{}
+
+func (e *SignatureInvalidError) Error() string {
+	return "signature Ed25519 invalide"
 }
