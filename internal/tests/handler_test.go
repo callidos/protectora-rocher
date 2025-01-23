@@ -5,7 +5,6 @@ import (
 	"net"
 	"protectora-rocher/pkg/communication"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 )
@@ -18,20 +17,17 @@ func TestHandleConnection(t *testing.T) {
 	mockConn.Buffer.WriteString("testuser\n")
 	mockConn.Buffer.WriteString("FIN_SESSION\n")
 
-	var wg sync.WaitGroup
-	wg.Add(1)
-
-	// Déclencher la goroutine
+	// Déclencher la goroutine pour gérer la connexion
 	doneChan := make(chan bool)
 	go func() {
-		communication.HandleConnection(mockConn, sharedKey, &wg)
+		communication.HandleConnection(mockConn, sharedKey) // Correction ici
 		doneChan <- true
 	}()
 
-	// Attendre que la goroutine ait terminé
+	// Timeout si la goroutine prend trop de temps
 	select {
 	case <-doneChan:
-		// Une fois la goroutine terminée, nous pouvons vérifier le buffer
+		// Une fois la goroutine terminée, vérifier le buffer de la connexion mockée
 		output := mockConn.Buffer.String()
 		t.Logf("Output buffer: %s", output)
 
@@ -64,13 +60,9 @@ func TestHandleConnection(t *testing.T) {
 		if err := mockConn.Close(); err != nil {
 			t.Fatalf("Erreur lors de la fermeture de la connexion : %v", err)
 		}
-
 	case <-time.After(5 * time.Second): // Timeout si la goroutine prend trop de temps
 		t.Fatal("Le test a dépassé le délai d'attente.")
 	}
-
-	// Attendre que toutes les goroutines finissent
-	wg.Wait()
 }
 
 // Test du traitement d'un message reçu correctement
@@ -91,12 +83,10 @@ func TestProcessIncomingMessage(t *testing.T) {
 	mockConn.Buffer.WriteString("FIN_SESSION\n")
 
 	// 4) Exécuter la gestion de la connexion
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go communication.HandleConnection(mockConn, sharedKey, &wg)
+	go communication.HandleConnection(mockConn, sharedKey)
 
 	// 5) Attendre un peu pour laisser le temps au serveur de traiter
-	wg.Wait()
+	time.Sleep(1 * time.Second) // Attente d'un court moment
 
 	// 6) Analyser la sortie
 	output := mockConn.Buffer.String()
@@ -148,13 +138,10 @@ func TestRejectCorruptedMessage(t *testing.T) {
 	mockConn.Buffer.WriteString("message-corrompu|mauvaisHMAC\n")
 	mockConn.Buffer.WriteString("FIN_SESSION\n")
 
-	var wg sync.WaitGroup
-	wg.Add(1)
-
-	go communication.HandleConnection(mockConn, sharedKey, &wg)
+	go communication.HandleConnection(mockConn, sharedKey)
 
 	// Attendre l'envoi de l'accusé de réception
-	wg.Wait()
+	time.Sleep(1 * time.Second)
 
 	output := mockConn.Buffer.String()
 	t.Logf("Output buffer for corrupted message: %s", output)
@@ -180,13 +167,9 @@ func TestHandleConnectionWithError(t *testing.T) {
 	}
 
 	sharedKey := []byte("thisisaverysecurekey!")
-	var wg sync.WaitGroup
-	wg.Add(1)
 
-	communication.HandleConnection(conn, sharedKey, &wg)
-
-	// Attendre l'envoi de l'accusé de réception avant de terminer
-	wg.Wait()
+	// Appel sans WaitGroup
+	communication.HandleConnection(conn, sharedKey)
 
 	t.Log("Test de gestion des connexions avec interruption")
 }
@@ -199,16 +182,10 @@ func TestHandleConnectionSessionDuration(t *testing.T) {
 	mockConn.Buffer.WriteString("testuser\n")
 	mockConn.Buffer.WriteString("FIN_SESSION\n")
 
-	var wg sync.WaitGroup
-	wg.Add(1)
-
-	go communication.HandleConnection(mockConn, sharedKey, &wg)
+	go communication.HandleConnection(mockConn, sharedKey)
 
 	// Attendre un peu avant de vérifier le résultat
 	time.Sleep(3 * time.Second)
-
-	// Attendre la fin du traitement
-	wg.Wait()
 
 	if mockConn.Buffer.Len() == 0 {
 		t.Errorf("Aucun message échangé pendant la session")
@@ -217,6 +194,9 @@ func TestHandleConnectionSessionDuration(t *testing.T) {
 
 // Test de réception de plusieurs messages en séquence
 func TestHandleMultipleMessages(t *testing.T) {
+	// Réinitialisation de l'historique des messages avant chaque test
+	communication.ResetMessageHistory()
+
 	mockConn := &MockConnection{}
 	sharedKey := []byte("thisisaverysecurekey!")
 
@@ -230,16 +210,10 @@ func TestHandleMultipleMessages(t *testing.T) {
 
 	mockConn.Buffer.WriteString("FIN_SESSION\n")
 
-	// Créer un canal de confirmation pour s'assurer que tous les accusés de réception sont envoyés
-	var wg sync.WaitGroup
-	wg.Add(1)
-
-	go func() {
-		communication.HandleConnection(mockConn, sharedKey, &wg)
-	}()
+	go communication.HandleConnection(mockConn, sharedKey)
 
 	// Attendre que la fonction de gestion de connexion ait terminé
-	wg.Wait()
+	time.Sleep(3 * time.Second)
 
 	// Log complet du buffer pour mieux analyser
 	output := mockConn.Buffer.String()

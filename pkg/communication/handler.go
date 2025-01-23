@@ -2,15 +2,15 @@ package communication
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"net"
 	"protectora-rocher/pkg/utils"
 	"strings"
-	"sync"
 	"time"
 )
 
-func HandleConnection(conn net.Conn, sharedKey []byte, wg *sync.WaitGroup) {
+func HandleConnection(conn net.Conn, sharedKey []byte) {
 	defer conn.Close()
 
 	// Définir une limite de lecture de 5 minutes
@@ -44,6 +44,7 @@ func HandleConnection(conn net.Conn, sharedKey []byte, wg *sync.WaitGroup) {
 		return
 	}
 
+	// Utilisation d'un canal pour gérer les messages du client
 	messageChan := make(chan string)
 	doneChan := make(chan bool)
 
@@ -79,9 +80,9 @@ func HandleConnection(conn net.Conn, sharedKey []byte, wg *sync.WaitGroup) {
 			conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
 
 		case <-doneChan:
-			// Ajouter l'attente de l'accusé de réception via WaitGroup
-			wg.Add(1)
-			if err := sendAcknowledgment(conn, sharedKey, wg); err != nil {
+			// Envoi de l'accusé de réception
+			// Correction ici : appel de sendAcknowledgment avec seulement deux arguments
+			if err := sendAcknowledgment(conn, sharedKey); err != nil {
 				utils.LogError("Erreur lors de l'envoi de l'accusé de réception", map[string]interface{}{"error": err.Error()})
 			}
 
@@ -91,14 +92,6 @@ func HandleConnection(conn net.Conn, sharedKey []byte, wg *sync.WaitGroup) {
 			})
 			return
 		}
-	}
-
-	// Vérification d'une erreur lors de la lecture du scanner
-	if err := scanner.Err(); err != nil {
-		utils.LogError("Erreur de lecture de la connexion", map[string]interface{}{
-			"error": err.Error(),
-			"user":  username,
-		})
 	}
 }
 
@@ -110,11 +103,27 @@ func processIncomingMessage(receivedMessage string, sharedKey []byte, conn net.C
 	}
 
 	encryptedMessage := parts[0]
-	receivedHMAC := parts[1]
+	receivedHMAC := strings.TrimSpace(parts[1])
+
+	// Log de débogage pour voir les valeurs envoyées et reçues
+	utils.LogInfo("Message reçu", map[string]interface{}{
+		"encrypted_message": encryptedMessage,
+		"received_hmac":     receivedHMAC,
+	})
 
 	// Vérification de l'intégrité du message avec HMAC
 	expectedHMAC := GenerateHMAC(encryptedMessage, sharedKey)
-	if receivedHMAC != expectedHMAC {
+
+	// Suppression des espaces et formatage uniforme pour comparaison
+	receivedHMAC = strings.ReplaceAll(receivedHMAC, " ", "") // Enlève les espaces
+	expectedHMAC = strings.ReplaceAll(expectedHMAC, " ", "") // Enlève les espaces
+
+	// Convertir en []byte pour une comparaison fiable
+	receivedHMACBytes := []byte(receivedHMAC)
+	expectedHMACBytes := []byte(expectedHMAC)
+
+	// Comparaison HMAC
+	if !bytes.Equal(receivedHMACBytes, expectedHMACBytes) {
 		return fmt.Errorf("HMAC invalide, message rejeté")
 	}
 
@@ -129,8 +138,8 @@ func processIncomingMessage(receivedMessage string, sharedKey []byte, conn net.C
 		"message": string(decryptedMessage),
 	})
 
-	// Envoi de l'accusé de réception
-	if err := sendAcknowledgment(conn, sharedKey, nil); err != nil {
+	// Envoi de l'accusé de réception avec les bons arguments (conn et sharedKey)
+	if err := sendAcknowledgment(conn, sharedKey); err != nil {
 		utils.LogError("Erreur lors de l'envoi de l'accusé de réception", map[string]interface{}{"error": err.Error()})
 		return fmt.Errorf("erreur d'envoi de l'accusé de réception : %v", err)
 	}
@@ -164,11 +173,7 @@ func sendWelcomeMessage(conn net.Conn, sharedKey []byte, username string) error 
 	return nil
 }
 
-func sendAcknowledgment(conn net.Conn, sharedKey []byte, wg *sync.WaitGroup) error {
-	if wg != nil {
-		defer wg.Done() // Indique que cette goroutine est terminée lorsque la fonction retourne.
-	}
-
+func sendAcknowledgment(conn net.Conn, sharedKey []byte) error {
 	ackMessage := "Message reçu avec succès."
 	utils.LogInfo("Envoi de l'accusé de réception", map[string]interface{}{
 		"ackMessage": ackMessage,
