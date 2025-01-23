@@ -5,38 +5,27 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"net"
 	"protectora-rocher/pkg/utils"
 	"strings"
-	"time"
 )
 
-func HandleConnection(conn net.Conn, sharedKey []byte) {
-	defer conn.Close()
+func HandleConnection(reader io.Reader, writer io.Writer, sharedKey []byte) {
+	utils.Logger.Info("Nouvelle connexion traitée", map[string]interface{}{})
 
-	conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
-
-	utils.LogInfo("Nouvelle connexion acceptée", map[string]interface{}{
-		"remote_addr": conn.RemoteAddr().String(),
-	})
-
-	scanner := bufio.NewScanner(conn)
+	scanner := bufio.NewScanner(reader)
 
 	if !scanner.Scan() {
-		utils.LogWarning("Erreur de lecture du nom d'utilisateur", map[string]interface{}{
-			"remote_addr": conn.RemoteAddr().String(),
-		})
+		utils.Logger.Warning("Erreur de lecture du nom d'utilisateur", map[string]interface{}{})
 		return
 	}
 	username := strings.TrimSpace(scanner.Text())
 
-	utils.LogInfo("Utilisateur connecté", map[string]interface{}{
+	utils.Logger.Info("Utilisateur connecté", map[string]interface{}{
 		"username": username,
-		"remote":   conn.RemoteAddr().String(),
 	})
 
-	if err := sendWelcomeMessage(conn, sharedKey, username); err != nil {
-		utils.LogError("Erreur d'envoi du message de bienvenue", map[string]interface{}{
+	if err := sendWelcomeMessage(writer, sharedKey, username); err != nil {
+		utils.Logger.Error("Erreur d'envoi du message de bienvenue", map[string]interface{}{
 			"error": err.Error(),
 		})
 		return
@@ -48,14 +37,12 @@ func HandleConnection(conn net.Conn, sharedKey []byte) {
 	go func() {
 		for scanner.Scan() {
 			receivedMessage := strings.TrimSpace(scanner.Text())
-			utils.LogDebug("Message reçu du client", map[string]interface{}{
+			utils.Logger.Debug("Message reçu", map[string]interface{}{
 				"message": receivedMessage,
-				"remote":  conn.RemoteAddr().String(),
 			})
 			if receivedMessage == "FIN_SESSION" {
-				utils.LogInfo("Fin de session demandée par l'utilisateur", map[string]interface{}{
+				utils.Logger.Info("Fin de session demandée par l'utilisateur", map[string]interface{}{
 					"username": username,
-					"remote":   conn.RemoteAddr().String(),
 				})
 				doneChan <- true
 				return
@@ -68,38 +55,29 @@ func HandleConnection(conn net.Conn, sharedKey []byte) {
 	for {
 		select {
 		case receivedMessage := <-messageChan:
-			if err := processIncomingMessage(receivedMessage, sharedKey, conn, username); err != nil {
-				utils.LogError("Erreur lors du traitement du message", map[string]interface{}{
+			if err := processIncomingMessage(receivedMessage, sharedKey, writer, username); err != nil {
+				utils.Logger.Error("Erreur lors du traitement du message", map[string]interface{}{
 					"error":   err.Error(),
 					"message": receivedMessage,
 				})
 			}
-			if err := sendAcknowledgment(conn, sharedKey); err != nil {
-				utils.LogError("Erreur lors de l'envoi de l'accusé de réception", map[string]interface{}{"error": err.Error()})
+			if err := sendAcknowledgment(writer, sharedKey); err != nil {
+				utils.Logger.Error("Erreur lors de l'envoi de l'accusé de réception", map[string]interface{}{
+					"error": err.Error(),
+				})
 			}
-
-			output := getBufferContents(conn)
-			utils.LogDebug("État du buffer après envoi de l'accusé", map[string]interface{}{
-				"output": output,
-			})
-
-			conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
 
 		case <-doneChan:
-			if err := sendAcknowledgment(conn, sharedKey); err != nil {
-				utils.LogError("Erreur lors de l'envoi de l'accusé de réception", map[string]interface{}{"error": err.Error()})
-			}
-
-			utils.LogInfo("Fin de communication avec le client", map[string]interface{}{
+			utils.Logger.Info("Fin de communication avec l'utilisateur", map[string]interface{}{
 				"username": username,
-				"remote":   conn.RemoteAddr().String(),
 			})
 			return
 		}
 	}
 }
 
-func processIncomingMessage(receivedMessage string, sharedKey []byte, conn net.Conn, username string) error {
+// processIncomingMessage traite un message reçu et vérifie son intégrité.
+func processIncomingMessage(receivedMessage string, sharedKey []byte, writer io.Writer, username string) error {
 	parts := strings.SplitN(receivedMessage, "|", 2)
 	if len(parts) != 2 {
 		return fmt.Errorf("message mal formé")
@@ -118,10 +96,7 @@ func processIncomingMessage(receivedMessage string, sharedKey []byte, conn net.C
 	receivedHMAC = strings.ReplaceAll(receivedHMAC, " ", "")
 	expectedHMAC = strings.ReplaceAll(expectedHMAC, " ", "")
 
-	receivedHMACBytes := []byte(receivedHMAC)
-	expectedHMACBytes := []byte(expectedHMAC)
-
-	if !bytes.Equal(receivedHMACBytes, expectedHMACBytes) {
+	if !bytes.Equal([]byte(receivedHMAC), []byte(expectedHMAC)) {
 		return fmt.Errorf("HMAC invalide, message rejeté")
 	}
 
@@ -135,8 +110,10 @@ func processIncomingMessage(receivedMessage string, sharedKey []byte, conn net.C
 		"message": string(decryptedMessage),
 	})
 
-	if err := sendAcknowledgment(conn, sharedKey); err != nil {
-		utils.LogError("Erreur lors de l'envoi de l'accusé de réception", map[string]interface{}{"error": err.Error()})
+	if err := sendAcknowledgment(writer, sharedKey); err != nil {
+		utils.LogError("Erreur lors de l'envoi de l'accusé de réception", map[string]interface{}{
+			"error": err.Error(),
+		})
 		return fmt.Errorf("erreur d'envoi de l'accusé de réception : %v", err)
 	}
 
@@ -147,7 +124,8 @@ func processIncomingMessage(receivedMessage string, sharedKey []byte, conn net.C
 	return nil
 }
 
-func sendWelcomeMessage(conn net.Conn, sharedKey []byte, username string) error {
+// sendWelcomeMessage envoie un message de bienvenue chiffré au client.
+func sendWelcomeMessage(writer io.Writer, sharedKey []byte, username string) error {
 	welcomeMessage := fmt.Sprintf("Bienvenue %s sur le serveur sécurisé.", username)
 
 	encryptedMessage, err := EncryptAESGCM([]byte(welcomeMessage), sharedKey)
@@ -156,7 +134,7 @@ func sendWelcomeMessage(conn net.Conn, sharedKey []byte, username string) error 
 	}
 
 	hmac := GenerateHMAC(encryptedMessage, sharedKey)
-	_, err = fmt.Fprintf(conn, "%s|%s\n", encryptedMessage, hmac)
+	_, err = fmt.Fprintf(writer, "%s|%s\n", encryptedMessage, hmac)
 	if err != nil {
 		return fmt.Errorf("erreur d'envoi du message de bienvenue: %v", err)
 	}
@@ -168,54 +146,22 @@ func sendWelcomeMessage(conn net.Conn, sharedKey []byte, username string) error 
 	return nil
 }
 
-func sendAcknowledgment(conn net.Conn, sharedKey []byte) error {
+// sendAcknowledgment envoie un accusé de réception au client.
+func sendAcknowledgment(writer io.Writer, sharedKey []byte) error {
 	ackMessage := "Message reçu avec succès."
-	utils.LogInfo("Préparation de l'accusé de réception", map[string]interface{}{
-		"ackMessage": ackMessage,
-		"remote":     conn.RemoteAddr().String(),
-	})
 
 	encryptedAck, err := EncryptAESGCM([]byte(ackMessage), sharedKey)
 	if err != nil {
-		utils.LogError("Erreur lors du chiffrement de l'accusé de réception", map[string]interface{}{
-			"error": err.Error(),
-		})
 		return fmt.Errorf("erreur de chiffrement de l'accusé de réception: %v", err)
 	}
 
-	utils.LogDebug("Accusé de réception chiffré", map[string]interface{}{
-		"encrypted_ack": encryptedAck,
-	})
-
 	hmac := GenerateHMAC(encryptedAck, sharedKey)
-	utils.LogDebug("HMAC généré pour l'accusé de réception", map[string]interface{}{
-		"hmac": hmac,
-	})
-
-	_, err = fmt.Fprintf(conn, "%s|%s\n", encryptedAck, hmac)
+	_, err = fmt.Fprintf(writer, "%s|%s\n", encryptedAck, hmac)
 	if err != nil {
-		utils.LogError("Erreur d'envoi de l'accusé de réception", map[string]interface{}{
-			"error": err.Error(),
-		})
 		return fmt.Errorf("erreur d'envoi de l'accusé de réception: %v", err)
 	}
 
-	utils.LogInfo("Accusé de réception envoyé avec succès", map[string]interface{}{
-		"ackMessage": ackMessage,
-		"remote":     conn.RemoteAddr().String(),
-	})
+	utils.LogInfo("Accusé de réception envoyé avec succès", map[string]interface{}{})
 
 	return nil
-}
-
-func getBufferContents(conn net.Conn) string {
-	var buffer bytes.Buffer
-
-	_, err := io.Copy(&buffer, conn)
-	if err != nil {
-		utils.LogError("Erreur lors de la lecture du buffer de la connexion", map[string]interface{}{"error": err.Error()})
-		return ""
-	}
-
-	return buffer.String()
 }

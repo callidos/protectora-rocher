@@ -8,164 +8,159 @@ import (
 
 var (
 	testMasterKey = []byte("thisisaverysecuremasterkey!")
-	testMessage   = "Message de test pour chiffrement"
+	testMessage   = "Test encryption message"
 )
 
-// Test de dérivation des clés
+// Test key derivation
 func TestDeriveKeys(t *testing.T) {
 	encryptionKey, hmacKey, err := communication.DeriveKeys(testMasterKey)
 	if err != nil {
-		t.Fatalf("Erreur lors de la dérivation des clés : %v", err)
+		t.Fatalf("Key derivation failed: %v", err)
 	}
 	if len(encryptionKey) != 16 || len(hmacKey) != 16 {
-		t.Errorf("Les clés dérivées n'ont pas les bonnes longueurs")
+		t.Errorf("Derived keys have incorrect lengths")
 	}
 }
 
-// Test du chiffrement et du déchiffrement avec des données valides
+// Test encryption and decryption with valid data
 func TestEncryptionDecryption(t *testing.T) {
 	ciphertext, err := communication.EncryptAESGCM([]byte(testMessage), testMasterKey)
 	if err != nil {
-		t.Fatalf("Erreur de chiffrement : %v", err)
+		t.Fatalf("Encryption failed: %v", err)
 	}
 
 	plaintext, err := communication.DecryptAESGCM(ciphertext, testMasterKey)
 	if err != nil {
-		t.Fatalf("Erreur de déchiffrement : %v", err)
+		t.Fatalf("Decryption failed: %v", err)
 	}
 
 	if string(plaintext) != testMessage {
-		t.Errorf("Le message déchiffré ne correspond pas au message original")
+		t.Errorf("Decrypted message does not match original")
 	}
 }
 
-// Test du déchiffrement de données corrompues
+// Test decryption with corrupted data
 func TestDecryptCorruptedData(t *testing.T) {
 	ciphertext, err := communication.EncryptAESGCM([]byte(testMessage), testMasterKey)
 	if err != nil {
-		t.Fatalf("Erreur de chiffrement : %v", err)
+		t.Fatalf("Encryption failed: %v", err)
 	}
 
-	// Corruption du message chiffré (modification d'un octet)
+	// Corrupting ciphertext by modifying last character
 	corruptedCiphertext := ciphertext[:len(ciphertext)-5] + "XYZ123"
 
 	_, err = communication.DecryptAESGCM(corruptedCiphertext, testMasterKey)
 	if err == nil {
-		t.Errorf("Le déchiffrement de données corrompues devrait échouer")
+		t.Errorf("Decryption should fail for corrupted data")
 	}
 }
 
-// Test de la génération HMAC
+// Test HMAC generation
 func TestGenerateHMAC(t *testing.T) {
 	key := []byte("secretkey")
-	message := "message-test"
+	message := "test-message"
 
-	expectedHMAC := communication.GenerateHMAC(message, key)
-	computedHMAC := communication.GenerateHMAC(message, key)
+	hmac1 := communication.GenerateHMAC(message, key)
+	hmac2 := communication.GenerateHMAC(message, key)
 
-	if expectedHMAC != computedHMAC {
-		t.Errorf("Les HMAC ne correspondent pas. Attendu: %s, Reçu: %s", expectedHMAC, computedHMAC)
+	if hmac1 != hmac2 {
+		t.Errorf("HMAC mismatch. Expected %s, got %s", hmac1, hmac2)
 	}
 }
 
-// Test des cas limites de chiffrement et déchiffrement
+// Test encryption and decryption edge cases
 func TestEncryptDecryptEdgeCases(t *testing.T) {
 	testCases := []struct {
 		input      string
 		masterKey  []byte
 		shouldFail bool
 	}{
-		{"", []byte("testkey"), true}, // Message vide doit échouer
-		{"Short", []byte("shortkey"), false},
-		{"Message très long....", []byte("longsecurekey123"), false},
-		{"Corrupted", []byte("longsecurekey123"), true}, // Doit échouer après corruption
+		{"", []byte("testkey"), true}, // Empty message should fail
+		{"Short", testMasterKey, false},
+		{"Long test message for security", testMasterKey, false},
+		{"Corrupted", testMasterKey, true}, // Expect failure after corruption
 	}
 
 	for _, tc := range testCases {
 		ciphertext, err := communication.EncryptAESGCM([]byte(tc.input), tc.masterKey)
 
-		if tc.input == "" {
+		if tc.shouldFail && tc.input == "" {
 			if err == nil {
-				t.Errorf("Expected failure for empty input, but encryption succeeded")
-			} else {
-				t.Logf("Expected error for empty input, received: %v", err)
+				t.Errorf("Expected encryption failure for empty input: %q", tc.input)
 			}
 			continue
 		}
 
 		if err != nil {
-			t.Errorf("Erreur de chiffrement pour l'entrée : %s, erreur : %v", tc.input, err)
+			t.Errorf("Encryption failed for input: %q, error: %v", tc.input, err)
 			continue
 		}
 
-		// Corruption intentionnelle du message chiffré pour vérifier l'échec attendu
+		// Corrupt ciphertext if needed
 		if tc.shouldFail && tc.input == "Corrupted" {
-			ciphertext = ciphertext[:len(ciphertext)-1] + "X" // Corruption volontaire
+			ciphertext = ciphertext[:len(ciphertext)-1] + "X"
 		}
 
 		decrypted, err := communication.DecryptAESGCM(ciphertext, tc.masterKey)
 		if tc.shouldFail {
 			if err == nil {
-				t.Errorf("Expected failure but got success for input: %s", tc.input)
+				t.Errorf("Expected failure but succeeded for input: %q", tc.input)
 			}
 		} else {
 			if err != nil {
-				t.Errorf("Decryption failed for input: %s, error: %v", tc.input, err)
+				t.Errorf("Decryption failed for input: %q, error: %v", tc.input, err)
 			} else if string(decrypted) != tc.input {
-				t.Errorf("Le message déchiffré ne correspond pas au message original pour l'entrée : %s", tc.input)
+				t.Errorf("Decrypted message does not match original for input: %q", tc.input)
 			}
 		}
 	}
 }
 
-// Test des cas d'erreur pour le déchiffrement
+// Test decryption error cases
 func TestDecryptAESGCMErrorCases(t *testing.T) {
-	// Test des données vides
 	_, err := communication.DecryptAESGCM("", testMasterKey)
 	if err == nil {
-		t.Errorf("Expected error for empty input, but got nil")
+		t.Error("Expected error for empty input")
 	}
 
-	// Test avec des données non encodées en base64
-	_, err = communication.DecryptAESGCM("invalid_base64_data", testMasterKey)
+	_, err = communication.DecryptAESGCM("invalid_base64", testMasterKey)
 	if err == nil {
-		t.Errorf("Expected error for invalid base64 data, but got nil")
+		t.Error("Expected error for invalid base64 data")
 	}
 
-	// Test avec un message tronqué
-	encrypted, _ := communication.EncryptAESGCM([]byte("Test message"), testMasterKey)
+	encrypted, _ := communication.EncryptAESGCM([]byte(testMessage), testMasterKey)
 	truncatedCiphertext := encrypted[:len(encrypted)-5]
 	_, err = communication.DecryptAESGCM(truncatedCiphertext, testMasterKey)
 	if err == nil {
-		t.Errorf("Expected error for truncated input, but got nil")
+		t.Error("Expected error for truncated input")
 	}
 }
 
-// Test de performance du chiffrement et du déchiffrement
+// Test encryption/decryption performance
 func TestEncryptionDecryptionPerformance(t *testing.T) {
-	largeMessage := make([]byte, 1<<20) // 1 MB de données
-	_, err := communication.EncryptAESGCM(largeMessage, testMasterKey)
+	largeMessage := make([]byte, 1<<20) // 1 MB data
+
+	encrypted, err := communication.EncryptAESGCM(largeMessage, testMasterKey)
 	if err != nil {
-		t.Fatalf("Erreur de chiffrement de gros message : %v", err)
+		t.Fatalf("Encryption failed for large data: %v", err)
 	}
 
-	encrypted, _ := communication.EncryptAESGCM(largeMessage, testMasterKey)
 	_, err = communication.DecryptAESGCM(encrypted, testMasterKey)
 	if err != nil {
-		t.Fatalf("Erreur de déchiffrement de gros message : %v", err)
+		t.Fatalf("Decryption failed for large data: %v", err)
 	}
 }
 
-// Test pour vérifier la gestion des clés incorrectes
+// Test decryption with incorrect key
 func TestDecryptWithWrongKey(t *testing.T) {
-	wrongKey := []byte("thisisawrongkeyfortest!!")
+	wrongKey := []byte("wrongkeyfortesting")
 	ciphertext, err := communication.EncryptAESGCM([]byte(testMessage), testMasterKey)
 	if err != nil {
-		t.Fatalf("Erreur de chiffrement : %v", err)
+		t.Fatalf("Encryption failed: %v", err)
 	}
 
 	_, err = communication.DecryptAESGCM(ciphertext, wrongKey)
 	if err == nil {
-		t.Errorf("Le déchiffrement avec une mauvaise clé devrait échouer")
+		t.Errorf("Decryption should fail with wrong key")
 	}
 }

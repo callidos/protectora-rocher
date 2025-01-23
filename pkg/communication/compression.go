@@ -7,59 +7,43 @@ import (
 	"io"
 )
 
-// CompressData compresse les données de manière asynchrone et renvoie un canal de résultat.
 func CompressData(data []byte) ([]byte, error) {
-	resultChan := make(chan []byte, 1)
-	errorChan := make(chan error, 1)
-
-	go func() {
+	if len(data) == 0 {
 		var buffer bytes.Buffer
 		writer := gzip.NewWriter(&buffer)
-
-		_, err := writer.Write(data)
-		if err != nil {
-			errorChan <- fmt.Errorf("erreur lors de la compression: %v", err)
-			return
+		if err := writer.Close(); err != nil {
+			return nil, fmt.Errorf("failed to close gzip writer: %w", err)
 		}
-		writer.Close()
-
-		resultChan <- buffer.Bytes()
-	}()
-
-	select {
-	case result := <-resultChan:
-		return result, nil
-	case err := <-errorChan:
-		return nil, err
+		return buffer.Bytes(), nil
 	}
+
+	var buffer bytes.Buffer
+	writer := gzip.NewWriter(&buffer)
+	if _, err := writer.Write(data); err != nil {
+		return nil, fmt.Errorf("compression failed: %w", err)
+	}
+	if err := writer.Close(); err != nil {
+		return nil, fmt.Errorf("failed to close gzip writer: %w", err)
+	}
+
+	return buffer.Bytes(), nil
 }
 
-// DecompressData décompresse les données de manière asynchrone et renvoie un canal de résultat.
 func DecompressData(data []byte) ([]byte, error) {
-	resultChan := make(chan []byte, 1)
-	errorChan := make(chan error, 1)
-
-	go func() {
-		reader, err := gzip.NewReader(bytes.NewReader(data))
-		if err != nil {
-			errorChan <- fmt.Errorf("erreur lors de la création du lecteur de décompression: %v", err)
-			return
-		}
-		defer reader.Close()
-
-		uncompressedData, err := io.ReadAll(reader)
-		if err != nil {
-			errorChan <- fmt.Errorf("erreur lors de la lecture des données décompressées: %v", err)
-			return
-		}
-
-		resultChan <- uncompressedData
-	}()
-
-	select {
-	case result := <-resultChan:
-		return result, nil
-	case err := <-errorChan:
-		return nil, err
+	if len(data) == 0 {
+		return nil, fmt.Errorf("compressed data is empty")
 	}
+
+	reader, err := gzip.NewReader(bytes.NewReader(data))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create gzip reader: %w", err)
+	}
+	defer reader.Close()
+
+	uncompressedData, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read decompressed data: %w", err)
+	}
+
+	return uncompressedData, nil
 }

@@ -13,9 +13,7 @@ import (
 	"github.com/cloudflare/circl/kem/kyber/kyber768"
 )
 
-const (
-	keyRotationInterval = 10 * time.Minute
-)
+const keyRotationInterval = 10 * time.Minute
 
 var (
 	mutex       sync.Mutex
@@ -23,26 +21,16 @@ var (
 	lastKeyTime time.Time
 )
 
-// Resultat pour les échanges de clé
 type KeyExchangeResult struct {
 	Key [32]byte
 	Err error
 }
 
 func GenerateEd25519KeyPair() (ed25519.PublicKey, ed25519.PrivateKey, error) {
-	pub, priv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		return nil, nil, fmt.Errorf("erreur de génération Ed25519 : %v", err)
-	}
-	return pub, priv, nil
+	return ed25519.GenerateKey(rand.Reader)
 }
 
-func PerformAuthenticatedKeyExchange(
-	conn net.Conn,
-	privateEd25519 ed25519.PrivateKey,
-	publicEd25519 ed25519.PublicKey,
-) (<-chan KeyExchangeResult, error) {
-
+func PerformAuthenticatedKeyExchange(conn net.Conn, privateKey ed25519.PrivateKey, publicKey ed25519.PublicKey) (<-chan KeyExchangeResult, error) {
 	resultChan := make(chan KeyExchangeResult, 1)
 
 	go func() {
@@ -52,7 +40,7 @@ func PerformAuthenticatedKeyExchange(
 		defer mutex.Unlock()
 
 		if time.Since(lastKeyTime) > keyRotationInterval || currentKey == [32]byte{} {
-			if err := exchangeNewKyberSessionKey(conn, privateEd25519); err != nil {
+			if err := performKyberKeyExchange(conn, privateKey); err != nil {
 				resultChan <- KeyExchangeResult{Err: fmt.Errorf("échec de l'échange de clé Kyber : %v", err)}
 				return
 			}
@@ -65,24 +53,24 @@ func PerformAuthenticatedKeyExchange(
 	return resultChan, nil
 }
 
-func exchangeNewKyberSessionKey(conn net.Conn, privateEd25519 ed25519.PrivateKey) error {
+func performKyberKeyExchange(conn net.Conn, privateKey ed25519.PrivateKey) error {
 	pkServer, skServer, err := kyber768.GenerateKeyPair(rand.Reader)
 	if err != nil {
-		return fmt.Errorf("erreur de génération de paire Kyber768 : %v", err)
+		return fmt.Errorf("erreur lors de la génération de la paire Kyber768 : %v", err)
 	}
 
 	pkBytes, err := pkServer.MarshalBinary()
 	if err != nil {
-		return fmt.Errorf("erreur de sérialisation pk Kyber : %v", err)
+		return fmt.Errorf("erreur de sérialisation de la clé publique Kyber : %v", err)
 	}
 
-	signature := ed25519.Sign(privateEd25519, pkBytes)
+	signature := ed25519.Sign(privateKey, pkBytes)
 
 	if err := sendBytesWithLength(conn, pkBytes); err != nil {
-		return fmt.Errorf("erreur lors de l'envoi de pkKyber : %v", err)
+		return fmt.Errorf("échec de l'envoi de la clé publique Kyber : %v", err)
 	}
 	if err := sendBytesWithLength(conn, signature); err != nil {
-		return fmt.Errorf("erreur lors de l'envoi de la signature Ed25519 : %v", err)
+		return fmt.Errorf("échec de l'envoi de la signature Ed25519 : %v", err)
 	}
 
 	ctClient, err := receiveBytesWithLength(conn)
@@ -90,11 +78,15 @@ func exchangeNewKyberSessionKey(conn net.Conn, privateEd25519 ed25519.PrivateKey
 		return fmt.Errorf("erreur de réception du ciphertext Kyber : %v", err)
 	}
 	if len(ctClient) != kyber768.CiphertextSize {
-		return fmt.Errorf("taille invalide de ciphertext Kyber, reçu %d octets", len(ctClient))
+		return fmt.Errorf("taille du ciphertext Kyber invalide, reçu %d octets", len(ctClient))
 	}
 
 	sharedSecret := make([]byte, kyber768.SharedKeySize)
 	skServer.DecapsulateTo(sharedSecret, ctClient)
+
+	if len(sharedSecret) != kyber768.SharedKeySize {
+		return fmt.Errorf("taille de la clé partagée Kyber incorrecte")
+	}
 
 	copy(currentKey[:], sharedSecret)
 
@@ -102,28 +94,30 @@ func exchangeNewKyberSessionKey(conn net.Conn, privateEd25519 ed25519.PrivateKey
 }
 
 func sendBytesWithLength(conn net.Conn, data []byte) error {
-	var lengthBytes [4]byte
-	binary.BigEndian.PutUint32(lengthBytes[:], uint32(len(data)))
+	length := uint32(len(data))
+	lenBuf := make([]byte, 4)
+	binary.BigEndian.PutUint32(lenBuf, length)
 
-	if _, err := conn.Write(lengthBytes[:]); err != nil {
-		return err
-	}
-	if _, err := conn.Write(data); err != nil {
-		return err
+	if _, err := conn.Write(append(lenBuf, data...)); err != nil {
+		return fmt.Errorf("échec de l'envoi des données")
 	}
 	return nil
 }
 
 func receiveBytesWithLength(conn net.Conn) ([]byte, error) {
-	var lengthBytes [4]byte
-	if _, err := io.ReadFull(conn, lengthBytes[:]); err != nil {
-		return nil, err
+	lenBuf := make([]byte, 4)
+	if _, err := io.ReadFull(conn, lenBuf); err != nil {
+		return nil, fmt.Errorf("échec de la lecture de la longueur des données")
 	}
-	length := binary.BigEndian.Uint32(lengthBytes[:])
+
+	length := binary.BigEndian.Uint32(lenBuf)
+	if length > 65536 {
+		return nil, fmt.Errorf("données trop volumineuses")
+	}
 
 	buf := make([]byte, length)
 	if _, err := io.ReadFull(conn, buf); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("échec de la lecture des données")
 	}
 	return buf, nil
 }
