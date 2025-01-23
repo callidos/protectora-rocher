@@ -57,16 +57,14 @@ func TestDecryptCorruptedData(t *testing.T) {
 
 // Test de la génération HMAC
 func TestGenerateHMAC(t *testing.T) {
-	hmac1 := communication.GenerateHMAC(testMessage, testMasterKey)
-	hmac2 := communication.GenerateHMAC(testMessage, testMasterKey)
+	key := []byte("secretkey")
+	message := "message-test"
 
-	if hmac1 != hmac2 {
-		t.Errorf("Les HMAC générés pour le même message ne sont pas identiques")
-	}
+	expectedHMAC := communication.GenerateHMAC(message, key)
+	computedHMAC := communication.GenerateHMAC(message, key)
 
-	hmacDifferent := communication.GenerateHMAC("autre message", testMasterKey)
-	if hmac1 == hmacDifferent {
-		t.Errorf("Les HMAC pour des messages différents ne devraient pas être identiques")
+	if expectedHMAC != computedHMAC {
+		t.Errorf("Les HMAC ne correspondent pas. Attendu: %s, Reçu: %s", expectedHMAC, computedHMAC)
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
+	"strings"
 )
 
 func DeriveKeys(masterKey []byte) ([]byte, []byte, error) {
@@ -154,7 +155,13 @@ func DecryptAESGCM(ciphertextBase64 string, masterKey []byte) ([]byte, error) {
 }
 
 func GenerateHMAC(message string, key []byte) string {
+	// Normalisation du message pour éviter les erreurs dues aux espaces
+	normalizedMessage := strings.TrimSpace(message)
+
 	mac := hmac.New(sha256.New, key)
-	mac.Write([]byte(message))
-	return base64.StdEncoding.EncodeToString(mac.Sum(nil))
+	mac.Write([]byte(normalizedMessage))
+	hmacValue := mac.Sum(nil)
+
+	encodedHMAC := base64.StdEncoding.EncodeToString(hmacValue)
+	return encodedHMAC
 }

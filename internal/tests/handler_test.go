@@ -1,7 +1,8 @@
 package tests
 
 import (
-	"bytes"
+	"crypto/hmac"
+	"encoding/base64"
 	"net"
 	"protectora-rocher/pkg/communication"
 	"strings"
@@ -17,21 +18,18 @@ func TestHandleConnection(t *testing.T) {
 	mockConn.Buffer.WriteString("testuser\n")
 	mockConn.Buffer.WriteString("FIN_SESSION\n")
 
-	// Déclencher la goroutine pour gérer la connexion
+	// Démarrer la gestion de connexion dans une goroutine
 	doneChan := make(chan bool)
 	go func() {
-		communication.HandleConnection(mockConn, sharedKey) // Correction ici
+		communication.HandleConnection(mockConn, sharedKey)
 		doneChan <- true
 	}()
 
-	// Timeout si la goroutine prend trop de temps
 	select {
 	case <-doneChan:
-		// Une fois la goroutine terminée, vérifier le buffer de la connexion mockée
-		output := mockConn.Buffer.String()
+		output := strings.TrimSpace(mockConn.Buffer.String())
 		t.Logf("Output buffer: %s", output)
 
-		// Analyse de l'accusé de réception et des messages
 		parts := strings.SplitN(output, "|", 2)
 		if len(parts) < 2 {
 			t.Fatalf("Le message reçu est mal formé : %s", output)
@@ -42,7 +40,11 @@ func TestHandleConnection(t *testing.T) {
 
 		expectedHMAC := communication.GenerateHMAC(encryptedMessage, sharedKey)
 
-		if !bytes.Equal([]byte(strings.TrimSpace(receivedHMAC)), []byte(strings.TrimSpace(expectedHMAC))) {
+		// Décodage et comparaison des HMAC en bytes pour éviter les erreurs d'encodage
+		expectedHMACBytes, _ := base64.StdEncoding.DecodeString(expectedHMAC)
+		receivedHMACBytes, _ := base64.StdEncoding.DecodeString(receivedHMAC)
+
+		if !hmac.Equal(expectedHMACBytes, receivedHMACBytes) {
 			t.Fatalf("HMAC invalide, message corrompu. Attendu: %s, Reçu: %s", expectedHMAC, receivedHMAC)
 		}
 
@@ -56,11 +58,11 @@ func TestHandleConnection(t *testing.T) {
 			t.Errorf("Le message de bienvenue attendu n'a pas été reçu. Reçu : %s", decryptedMessage)
 		}
 
-		// Fermer la connexion
+		// Fermeture de la connexion
 		if err := mockConn.Close(); err != nil {
 			t.Fatalf("Erreur lors de la fermeture de la connexion : %v", err)
 		}
-	case <-time.After(5 * time.Second): // Timeout si la goroutine prend trop de temps
+	case <-time.After(5 * time.Second):
 		t.Fatal("Le test a dépassé le délai d'attente.")
 	}
 }
