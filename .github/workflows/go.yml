@@ -22,6 +22,9 @@ jobs:
         with:
           go-version: ${{ matrix.go-version }}
 
+      - name: Ensure Go modules are up-to-date
+        run: go get -u ./...
+
       - name: Verify Go modules
         run: go mod tidy && go mod verify
 
@@ -29,7 +32,7 @@ jobs:
         uses: actions/cache@v3
         with:
           path: ~/go/pkg/mod
-          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}-${{ github.sha }}
           restore-keys: |
             ${{ runner.os }}-go-
 
