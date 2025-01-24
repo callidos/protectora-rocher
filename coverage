@@ -1,0 +1,13 @@
+mode: set
+protectora-rocher/internal/tests/mock_connection.go:17.60,19.2 1 1
+protectora-rocher/internal/tests/mock_connection.go:21.61,23.21 1 1
+protectora-rocher/internal/tests/mock_connection.go:23.21,25.3 1 0
+protectora-rocher/internal/tests/mock_connection.go:26.2,26.26 1 1
+protectora-rocher/internal/tests/mock_connection.go:29.40,31.2 1 0
+protectora-rocher/internal/tests/mock_connection.go:33.48,34.21 1 0
+protectora-rocher/internal/tests/mock_connection.go:34.21,36.3 1 0
+protectora-rocher/internal/tests/mock_connection.go:37.2,37.17 1 0
+protectora-rocher/internal/tests/mock_connection.go:40.47,42.2 1 0
+protectora-rocher/internal/tests/mock_connection.go:44.62,44.76 1 0
+protectora-rocher/internal/tests/mock_connection.go:45.62,45.76 1 0
+protectora-rocher/internal/tests/mock_connection.go:46.62,46.76 1 0
