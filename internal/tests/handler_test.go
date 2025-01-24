@@ -5,19 +5,17 @@ import (
 	"encoding/base64"
 	"protectora-rocher/pkg/communication"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
 
-// Test de la gestion de la connexion avec un utilisateur valide
 func TestHandleConnection(t *testing.T) {
 	mockConn := &MockConnection{}
 	sharedKey := []byte("thisisaverysecurekey!")
 
-	mockConn.Buffer.WriteString("testuser\n")
-	mockConn.Buffer.WriteString("FIN_SESSION\n")
+	mockConn.Buffer.WriteString("testuser\nFIN_SESSION\n")
 
-	// Démarrer la gestion de connexion dans une goroutine
 	doneChan := make(chan bool)
 	go func() {
 		communication.HandleConnection(mockConn, mockConn, sharedKey)
@@ -26,128 +24,120 @@ func TestHandleConnection(t *testing.T) {
 
 	select {
 	case <-doneChan:
-		output := strings.TrimSpace(mockConn.Buffer.String())
-		t.Logf("Output buffer: %s", output)
-
-		parts := strings.SplitN(output, "|", 2)
-		if len(parts) < 2 {
-			t.Fatalf("Le message reçu est mal formé : %s", output)
-		}
-
-		encryptedMessage := parts[0]
-		receivedHMAC := strings.TrimSpace(parts[1])
-
-		expectedHMAC := communication.GenerateHMAC(encryptedMessage, sharedKey)
-
-		expectedHMACBytes, _ := base64.StdEncoding.DecodeString(expectedHMAC)
-		receivedHMACBytes, _ := base64.StdEncoding.DecodeString(receivedHMAC)
-
-		if !hmac.Equal(expectedHMACBytes, receivedHMACBytes) {
-			t.Fatalf("HMAC invalide, message corrompu. Attendu: %s, Reçu: %s", expectedHMAC, receivedHMAC)
-		}
-
-		decryptedMessage, err := communication.DecryptAESGCM(encryptedMessage, sharedKey)
-		if err != nil {
-			t.Fatalf("Erreur lors du déchiffrement du message de bienvenue : %v", err)
-		}
-
-		expectedWelcomeMessage := "Bienvenue testuser sur le serveur sécurisé."
-		if string(decryptedMessage) != expectedWelcomeMessage {
-			t.Errorf("Le message de bienvenue attendu n'a pas été reçu. Reçu : %s", decryptedMessage)
-		}
+		validateWelcomeMessage(t, mockConn.Buffer.String(), sharedKey, "testuser")
 	case <-time.After(5 * time.Second):
-		t.Fatal("Le test a dépassé le délai d'attente.")
+		t.Fatal("Timeout exceeded")
 	}
 }
 
-// Test du rejet de messages corrompus
 func TestRejectCorruptedMessage(t *testing.T) {
 	mockConn := &MockConnection{}
 	sharedKey := []byte("thisisaverysecurekey!")
 
-	mockConn.Buffer.WriteString("testuser\n")
-	mockConn.Buffer.WriteString("message-corrompu|mauvaisHMAC\n")
-	mockConn.Buffer.WriteString("FIN_SESSION\n")
+	mockConn.Buffer.WriteString("testuser\nmessage-corrompu|mauvaisHMAC\nFIN_SESSION\n")
 
 	go communication.HandleConnection(mockConn, mockConn, sharedKey)
-
 	time.Sleep(1 * time.Second)
 
-	output := mockConn.Buffer.String()
-	t.Logf("Output buffer for corrupted message: %s", output)
-
-	if strings.Contains(output, "Message reçu avec succès.") {
-		t.Errorf("Le message corrompu aurait dû être rejeté")
+	if strings.Contains(mockConn.Buffer.String(), "Message reçu avec succès.") {
+		t.Errorf("Corrupted message should have been rejected")
 	}
 }
 
-// Test de gestion d'une connexion interrompue
 func TestHandleConnectionWithError(t *testing.T) {
 	mockConn := &MockConnection{}
 	sharedKey := []byte("thisisaverysecurekey!")
 
-	go communication.HandleConnection(mockConn, mockConn, sharedKey)
+	mockConn.Buffer.WriteString("\n")
 
-	time.Sleep(1 * time.Second)
+	var wg sync.WaitGroup
+	wg.Add(1)
 
-	t.Log("Test de gestion des connexions avec interruption")
+	go func() {
+		defer wg.Done()
+		communication.HandleConnection(mockConn, mockConn, sharedKey)
+	}()
+
+	wg.Wait()
+
+	output := mockConn.Buffer.String()
+	if !strings.Contains(output, "Erreur: Nom d'utilisateur vide") {
+		t.Errorf("Expected error for empty username but got: %s", output)
+	}
 }
 
-// Test de la durée de session
 func TestHandleConnectionSessionDuration(t *testing.T) {
 	mockConn := &MockConnection{}
 	sharedKey := []byte("thisisaverysecurekey!")
 
-	mockConn.Buffer.WriteString("testuser\n")
-	mockConn.Buffer.WriteString("FIN_SESSION\n")
+	mockConn.Buffer.WriteString("testuser\nFIN_SESSION\n")
 
 	go communication.HandleConnection(mockConn, mockConn, sharedKey)
-
 	time.Sleep(3 * time.Second)
 
 	if mockConn.Buffer.Len() == 0 {
-		t.Errorf("Aucun message échangé pendant la session")
+		t.Errorf("No messages exchanged during session")
 	}
 }
 
-// Test de réception de plusieurs messages en séquence
 func TestHandleMultipleMessages(t *testing.T) {
 	mockConn := &MockConnection{}
 	sharedKey := []byte("thisisaverysecurekey!")
 
 	mockConn.Buffer.WriteString("testuser\n")
-
 	messages := []string{"Message 1", "Message 2", "Message 3"}
-	for _, msg := range messages {
-		encryptedMessage, _ := communication.EncryptAESGCM([]byte(msg), sharedKey)
-		hmac := communication.GenerateHMAC(encryptedMessage, sharedKey)
-		mockConn.Buffer.WriteString(encryptedMessage + "|" + hmac + "\n")
-	}
 
+	for _, msg := range messages {
+		encrypted, _ := communication.EncryptAESGCM([]byte(msg), sharedKey)
+		hmacValue := communication.GenerateHMAC(encrypted, sharedKey)
+		mockConn.Buffer.WriteString(encrypted + "|" + hmacValue + "\n")
+	}
 	mockConn.Buffer.WriteString("FIN_SESSION\n")
 
 	go communication.HandleConnection(mockConn, mockConn, sharedKey)
-
 	time.Sleep(2 * time.Second)
 
-	output := mockConn.Buffer.String()
-	t.Logf("Output buffer after processing: %s", output)
-
-	if !containsDecryptedAck(output, "Message reçu avec succès.", sharedKey) {
-		t.Errorf("L'accusé de réception du message n'a pas été reçu")
+	if !containsDecryptedAck(mockConn.Buffer.String(), "Message reçu avec succès.", sharedKey) {
+		t.Errorf("Acknowledgment was not received")
 	}
 }
 
-// containsDecryptedAck vérifie si un accusé de réception est présent après déchiffrement.
-func containsDecryptedAck(fullOutput string, expectedAck string, sharedKey []byte) bool {
-	lines := strings.Split(strings.TrimSpace(fullOutput), "\n")
-	for _, line := range lines {
+func TestInvalidUsernameHandling(t *testing.T) {
+	mockConn := &MockConnection{}
+	sharedKey := []byte("thisisaverysecurekey!")
+
+	mockConn.Buffer.WriteString("\nFIN_SESSION\n")
+
+	go communication.HandleConnection(mockConn, mockConn, sharedKey)
+	time.Sleep(1 * time.Second)
+
+	output := mockConn.Buffer.String()
+	if !strings.Contains(output, "Erreur: Nom d'utilisateur vide") {
+		t.Errorf("Session should not start with empty username, but it did")
+	}
+}
+
+func TestEmptyMessageHandling(t *testing.T) {
+	mockConn := &MockConnection{}
+	sharedKey := []byte("thisisaverysecurekey!")
+
+	mockConn.Buffer.WriteString("testuser\n|\nFIN_SESSION\n")
+
+	go communication.HandleConnection(mockConn, mockConn, sharedKey)
+	time.Sleep(1 * time.Second)
+
+	if strings.Contains(mockConn.Buffer.String(), "Message reçu avec succès.") {
+		t.Errorf("Empty message should not be acknowledged")
+	}
+}
+
+func containsDecryptedAck(fullOutput, expectedAck string, sharedKey []byte) bool {
+	for _, line := range strings.Split(strings.TrimSpace(fullOutput), "\n") {
 		parts := strings.SplitN(line, "|", 2)
 		if len(parts) != 2 {
 			continue
 		}
-		encrypted := parts[0]
-		receivedHMAC := parts[1]
+		encrypted, receivedHMAC := parts[0], parts[1]
 
 		expectedHMAC := communication.GenerateHMAC(encrypted, sharedKey)
 		if expectedHMAC != strings.TrimSpace(receivedHMAC) {
@@ -155,13 +145,36 @@ func containsDecryptedAck(fullOutput string, expectedAck string, sharedKey []byt
 		}
 
 		decrypted, err := communication.DecryptAESGCM(encrypted, sharedKey)
-		if err != nil {
-			continue
-		}
-
-		if string(decrypted) == expectedAck {
+		if err == nil && string(decrypted) == expectedAck {
 			return true
 		}
 	}
 	return false
+}
+
+func validateWelcomeMessage(t *testing.T, output string, sharedKey []byte, username string) {
+	parts := strings.SplitN(strings.TrimSpace(output), "|", 2)
+	if len(parts) < 2 {
+		t.Fatalf("Malformed received message: %s", output)
+	}
+
+	encryptedMessage, receivedHMAC := parts[0], strings.TrimSpace(parts[1])
+	expectedHMAC := communication.GenerateHMAC(encryptedMessage, sharedKey)
+
+	expectedHMACBytes, _ := base64.StdEncoding.DecodeString(expectedHMAC)
+	receivedHMACBytes, _ := base64.StdEncoding.DecodeString(receivedHMAC)
+
+	if !hmac.Equal(expectedHMACBytes, receivedHMACBytes) {
+		t.Fatalf("HMAC mismatch. Expected: %s, Got: %s", expectedHMAC, receivedHMAC)
+	}
+
+	decryptedMessage, err := communication.DecryptAESGCM(encryptedMessage, sharedKey)
+	if err != nil {
+		t.Fatalf("Decryption failed: %v", err)
+	}
+
+	expectedWelcomeMessage := "Bienvenue " + username + " sur le serveur sécurisé."
+	if string(decryptedMessage) != expectedWelcomeMessage {
+		t.Errorf("Unexpected welcome message. Got: %s", decryptedMessage)
+	}
 }

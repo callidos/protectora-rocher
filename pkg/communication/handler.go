@@ -2,23 +2,33 @@ package communication
 
 import (
 	"bufio"
-	"bytes"
+	"crypto/hmac"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"protectora-rocher/pkg/utils"
 	"strings"
+	"time"
 )
 
 func HandleConnection(reader io.Reader, writer io.Writer, sharedKey []byte) {
 	utils.Logger.Info("Nouvelle connexion traitée", map[string]interface{}{})
 
 	scanner := bufio.NewScanner(reader)
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024) // Augmenter la taille du buffer
 
 	if !scanner.Scan() {
 		utils.Logger.Warning("Erreur de lecture du nom d'utilisateur", map[string]interface{}{})
+		fmt.Fprintln(writer, "Erreur: Impossible de lire le nom d'utilisateur")
 		return
 	}
+
 	username := strings.TrimSpace(scanner.Text())
+	if username == "" {
+		utils.Logger.Warning("Nom d'utilisateur vide, fermeture de la connexion", map[string]interface{}{})
+		fmt.Fprintln(writer, "Erreur: Nom d'utilisateur vide")
+		return
+	}
 
 	utils.Logger.Info("Utilisateur connecté", map[string]interface{}{
 		"username": username,
@@ -49,7 +59,19 @@ func HandleConnection(reader io.Reader, writer io.Writer, sharedKey []byte) {
 			}
 			messageChan <- receivedMessage
 		}
+
+		if err := scanner.Err(); err != nil {
+			utils.Logger.Error("Erreur de lecture de la connexion", map[string]interface{}{
+				"error": err.Error(),
+			})
+		}
 		doneChan <- true
+	}()
+
+	defer func() {
+		if closer, ok := writer.(io.Closer); ok {
+			closer.Close()
+		}
 	}()
 
 	for {
@@ -86,17 +108,17 @@ func processIncomingMessage(receivedMessage string, sharedKey []byte, writer io.
 	encryptedMessage := parts[0]
 	receivedHMAC := strings.TrimSpace(parts[1])
 
-	utils.LogInfo("Message reçu", map[string]interface{}{
+	utils.Logger.Info("Message reçu", map[string]interface{}{
 		"encrypted_message": encryptedMessage,
 		"received_hmac":     receivedHMAC,
 	})
 
+	if _, err := base64.StdEncoding.DecodeString(encryptedMessage); err != nil {
+		return fmt.Errorf("message mal encodé : %v", err)
+	}
+
 	expectedHMAC := GenerateHMAC(encryptedMessage, sharedKey)
-
-	receivedHMAC = strings.ReplaceAll(receivedHMAC, " ", "")
-	expectedHMAC = strings.ReplaceAll(expectedHMAC, " ", "")
-
-	if !bytes.Equal([]byte(receivedHMAC), []byte(expectedHMAC)) {
+	if !hmac.Equal([]byte(receivedHMAC), []byte(expectedHMAC)) {
 		return fmt.Errorf("HMAC invalide, message rejeté")
 	}
 
@@ -105,19 +127,19 @@ func processIncomingMessage(receivedMessage string, sharedKey []byte, writer io.
 		return fmt.Errorf("erreur de déchiffrement : %v", err)
 	}
 
-	utils.LogInfo("Message reçu et déchiffré", map[string]interface{}{
+	utils.Logger.Info("Message reçu et déchiffré", map[string]interface{}{
 		"user":    username,
 		"message": string(decryptedMessage),
 	})
 
 	if err := sendAcknowledgment(writer, sharedKey); err != nil {
-		utils.LogError("Erreur lors de l'envoi de l'accusé de réception", map[string]interface{}{
+		utils.Logger.Error("Erreur lors de l'envoi de l'accusé de réception", map[string]interface{}{
 			"error": err.Error(),
 		})
 		return fmt.Errorf("erreur d'envoi de l'accusé de réception : %v", err)
 	}
 
-	utils.LogInfo("Accusé de réception envoyé avec succès", map[string]interface{}{
+	utils.Logger.Info("Accusé de réception envoyé avec succès", map[string]interface{}{
 		"user": username,
 	})
 
@@ -139,7 +161,7 @@ func sendWelcomeMessage(writer io.Writer, sharedKey []byte, username string) err
 		return fmt.Errorf("erreur d'envoi du message de bienvenue: %v", err)
 	}
 
-	utils.LogInfo("Message de bienvenue envoyé avec succès", map[string]interface{}{
+	utils.Logger.Info("Message de bienvenue envoyé avec succès", map[string]interface{}{
 		"username": username,
 	})
 
@@ -156,12 +178,17 @@ func sendAcknowledgment(writer io.Writer, sharedKey []byte) error {
 	}
 
 	hmac := GenerateHMAC(encryptedAck, sharedKey)
+
+	if w, ok := writer.(interface{ SetWriteDeadline(time.Time) error }); ok {
+		w.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	}
+
 	_, err = fmt.Fprintf(writer, "%s|%s\n", encryptedAck, hmac)
 	if err != nil {
 		return fmt.Errorf("erreur d'envoi de l'accusé de réception: %v", err)
 	}
 
-	utils.LogInfo("Accusé de réception envoyé avec succès", map[string]interface{}{})
+	utils.Logger.Info("Accusé de réception envoyé avec succès", map[string]interface{}{})
 
 	return nil
 }
