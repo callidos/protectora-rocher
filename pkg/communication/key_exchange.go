@@ -6,7 +6,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"net"
 	"sync"
 	"time"
 
@@ -30,7 +29,7 @@ func GenerateEd25519KeyPair() (ed25519.PublicKey, ed25519.PrivateKey, error) {
 	return ed25519.GenerateKey(rand.Reader)
 }
 
-func PerformAuthenticatedKeyExchange(conn net.Conn, privateKey ed25519.PrivateKey, publicKey ed25519.PublicKey) (<-chan KeyExchangeResult, error) {
+func PerformAuthenticatedKeyExchange(conn io.ReadWriter, privateKey ed25519.PrivateKey, publicKey ed25519.PublicKey) (<-chan KeyExchangeResult, error) {
 	resultChan := make(chan KeyExchangeResult, 1)
 
 	go func() {
@@ -53,7 +52,7 @@ func PerformAuthenticatedKeyExchange(conn net.Conn, privateKey ed25519.PrivateKe
 	return resultChan, nil
 }
 
-func performKyberKeyExchange(conn net.Conn, privateKey ed25519.PrivateKey) error {
+func performKyberKeyExchange(conn io.ReadWriter, privateKey ed25519.PrivateKey) error {
 	pkServer, skServer, err := kyber768.GenerateKeyPair(rand.Reader)
 	if err != nil {
 		return fmt.Errorf("erreur lors de la génération de la paire Kyber768 : %v", err)
@@ -93,7 +92,7 @@ func performKyberKeyExchange(conn net.Conn, privateKey ed25519.PrivateKey) error
 	return nil
 }
 
-func sendBytesWithLength(conn net.Conn, data []byte) error {
+func sendBytesWithLength(conn io.Writer, data []byte) error {
 	length := uint32(len(data))
 	lenBuf := make([]byte, 4)
 	binary.BigEndian.PutUint32(lenBuf, length)
@@ -104,7 +103,7 @@ func sendBytesWithLength(conn net.Conn, data []byte) error {
 	return nil
 }
 
-func receiveBytesWithLength(conn net.Conn) ([]byte, error) {
+func receiveBytesWithLength(conn io.Reader) ([]byte, error) {
 	lenBuf := make([]byte, 4)
 	if _, err := io.ReadFull(conn, lenBuf); err != nil {
 		return nil, fmt.Errorf("échec de la lecture de la longueur des données")
