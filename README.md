@@ -1,3 +1,4 @@
+
 # R.O.C.H.E.R Protocol (Robust and Optimized Communication Harnessing Enhanced Resilience)
 
 **R.O.C.H.E.R** is an ultra-secure communication protocol designed for critical environments, such as military applications and highly confidential systems. It relies on a robust and modern architecture using advanced technologies to ensure the confidentiality, integrity, and availability of communications.
@@ -23,6 +24,8 @@
 - **Attack detection**: Protection against replay attacks with strict time windows.
 - **Modularity**: Designed as an independent protocol, easily integrable into other systems.
 - **GNARK Compatibility**: Secure authentication based on zero-knowledge proofs.
+- **Easy-to-use API**: Simplified API for developers to integrate the protocol easily.
+- **Flexible data handling**: Supports secure message sending and receiving with integrated encryption and compression.
 
 ---
 
@@ -37,8 +40,9 @@ The protocol follows a strict client-server architecture with a clear separation
 2. **Modules**:
    - **Encryption**: Handles sensitive data using AES-GCM.
    - **Compression**: Reduces message size with Gzip.
-   - **Key exchange**: Implements Ed25519 and Curve25519.
+   - **Key exchange**: Implements Ed25519 and Kyber for secure key exchange.
    - **Anti-replay**: Manages sequences and timestamps to prevent duplicates.
+   - **Session management**: Enables ephemeral or persistent session modes.
 
 ---
 
@@ -84,7 +88,7 @@ The protocol follows a strict client-server architecture with a clear separation
 
 ## Usage Example
 
-Here is a simple example showing how to send and receive a secure message using the R.O.C.H.E.R protocol.
+Here is a simple example showing how to use the R.O.C.H.E.R protocol to send and receive secure messages.
 
 ### Client Code
 
@@ -100,7 +104,7 @@ func main() {
     conn, _ := net.Dial("tcp", "localhost:8080")
     sharedKey := []byte("thisisaverysecurekey!")
 
-    err := communication.SendMessage(conn, "Hello, secure world!", sharedKey, 1)
+    err := communication.SendSecureMessage(conn, "Hello, secure world!", sharedKey, 1, 60)
     if err != nil {
         panic(err)
     }
@@ -114,7 +118,7 @@ package main
 
 import (
     "net"
-    "github.com/your-username/protectora-rocher/pkg/communication"
+    "github.com/callidos/protectora-rocher/pkg/communication"
 )
 
 func main() {
@@ -122,7 +126,7 @@ func main() {
     for {
         conn, _ := listener.Accept()
         sharedKey := []byte("thisisaverysecurekey!")
-        go communication.HandleConnection(conn, sharedKey)
+        go communication.HandleNewConnection(conn, conn, sharedKey)
     }
 }
 ```
@@ -131,7 +135,7 @@ func main() {
 
 ## Documentation
 
-For more details, check the [GoDoc documentation](https://pkg.go.dev/github.com/your-username/protectora-rocher/pkg/communication).
+For more details, check the [GoDoc documentation](https://pkg.go.dev/github.com/callidos/protectora-rocher/pkg/communication).
 
 ---
 
