@@ -33,7 +33,8 @@ func HandleNewConnection(reader io.Reader, writer io.Writer, sharedKey []byte) {
 }
 
 func PerformKeyExchange(conn io.ReadWriter, privKey []byte, pubKey []byte) (<-chan KeyExchangeResult, error) {
-	return PerformAuthenticatedKeyExchange(conn, privKey, pubKey)
+	return PerformAuthenticatedKeyExchange(conn, privKey)
+
 }
 
 func ResetSecurityState() {

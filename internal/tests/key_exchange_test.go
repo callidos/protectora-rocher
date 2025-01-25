@@ -20,26 +20,29 @@ func TestFullKyberExchange(t *testing.T) {
 
 	serverConn, clientConn := net.Pipe()
 
+	// Pass the private key as ed25519.PrivateKey
 	resultChan, err := communication.PerformAuthenticatedKeyExchange(
 		serverConn,
-		serverPrivKey,
-		serverPubKey,
+		serverPrivKey, // We use the private key directly, since the public key is not needed in this function.
 	)
 	if err != nil {
 		t.Fatalf("Server setup error: %v", err)
 	}
 
+	// Simulate client-side logic
 	clientSharedKey, clientErr := simulateClient(clientConn, serverPubKey)
 	if clientErr != nil {
 		t.Fatalf("Client error: %v", clientErr)
 	}
 	clientConn.Close()
 
+	// Get the key exchange result from the server
 	result := <-resultChan
 	if result.Err != nil {
 		t.Fatalf("Server error: %v", result.Err)
 	}
 
+	// Check if the shared keys match
 	if !bytes.Equal(result.Key[:], clientSharedKey) {
 		t.Fatalf("Shared keys do not match.\nServer: %x\nClient: %x", result.Key[:], clientSharedKey)
 	}
@@ -47,6 +50,7 @@ func TestFullKyberExchange(t *testing.T) {
 
 // simulateClient handles the client-side logic of the Kyber exchange
 func simulateClient(conn net.Conn, serverPubEd25519 ed25519.PublicKey) ([]byte, error) {
+	// Read the Kyber public key and signature
 	pkBytes, err := readBytesWithLength(conn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read Kyber public key: %v", err)
@@ -57,17 +61,21 @@ func simulateClient(conn net.Conn, serverPubEd25519 ed25519.PublicKey) ([]byte, 
 		return nil, fmt.Errorf("failed to read Ed25519 signature: %v", err)
 	}
 
+	// Verify the signature using the server's public key
 	if !ed25519.Verify(serverPubEd25519, pkBytes, signature) {
 		return nil, fmt.Errorf("invalid Ed25519 signature")
 	}
 
+	// Unpack the Kyber public key (no return value for Unpack)
 	var pkServer kyber768.PublicKey
-	pkServer.Unpack(pkBytes) // Unpack panics if data is incorrect
+	pkServer.Unpack(pkBytes) // This modifies pkServer directly
 
+	// Prepare ciphertext and shared key
 	ct := make([]byte, kyber768.CiphertextSize)
 	sharedKey := make([]byte, kyber768.SharedKeySize)
 	pkServer.EncapsulateTo(ct, sharedKey, nil)
 
+	// Send the ciphertext to the server
 	if err := writeBytesWithLength(conn, ct); err != nil {
 		return nil, fmt.Errorf("failed to send Kyber ciphertext: %v", err)
 	}
@@ -106,6 +114,3 @@ func writeBytesWithLength(conn net.Conn, data []byte) error {
 	_, err := conn.Write(data)
 	return err
 }
-
-// Custom error type for signature verification failure
-var ErrSignatureInvalid = fmt.Errorf("invalid Ed25519 signature")

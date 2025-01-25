@@ -12,16 +12,15 @@ import (
 	"io"
 )
 
-func DeriveKeys(masterKey []byte) ([]byte, []byte, error) {
+func DeriveKeys(masterKey []byte) (encryptionKey, hmacKey []byte, err error) {
 	if len(masterKey) == 0 {
 		return nil, nil, errors.New("master key cannot be empty")
 	}
-
 	hash := sha256.Sum256(masterKey)
 	return hash[:16], hash[16:], nil
 }
 
-func EncryptAESGCM(plaintext []byte, masterKey []byte) (string, error) {
+func EncryptAESGCM(plaintext, masterKey []byte) (string, error) {
 	if len(plaintext) == 0 {
 		return "", errors.New("input data cannot be empty")
 	}
@@ -31,10 +30,7 @@ func EncryptAESGCM(plaintext []byte, masterKey []byte) (string, error) {
 		return "", fmt.Errorf("key derivation failed: %w", err)
 	}
 
-	h := hmac.New(sha256.New, hmacKey)
-	h.Write(plaintext)
-	hmacValue := h.Sum(nil)
-
+	hmacValue := computeHMAC(plaintext, hmacKey)
 	dataToEncrypt := append(hmacValue, plaintext...)
 
 	block, err := aes.NewCipher(encryptionKey)
@@ -99,14 +95,9 @@ func DecryptAESGCM(ciphertextBase64 string, masterKey []byte) ([]byte, error) {
 		return nil, errors.New("decrypted data too short to contain valid HMAC")
 	}
 
-	expectedHMAC := decryptedData[:sha256.Size]
-	plaintext := decryptedData[sha256.Size:]
+	expectedHMAC, plaintext := decryptedData[:sha256.Size], decryptedData[sha256.Size:]
 
-	h := hmac.New(sha256.New, hmacKey)
-	h.Write(plaintext)
-	calculatedHMAC := h.Sum(nil)
-
-	if !hmac.Equal(expectedHMAC, calculatedHMAC) {
+	if !hmac.Equal(expectedHMAC, computeHMAC(plaintext, hmacKey)) {
 		return nil, errors.New("HMAC verification failed")
 	}
 
@@ -114,7 +105,11 @@ func DecryptAESGCM(ciphertextBase64 string, masterKey []byte) ([]byte, error) {
 }
 
 func GenerateHMAC(message string, key []byte) string {
+	return base64.StdEncoding.EncodeToString(computeHMAC([]byte(message), key))
+}
+
+func computeHMAC(data, key []byte) []byte {
 	mac := hmac.New(sha256.New, key)
-	mac.Write([]byte(message))
-	return base64.StdEncoding.EncodeToString(mac.Sum(nil))
+	mac.Write(data)
+	return mac.Sum(nil)
 }
