@@ -2,6 +2,7 @@ package tests
 
 import (
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -127,4 +128,26 @@ func TestMessagePerformance(t *testing.T) {
 	}
 
 	t.Logf("Time for 1000 messages: %v", time.Since(start))
+}
+
+func TestMessagePerformanceConcurrent(t *testing.T) {
+	mockConn := &MockConnection{}
+	key := []byte("securekey!")
+	msg := "Performance test message"
+
+	start := time.Now()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 1000; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := communication.SendMessage(mockConn, msg, key, 1, 0); err != nil {
+				t.Errorf("Error sending message: %v", err)
+			}
+		}()
+	}
+
+	wg.Wait()
+	t.Logf("Time for 1000 concurrent messages: %v", time.Since(start))
 }

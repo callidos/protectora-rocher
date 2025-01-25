@@ -17,6 +17,7 @@ func HandleConnection(reader io.Reader, writer io.Writer, sharedKey []byte) {
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024) // Augmenter la taille du buffer
 
+	// Lire le nom d'utilisateur
 	if !scanner.Scan() {
 		utils.Logger.Warning("Erreur de lecture du nom d'utilisateur", map[string]interface{}{})
 		fmt.Fprintln(writer, "Erreur: Impossible de lire le nom d'utilisateur")
@@ -25,8 +26,17 @@ func HandleConnection(reader io.Reader, writer io.Writer, sharedKey []byte) {
 
 	username := strings.TrimSpace(scanner.Text())
 	if username == "" {
+		// Cas où le nom d'utilisateur est vide, on ferme la connexion et on envoie un message d'erreur
 		utils.Logger.Warning("Nom d'utilisateur vide, fermeture de la connexion", map[string]interface{}{})
-		fmt.Fprintln(writer, "Erreur: Nom d'utilisateur vide")
+		fmt.Fprintln(writer, "Erreur: Impossible de lire le nom d'utilisateur ou nom d'utilisateur vide")
+
+		// Ajouter un log avant de fermer la connexion
+		utils.Logger.Debug("Fermeture de la connexion due à un nom d'utilisateur vide", map[string]interface{}{})
+
+		// Fermer la connexion si le nom d'utilisateur est vide
+		if closer, ok := writer.(io.Closer); ok {
+			closer.Close()
+		}
 		return
 	}
 
@@ -34,6 +44,7 @@ func HandleConnection(reader io.Reader, writer io.Writer, sharedKey []byte) {
 		"username": username,
 	})
 
+	// Envoi du message de bienvenue
 	if err := sendWelcomeMessage(writer, sharedKey, username); err != nil {
 		utils.Logger.Error("Erreur d'envoi du message de bienvenue", map[string]interface{}{
 			"error": err.Error(),
@@ -44,12 +55,15 @@ func HandleConnection(reader io.Reader, writer io.Writer, sharedKey []byte) {
 	messageChan := make(chan string)
 	doneChan := make(chan bool)
 
+	// Goroutine pour traiter les messages entrants
 	go func() {
 		for scanner.Scan() {
 			receivedMessage := strings.TrimSpace(scanner.Text())
 			utils.Logger.Debug("Message reçu", map[string]interface{}{
 				"message": receivedMessage,
 			})
+
+			// Si le message est "FIN_SESSION", fermer la session
 			if receivedMessage == "FIN_SESSION" {
 				utils.Logger.Info("Fin de session demandée par l'utilisateur", map[string]interface{}{
 					"username": username,
@@ -57,6 +71,8 @@ func HandleConnection(reader io.Reader, writer io.Writer, sharedKey []byte) {
 				doneChan <- true
 				return
 			}
+
+			// Sinon, envoyer le message au canal de traitement
 			messageChan <- receivedMessage
 		}
 
@@ -68,21 +84,26 @@ func HandleConnection(reader io.Reader, writer io.Writer, sharedKey []byte) {
 		doneChan <- true
 	}()
 
+	// Fermeture de la connexion si nécessaire
 	defer func() {
 		if closer, ok := writer.(io.Closer); ok {
 			closer.Close()
 		}
 	}()
 
+	// Traitement des messages reçus
 	for {
 		select {
 		case receivedMessage := <-messageChan:
+			// Traitement du message entrant
 			if err := processIncomingMessage(receivedMessage, sharedKey, writer, username); err != nil {
 				utils.Logger.Error("Erreur lors du traitement du message", map[string]interface{}{
 					"error":   err.Error(),
 					"message": receivedMessage,
 				})
 			}
+
+			// Envoi de l'accusé de réception
 			if err := sendAcknowledgment(writer, sharedKey); err != nil {
 				utils.Logger.Error("Erreur lors de l'envoi de l'accusé de réception", map[string]interface{}{
 					"error": err.Error(),
@@ -90,6 +111,7 @@ func HandleConnection(reader io.Reader, writer io.Writer, sharedKey []byte) {
 			}
 
 		case <-doneChan:
+			// Fin de la session
 			utils.Logger.Info("Fin de communication avec l'utilisateur", map[string]interface{}{
 				"username": username,
 			})
@@ -98,7 +120,6 @@ func HandleConnection(reader io.Reader, writer io.Writer, sharedKey []byte) {
 	}
 }
 
-// processIncomingMessage traite un message reçu et vérifie son intégrité.
 func processIncomingMessage(receivedMessage string, sharedKey []byte, writer io.Writer, username string) error {
 	parts := strings.SplitN(receivedMessage, "|", 2)
 	if len(parts) != 2 {
@@ -146,7 +167,6 @@ func processIncomingMessage(receivedMessage string, sharedKey []byte, writer io.
 	return nil
 }
 
-// sendWelcomeMessage envoie un message de bienvenue chiffré au client.
 func sendWelcomeMessage(writer io.Writer, sharedKey []byte, username string) error {
 	welcomeMessage := fmt.Sprintf("Bienvenue %s sur le serveur sécurisé.", username)
 
@@ -156,6 +176,7 @@ func sendWelcomeMessage(writer io.Writer, sharedKey []byte, username string) err
 	}
 
 	hmac := GenerateHMAC(encryptedMessage, sharedKey)
+
 	_, err = fmt.Fprintf(writer, "%s|%s\n", encryptedMessage, hmac)
 	if err != nil {
 		return fmt.Errorf("erreur d'envoi du message de bienvenue: %v", err)
@@ -168,7 +189,6 @@ func sendWelcomeMessage(writer io.Writer, sharedKey []byte, username string) err
 	return nil
 }
 
-// sendAcknowledgment envoie un accusé de réception au client.
 func sendAcknowledgment(writer io.Writer, sharedKey []byte) error {
 	ackMessage := "Message reçu avec succès."
 
