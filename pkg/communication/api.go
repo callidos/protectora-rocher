@@ -37,6 +37,14 @@ func PerformKeyExchange(conn io.ReadWriter, privKey []byte, pubKey []byte) (<-ch
 
 }
 
+func InitiateSecureCall(conn io.ReadWriter, key []byte) error {
+	return StartSecureCall(conn, key)
+}
+
+func TerminateSecureCall(conn io.ReadWriter, key []byte) {
+	StopSecureCall(conn, key)
+}
+
 func ResetSecurityState() {
 	ResetMessageHistory()
 	ResetKeyExchangeState()
