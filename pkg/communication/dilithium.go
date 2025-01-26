@@ -132,14 +132,27 @@ func performSignatureGeneration(t *testing.T) {
 }
 
 func performSignatureVerification(t *testing.T) {
-	pk, sk, _ := mode2.GenerateKey(rand.Reader)
+	// Générer les clés
+	pk, sk, err := mode2.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("Erreur de génération de clés: %v", err)
+	}
+
+	// Définir un message fixe
 	message := []byte("Message à signer")
+
+	// Générer la signature
 	signature := make([]byte, mode2.SignatureSize)
 	mode2.SignTo(sk, message, signature)
 
+	t.Logf("Message signé: %s", message)
+	t.Logf("Signature générée: %x", signature)
+	t.Logf("Clé publique utilisée pour vérification: %x", pk.Bytes())
+
+	// Vérification de la signature
 	if mode2.Verify(pk, message, signature) {
-		t.Log("Signature validée avec succès.")
+		t.Log("[DEBUG] Signature validée avec succès.")
 	} else {
-		t.Fatal("La signature est invalide.")
+		t.Fatal("[ERROR] La signature est invalide.")
 	}
 }

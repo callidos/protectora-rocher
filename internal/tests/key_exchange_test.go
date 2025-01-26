@@ -2,115 +2,161 @@ package tests
 
 import (
 	"bytes"
-	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/binary"
 	"fmt"
+	"io"
+	"log"
 	"net"
 	"protectora-rocher/pkg/communication"
 	"testing"
 
 	"github.com/cloudflare/circl/kem/kyber/kyber768"
+	"github.com/cloudflare/circl/sign/dilithium/mode2"
 )
+
+const maxDataSize = 65536
 
 // TestFullKyberExchange performs a full client-server key exchange simulation
 func TestFullKyberExchange(t *testing.T) {
-	serverPubKey, serverPrivKey, err := communication.GenerateEd25519KeyPair()
+	log.Println("[DEBUG] Début du test d'échange de clé Kyber-Dilithium")
+
+	serverPubKey, serverPrivKey, err := communication.GenerateDilithiumKeyPair()
 	if err != nil {
-		t.Fatalf("Failed to generate server Ed25519 keys: %v", err)
+		t.Fatalf("[ERROR] Échec de la génération des clés Dilithium du serveur: %v", err)
 	}
+	log.Println("[DEBUG] Clés Dilithium du serveur générées avec succès")
 
 	serverConn, clientConn := net.Pipe()
+	log.Println("[DEBUG] Connexion simulée entre le serveur et le client établie")
 
-	// Pass the private key as ed25519.PrivateKey
-	resultChan, err := communication.PerformAuthenticatedKeyExchange(
-		serverConn,
-		serverPrivKey, // We use the private key directly, since the public key is not needed in this function.
-	)
+	// Lancer l'échange de clés sécurisé côté serveur
+	resultChan, err := communication.PerformAuthenticatedKeyExchange(serverConn, serverPrivKey)
 	if err != nil {
-		t.Fatalf("Server setup error: %v", err)
+		t.Fatalf("[ERROR] Erreur lors de la configuration du serveur: %v", err)
 	}
+	log.Println("[DEBUG] Échange de clé sécurisé côté serveur lancé avec succès")
 
-	// Simulate client-side logic
+	// Simuler la logique côté client
 	clientSharedKey, clientErr := simulateClient(clientConn, serverPubKey)
 	if clientErr != nil {
-		t.Fatalf("Client error: %v", clientErr)
+		t.Fatalf("[ERROR] Erreur côté client: %v", clientErr)
 	}
+	log.Println("[DEBUG] Échange de clé côté client terminé avec succès")
 	clientConn.Close()
 
-	// Get the key exchange result from the server
+	// Récupérer le résultat de l'échange côté serveur
 	result := <-resultChan
 	if result.Err != nil {
-		t.Fatalf("Server error: %v", result.Err)
+		t.Fatalf("[ERROR] Erreur côté serveur: %v", result.Err)
+	}
+	log.Println("[DEBUG] Résultat de l'échange de clé reçu côté serveur")
+
+	log.Printf("[DEBUG] Clé partagée côté serveur : %x", result.Key[:])
+	log.Printf("[DEBUG] Clé partagée côté client : %x", clientSharedKey)
+
+	// Vérification si les clés partagées sont identiques
+	if !bytes.Equal(result.Key[:], clientSharedKey) {
+		t.Fatalf("[ERROR] Les clés partagées ne correspondent pas.\nServeur: %x\nClient: %x", result.Key[:], clientSharedKey)
 	}
 
-	// Check if the shared keys match
-	if !bytes.Equal(result.Key[:], clientSharedKey) {
-		t.Fatalf("Shared keys do not match.\nServer: %x\nClient: %x", result.Key[:], clientSharedKey)
-	}
+	log.Println("[DEBUG] Échange de clé Kyber-Dilithium réussi")
 }
 
 // simulateClient handles the client-side logic of the Kyber exchange
-func simulateClient(conn net.Conn, serverPubEd25519 ed25519.PublicKey) ([]byte, error) {
-	// Read the Kyber public key and signature
+func simulateClient(conn net.Conn, serverPubDilithium *mode2.PublicKey) ([]byte, error) {
+	log.Println("[DEBUG] Début de la simulation client")
+
 	pkBytes, err := readBytesWithLength(conn)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read Kyber public key: %v", err)
+		log.Printf("[ERROR] Échec de la lecture de la clé publique Kyber: %v", err)
+		return nil, fmt.Errorf("échec de la lecture de la clé publique Kyber : %v", err)
 	}
+
+	log.Printf("[DEBUG] Clé publique Kyber reçue : %x", pkBytes)
 
 	signature, err := readBytesWithLength(conn)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read Ed25519 signature: %v", err)
+		log.Printf("[ERROR] Échec de la lecture de la signature Dilithium: %v", err)
+		return nil, fmt.Errorf("échec de la lecture de la signature Dilithium : %v", err)
 	}
 
-	// Verify the signature using the server's public key
-	if !ed25519.Verify(serverPubEd25519, pkBytes, signature) {
-		return nil, fmt.Errorf("invalid Ed25519 signature")
+	log.Printf("[DEBUG] Signature Dilithium reçue : %x", signature)
+
+	log.Println("[DEBUG] Vérification de la signature côté client")
+	if !mode2.Verify(serverPubDilithium, pkBytes, signature) {
+		log.Println("[ERROR] Signature Dilithium invalide côté client")
+		return nil, fmt.Errorf("signature Dilithium invalide")
 	}
 
-	// Unpack the Kyber public key (no return value for Unpack)
+	log.Println("[DEBUG] Signature Dilithium validée côté client")
+
 	var pkServer kyber768.PublicKey
-	pkServer.Unpack(pkBytes) // This modifies pkServer directly
+	pkServer.Unpack(pkBytes)
 
-	// Prepare ciphertext and shared key
+	log.Println("[DEBUG] Clé publique Kyber désérialisée")
+
 	ct := make([]byte, kyber768.CiphertextSize)
 	sharedKey := make([]byte, kyber768.SharedKeySize)
 	pkServer.EncapsulateTo(ct, sharedKey, nil)
 
-	// Send the ciphertext to the server
+	log.Printf("[DEBUG] Secret partagé dérivé côté client : %x", sharedKey)
+
 	if err := writeBytesWithLength(conn, ct); err != nil {
-		return nil, fmt.Errorf("failed to send Kyber ciphertext: %v", err)
+		log.Printf("[ERROR] Échec de l'envoi du ciphertext Kyber: %v", err)
+		return nil, fmt.Errorf("échec de l'envoi du ciphertext Kyber : %v", err)
 	}
 
+	log.Println("[INFO] Simulation client terminée avec succès")
 	return sharedKey, nil
 }
 
-// readBytesWithLength reads length-prefixed data from the connection
+// readBytesWithLength lit les données avec un préfixe de longueur à partir de la connexion
 func readBytesWithLength(conn net.Conn) ([]byte, error) {
 	lenBuf := make([]byte, 4)
-	if _, err := conn.Read(lenBuf); err != nil {
-		return nil, err
+	if _, err := io.ReadFull(conn, lenBuf); err != nil {
+		return nil, fmt.Errorf("échec de lecture de la longueur des données : %v", err)
 	}
 
-	length := (uint32(lenBuf[0]) << 24) | (uint32(lenBuf[1]) << 16) | (uint32(lenBuf[2]) << 8) | uint32(lenBuf[3])
-	data := make([]byte, length)
+	length := binary.BigEndian.Uint32(lenBuf)
+	if length > maxDataSize {
+		return nil, fmt.Errorf("taille des données trop volumineuse")
+	}
 
-	if _, err := conn.Read(data); err != nil {
-		return nil, err
+	data := make([]byte, length)
+	if _, err := io.ReadFull(conn, data); err != nil {
+		return nil, fmt.Errorf("échec de lecture des données : %v", err)
 	}
 	return data, nil
 }
 
-// writeBytesWithLength sends length-prefixed data to the connection
 func writeBytesWithLength(conn net.Conn, data []byte) error {
 	length := uint32(len(data))
-	lenBuf := []byte{
-		byte(length >> 24),
-		byte(length >> 16),
-		byte(length >> 8),
-		byte(length),
+	if length > maxDataSize {
+		return fmt.Errorf("taille des données trop volumineuse")
 	}
+
+	lenBuf := make([]byte, 4)
+	binary.BigEndian.PutUint32(lenBuf, length)
+
 	if _, err := conn.Write(lenBuf); err != nil {
-		return err
+		return fmt.Errorf("échec d'envoi de la longueur des données : %v", err)
 	}
-	_, err := conn.Write(data)
-	return err
+	if _, err := conn.Write(data); err != nil {
+		return fmt.Errorf("échec d'envoi des données : %v", err)
+	}
+	return nil
+}
+
+func testDilithiumSignature() {
+	message := []byte("Test message")
+	pk, sk, _ := mode2.GenerateKey(rand.Reader)
+	signature := make([]byte, mode2.SignatureSize)
+	mode2.SignTo(sk, message, signature)
+
+	if mode2.Verify(pk, message, signature) {
+		log.Println("[SUCCESS] Signature validée avec succès.")
+	} else {
+		log.Println("[ERROR] Signature invalide.")
+	}
 }
