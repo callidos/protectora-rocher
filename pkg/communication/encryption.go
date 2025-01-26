@@ -63,9 +63,6 @@ func DecryptAESGCM(ciphertextBase64 string, masterKey []byte) ([]byte, error) {
 	if ciphertextBase64 == "" {
 		return nil, errors.New("ciphertext cannot be empty")
 	}
-	if len(masterKey) == 0 {
-		return nil, errors.New("master key cannot be empty")
-	}
 
 	data, err := base64.StdEncoding.DecodeString(ciphertextBase64)
 	if err != nil {
@@ -106,7 +103,7 @@ func DecryptAESGCM(ciphertextBase64 string, masterKey []byte) ([]byte, error) {
 	expectedHMAC, plaintext := decryptedData[:sha256.Size], decryptedData[sha256.Size:]
 
 	if !hmac.Equal(expectedHMAC, computeHMAC(plaintext, hmacKey)) {
-		return nil, errors.New("HMAC verification failed")
+		return nil, errors.New("HMAC verification failed, message rejected")
 	}
 
 	return plaintext, nil

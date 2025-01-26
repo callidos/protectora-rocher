@@ -2,6 +2,7 @@ package tests
 
 import (
 	"bytes"
+	"encoding/base64"
 	"fmt"
 	"testing"
 
@@ -69,45 +70,57 @@ func TestGenerateHMAC(t *testing.T) {
 // Test edge cases for encryption/decryption
 func TestEncryptDecryptEdgeCases(t *testing.T) {
 	testCases := []struct {
+		name       string
 		input      string
-		masterKey  []byte
 		shouldFail bool
 	}{
-		{"", testMasterKey, true},       // Empty input should fail
-		{"Short", testMasterKey, false}, // Short input
-		{"Long test message for security", testMasterKey, false},
-		{"CorruptMe", testMasterKey, true}, // Will corrupt later
+		{"Empty input", "", true},                             // Empty input should fail
+		{"Short input", "Short", false},                       // Short input
+		{"Long input", "This is a long test message.", false}, // Long input
+		{"Corrupted input", "CorruptMe", true},                // Corrupt message later
 	}
 
+	key := []byte("thisisaverysecurekeythisisaverysecurekey")
+
 	for _, tc := range testCases {
-		ciphertext, err := communication.EncryptAESGCM([]byte(tc.input), tc.masterKey)
+		t.Run(tc.name, func(t *testing.T) {
+			ciphertext, err := communication.EncryptAESGCM([]byte(tc.input), key)
 
-		// Correction : gestion correcte des entrées vides
-		if err != nil {
 			if tc.shouldFail && tc.input == "" {
-				t.Logf("Expected failure for empty input: %q", tc.input)
-				continue
+				if err == nil {
+					t.Errorf("Expected failure for empty input: %q, but encryption succeeded", tc.input)
+				}
+				return
 			}
-			t.Errorf("Unexpected encryption failure for input: %q, error: %v", tc.input, err)
-			continue
-		}
 
-		if tc.shouldFail && tc.input == "CorruptMe" {
-			ciphertext = ciphertext[:len(ciphertext)-1] + "X" // Corrupt the last character
-		}
-
-		decrypted, err := communication.DecryptAESGCM(ciphertext, tc.masterKey)
-		if tc.shouldFail {
-			if err == nil {
-				t.Errorf("Expected failure but succeeded for input: %q", tc.input)
-			}
-		} else {
 			if err != nil {
-				t.Errorf("Decryption failed for input: %q, error: %v", tc.input, err)
-			} else if string(decrypted) != tc.input {
-				t.Errorf("Decrypted message does not match original for input: %q", tc.input)
+				t.Errorf("Unexpected encryption failure for input: %q, error: %v", tc.input, err)
+				return
 			}
-		}
+
+			// Corruption intentionnelle du message chiffré pour tester l'échec de déchiffrement
+			if tc.shouldFail && tc.input == "CorruptMe" {
+				ciphertextBytes, _ := base64.StdEncoding.DecodeString(ciphertext)
+				if len(ciphertextBytes) > 0 {
+					ciphertextBytes[len(ciphertextBytes)-1] ^= 0xFF // Corrupt last byte
+					ciphertext = base64.StdEncoding.EncodeToString(ciphertextBytes)
+				}
+			}
+
+			decrypted, err := communication.DecryptAESGCM(ciphertext, key)
+
+			if tc.shouldFail {
+				if err == nil {
+					t.Errorf("Expected decryption failure but succeeded for input: %q", tc.input)
+				}
+			} else {
+				if err != nil {
+					t.Errorf("Decryption failed for input: %q, error: %v", tc.input, err)
+				} else if string(decrypted) != tc.input {
+					t.Errorf("Decrypted message does not match original for input: %q, got: %q", tc.input, string(decrypted))
+				}
+			}
+		})
 	}
 }
 
