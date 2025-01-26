@@ -12,7 +12,7 @@ import (
 	"io"
 )
 
-func DeriveKeys(masterKey []byte) (encryptionKey, hmacKey []byte, err error) {
+func DeriveKeys(masterKey []byte) (encKey, hmacKey []byte, err error) {
 	if len(masterKey) == 0 {
 		return nil, nil, errors.New("master key cannot be empty")
 	}
@@ -24,14 +24,14 @@ func EncryptAESGCM(plaintext, masterKey []byte) (string, error) {
 	if len(plaintext) == 0 {
 		return "", errors.New("input data cannot be empty")
 	}
+	if len(masterKey) == 0 {
+		return "", errors.New("master key cannot be empty")
+	}
 
 	encryptionKey, hmacKey, err := DeriveKeys(masterKey)
 	if err != nil {
 		return "", fmt.Errorf("key derivation failed: %w", err)
 	}
-
-	hmacValue := computeHMAC(plaintext, hmacKey)
-	dataToEncrypt := append(hmacValue, plaintext...)
 
 	block, err := aes.NewCipher(encryptionKey)
 	if err != nil {
@@ -48,25 +48,33 @@ func EncryptAESGCM(plaintext, masterKey []byte) (string, error) {
 		return "", fmt.Errorf("nonce generation failed: %w", err)
 	}
 
+	hmacValue := computeHMAC(plaintext, hmacKey)
+
+	dataToEncrypt := append(hmacValue, plaintext...)
+
 	ciphertext := aesGCM.Seal(nil, nonce, dataToEncrypt, nil)
+
 	finalMessage := append(nonce, ciphertext...)
 
 	return base64.StdEncoding.EncodeToString(finalMessage), nil
 }
 
 func DecryptAESGCM(ciphertextBase64 string, masterKey []byte) ([]byte, error) {
-	if len(ciphertextBase64) == 0 {
+	if ciphertextBase64 == "" {
 		return nil, errors.New("ciphertext cannot be empty")
 	}
-
-	encryptionKey, hmacKey, err := DeriveKeys(masterKey)
-	if err != nil {
-		return nil, fmt.Errorf("key derivation failed: %w", err)
+	if len(masterKey) == 0 {
+		return nil, errors.New("master key cannot be empty")
 	}
 
 	data, err := base64.StdEncoding.DecodeString(ciphertextBase64)
 	if err != nil {
 		return nil, errors.New("invalid base64 encoding")
+	}
+
+	encryptionKey, hmacKey, err := DeriveKeys(masterKey)
+	if err != nil {
+		return nil, fmt.Errorf("key derivation failed: %w", err)
 	}
 
 	block, err := aes.NewCipher(encryptionKey)

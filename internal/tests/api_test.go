@@ -107,9 +107,10 @@ func TestHandleNewConnection(t *testing.T) {
 
 // TestPerformKeyExchange vérifie l'échange de clés sécurisé.
 func TestPerformKeyExchange(t *testing.T) {
-	pubKey, privKey, err := ed25519.GenerateKey(rand.Reader)
+	// Génération de la clé privée Ed25519 (seulement la clé privée est nécessaire)
+	_, privKey, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
-		t.Fatalf("Erreur de génération de clés Ed25519: %v", err)
+		t.Fatalf("Erreur de génération de clé privée Ed25519: %v", err)
 	}
 
 	server, client := net.Pipe()
@@ -119,7 +120,7 @@ func TestPerformKeyExchange(t *testing.T) {
 	done := make(chan bool)
 
 	go func() {
-		_, err := communication.PerformKeyExchange(server, privKey, pubKey)
+		_, err := communication.PerformKeyExchange(server, privKey)
 		if err != nil {
 			t.Errorf("Erreur d'échange de clés côté serveur: %v", err)
 		}

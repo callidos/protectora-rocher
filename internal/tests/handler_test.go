@@ -2,7 +2,6 @@ package tests
 
 import (
 	"crypto/hmac"
-	"encoding/base64"
 	"protectora-rocher/pkg/communication"
 	"strings"
 	"sync"
@@ -39,7 +38,8 @@ func TestRejectCorruptedMessage(t *testing.T) {
 	go communication.HandleConnection(mockConn, mockConn, sharedKey)
 	time.Sleep(1 * time.Second)
 
-	if strings.Contains(mockConn.Buffer.String(), "Message reçu avec succès.") {
+	output := mockConn.Buffer.String()
+	if strings.Contains(output, "Message reçu avec succès.") {
 		t.Errorf("Corrupted message should have been rejected")
 	}
 }
@@ -48,7 +48,6 @@ func TestHandleConnectionWithError(t *testing.T) {
 	mockConn := &MockConnection{}
 	sharedKey := []byte("thisisaverysecurekey!")
 
-	// Test with empty username
 	mockConn.Buffer.WriteString("\n")
 
 	var wg sync.WaitGroup
@@ -62,7 +61,7 @@ func TestHandleConnectionWithError(t *testing.T) {
 	wg.Wait()
 
 	output := mockConn.Buffer.String()
-	expectedErrorMessage := "Erreur: Impossible de lire le nom d'utilisateur ou nom d'utilisateur vide"
+	expectedErrorMessage := "Erreur: Nom d'utilisateur vide"
 	if !strings.Contains(output, expectedErrorMessage) {
 		t.Errorf("Expected error message: %s, but got: %s", expectedErrorMessage, output)
 	}
@@ -108,23 +107,19 @@ func TestInvalidUsernameHandling(t *testing.T) {
 	mockConn := &MockConnection{}
 	sharedKey := []byte("thisisaverysecurekey!")
 
-	// Simuler un nom d'utilisateur vide en envoyant une ligne vide
 	mockConn.Buffer.WriteString("\nFIN_SESSION\n")
 
-	// Créer un canal pour vérifier si la connexion a été fermée
 	doneChan := make(chan bool)
 
-	// Lancer HandleConnection dans une goroutine
 	go func() {
 		communication.HandleConnection(mockConn, mockConn, sharedKey)
 		doneChan <- true
 	}()
 
-	// Attendre un délai et vérifier si la connexion a été fermée
 	select {
 	case <-doneChan:
 		output := mockConn.Buffer.String()
-		if !strings.Contains(output, "Erreur: Impossible de lire le nom d'utilisateur ou nom d'utilisateur vide") {
+		if !strings.Contains(output, "Erreur: Nom d'utilisateur vide") {
 			t.Errorf("Session should not start with empty username, but it did: %s", output)
 		}
 	case <-time.After(1 * time.Second):
@@ -156,13 +151,11 @@ func containsDecryptedAck(fullOutput, expectedAck string, sharedKey []byte) bool
 		encrypted, receivedHMAC := parts[0], parts[1]
 
 		expectedHMAC := communication.GenerateHMAC(encrypted, sharedKey)
-		if expectedHMAC != strings.TrimSpace(receivedHMAC) {
-			continue
-		}
-
-		decrypted, err := communication.DecryptAESGCM(encrypted, sharedKey)
-		if err == nil && string(decrypted) == expectedAck {
-			return true
+		if hmac.Equal([]byte(expectedHMAC), []byte(receivedHMAC)) {
+			decrypted, err := communication.DecryptAESGCM(encrypted, sharedKey)
+			if err == nil && string(decrypted) == expectedAck {
+				return true
+			}
 		}
 	}
 	return false
@@ -170,18 +163,20 @@ func containsDecryptedAck(fullOutput, expectedAck string, sharedKey []byte) bool
 
 // validateWelcomeMessage valide le message de bienvenue reçu.
 func validateWelcomeMessage(t *testing.T, output string, sharedKey []byte, username string) {
-	parts := strings.SplitN(strings.TrimSpace(output), "|", 2)
-	if len(parts) < 2 {
+	parts := strings.SplitN(strings.TrimSpace(output), "\n", 2)
+	if len(parts) < 1 {
 		t.Fatalf("Malformed received message: %s", output)
 	}
 
-	encryptedMessage, receivedHMAC := parts[0], strings.TrimSpace(parts[1])
+	encryptedMessageParts := strings.SplitN(parts[0], "|", 2)
+	if len(encryptedMessageParts) < 2 {
+		t.Fatalf("Malformed welcome message format: %s", parts[0])
+	}
+
+	encryptedMessage, receivedHMAC := encryptedMessageParts[0], strings.TrimSpace(encryptedMessageParts[1])
 	expectedHMAC := communication.GenerateHMAC(encryptedMessage, sharedKey)
 
-	expectedHMACBytes, _ := base64.StdEncoding.DecodeString(expectedHMAC)
-	receivedHMACBytes, _ := base64.StdEncoding.DecodeString(receivedHMAC)
-
-	if !hmac.Equal(expectedHMACBytes, receivedHMACBytes) {
+	if !hmac.Equal([]byte(expectedHMAC), []byte(receivedHMAC)) {
 		t.Fatalf("HMAC mismatch. Expected: %s, Got: %s", expectedHMAC, receivedHMAC)
 	}
 
