@@ -1,6 +1,7 @@
 package tests
 
 import (
+	"runtime"
 	"strconv"
 	"sync"
 	"testing"
@@ -114,10 +115,18 @@ func TestMalformedMessage(t *testing.T) {
 }
 
 // Performance test for sending and receiving messages
+func logMemoryUsage(t *testing.T, message string) {
+	var memStats runtime.MemStats
+	runtime.ReadMemStats(&memStats)
+	t.Logf("%s - Memory usage: %d KB", message, memStats.Alloc/1024)
+}
+
 func TestMessagePerformance(t *testing.T) {
 	mockConn := &MockConnection{}
 	key := []byte("securekey!")
 	msg := "Performance test message"
+
+	logMemoryUsage(t, "Before test")
 
 	start := time.Now()
 
@@ -127,6 +136,8 @@ func TestMessagePerformance(t *testing.T) {
 		}
 	}
 
+	logMemoryUsage(t, "After test")
+
 	t.Logf("Time for 1000 messages: %v", time.Since(start))
 }
 
@@ -134,6 +145,8 @@ func TestMessagePerformanceConcurrent(t *testing.T) {
 	mockConn := &MockConnection{}
 	key := []byte("securekey!")
 	msg := "Performance test message"
+
+	logMemoryUsage(t, "Before concurrent test")
 
 	start := time.Now()
 
@@ -149,5 +162,8 @@ func TestMessagePerformanceConcurrent(t *testing.T) {
 	}
 
 	wg.Wait()
+
+	logMemoryUsage(t, "After concurrent test")
+
 	t.Logf("Time for 1000 concurrent messages: %v", time.Since(start))
 }

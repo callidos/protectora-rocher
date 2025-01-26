@@ -1,15 +1,13 @@
 package tests
 
 import (
-	"crypto/rand"
 	"encoding/base64"
+	"log"
 	"net"
 	"testing"
 	"time"
 
 	"protectora-rocher/pkg/communication"
-
-	"github.com/cloudflare/circl/sign/dilithium/mode2"
 )
 
 func TestInitializeSession(t *testing.T) {
@@ -70,30 +68,35 @@ func TestSendReceiveSecureMessage(t *testing.T) {
 
 // TestPerformKeyExchange vérifie l'échange de clés sécurisé.
 func TestPerformKeyExchange(t *testing.T) {
-	_, privKey, err := mode2.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("Erreur de génération de clés Dilithium: %v", err)
-	}
-
 	server, client := net.Pipe()
 	defer server.Close()
 	defer client.Close()
 
-	done := make(chan bool)
+	done := make(chan error)
 
 	go func() {
-		_, err := communication.PerformKeyExchange(server, privKey)
+		log.Println("Serveur: Démarrage de l'échange de clés")
+		err := communication.PerformKeyExchange(server)
 		if err != nil {
-			t.Errorf("Erreur d'échange de clés côté serveur: %v", err)
+			log.Printf("Serveur: Échec de l'échange de clés: %v", err)
 		}
-		done <- true
+		done <- err
 	}()
 
+	log.Println("Client: Démarrage de l'échange de clés")
+	err := communication.PerformKeyExchange(client)
+	if err != nil {
+		t.Fatalf("Client: Échec de l'échange de clés: %v", err)
+	}
+
 	select {
-	case <-done:
+	case serverErr := <-done:
+		if serverErr != nil {
+			t.Fatalf("Erreur d'échange de clés côté serveur: %v", serverErr)
+		}
 		t.Log("Échange de clé terminé avec succès")
 	case <-time.After(5 * time.Second):
-		t.Fatal("Timeout : l'échange de clé a pris trop de temps")
+		t.Fatal("Timeout: l'échange de clé a pris trop de temps")
 	}
 }
 

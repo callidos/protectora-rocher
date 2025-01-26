@@ -3,8 +3,6 @@ package communication
 import (
 	"fmt"
 	"io"
-
-	"github.com/cloudflare/circl/sign/dilithium/mode2"
 )
 
 var validModes = map[string]bool{
@@ -42,8 +40,8 @@ func ReceiveSecureMessage(reader io.Reader, key []byte) (string, error) {
 	return ReceiveMessage(reader, key)
 }
 
-func PerformKeyExchange(conn io.ReadWriter, privKey *mode2.PrivateKey) (<-chan KeyExchangeResult, error) {
-	return PerformAuthenticatedKeyExchange(conn, privKey)
+func PerformKeyExchange(conn io.ReadWriter) error {
+	return performKyberDilithiumKeyExchange(conn)
 }
 
 func ResetSecurityState() {
