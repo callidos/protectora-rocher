@@ -11,7 +11,7 @@ var testKey = []byte("thisisaverysecurekeyforaes256!!thisisahmackey!!") // 64 oc
 
 // TestEncryptFile vérifie le chiffrement d'un fichier.
 func TestEncryptFile(t *testing.T) {
-	// Création des fichiers temporaires
+	// Fichiers temporaires
 	inputFile := "test_input.txt"
 	encryptedFile := "test_output.enc"
 
@@ -21,6 +21,7 @@ func TestEncryptFile(t *testing.T) {
 		os.Remove(encryptedFile)
 	})
 
+	// Création du fichier d'entrée
 	err := os.WriteFile(inputFile, []byte("Ceci est un test pour le chiffrement de fichier."), 0644)
 	if err != nil {
 		t.Fatalf("Erreur lors de la création du fichier d'entrée: %v", err)
@@ -32,15 +33,16 @@ func TestEncryptFile(t *testing.T) {
 		t.Fatalf("Erreur lors du chiffrement du fichier: %v", err)
 	}
 
-	// Vérification de l'existence du fichier chiffré
-	if _, err := os.Stat(encryptedFile); os.IsNotExist(err) {
-		t.Fatal("Le fichier chiffré n'a pas été créé.")
+	// Vérification de l'existence et de la taille du fichier chiffré
+	info, err := os.Stat(encryptedFile)
+	if os.IsNotExist(err) || info.Size() <= 0 {
+		t.Fatal("Le fichier chiffré n'a pas été créé correctement.")
 	}
 }
 
 // TestDecryptFile vérifie le déchiffrement d'un fichier.
 func TestDecryptFile(t *testing.T) {
-	// Création des fichiers temporaires
+	// Fichiers temporaires
 	inputFile := "test_input.txt"
 	encryptedFile := "test_output.enc"
 	decryptedFile := "test_decrypted.txt"
@@ -52,6 +54,7 @@ func TestDecryptFile(t *testing.T) {
 		os.Remove(decryptedFile)
 	})
 
+	// Création du fichier d'entrée
 	err := os.WriteFile(inputFile, []byte("Ceci est un test pour le chiffrement de fichier."), 0644)
 	if err != nil {
 		t.Fatalf("Erreur lors de la création du fichier d'entrée: %v", err)
@@ -63,13 +66,10 @@ func TestDecryptFile(t *testing.T) {
 		t.Fatalf("Erreur lors du chiffrement du fichier: %v", err)
 	}
 
-	// Vérification que le fichier chiffré existe et n'est pas vide
-	fileInfo, err := os.Stat(encryptedFile)
-	if err != nil {
-		t.Fatalf("Erreur lors de la vérification du fichier chiffré: %v", err)
-	}
-	if fileInfo.Size() <= 0 {
-		t.Fatal("Le fichier chiffré est vide.")
+	// Vérification du fichier chiffré
+	info, err := os.Stat(encryptedFile)
+	if err != nil || info.Size() == 0 {
+		t.Fatalf("Fichier chiffré incorrect ou vide.")
 	}
 
 	// Déchiffrement
@@ -91,7 +91,7 @@ func TestDecryptFile(t *testing.T) {
 
 // TestSecureFileTransfer vérifie le transfert sécurisé d'un fichier.
 func TestSecureFileTransfer(t *testing.T) {
-	// Création des fichiers temporaires
+	// Fichiers temporaires
 	inputFile := "test_input.txt"
 	outputFile := "test_output.txt"
 
@@ -101,6 +101,7 @@ func TestSecureFileTransfer(t *testing.T) {
 		os.Remove(outputFile)
 	})
 
+	// Création du fichier d'entrée
 	err := os.WriteFile(inputFile, []byte("Test de transfert sécurisé de fichier."), 0644)
 	if err != nil {
 		t.Fatalf("Erreur lors de la création du fichier d'entrée: %v", err)
@@ -133,7 +134,7 @@ func TestSecureFileTransfer(t *testing.T) {
 
 // TestCorruptedFileDetection vérifie la détection des fichiers corrompus.
 func TestCorruptedFileDetection(t *testing.T) {
-	// Création des fichiers temporaires
+	// Fichiers temporaires
 	inputFile := "test_input.txt"
 	encryptedFile := "test_output.enc"
 
@@ -143,6 +144,7 @@ func TestCorruptedFileDetection(t *testing.T) {
 		os.Remove(encryptedFile)
 	})
 
+	// Création du fichier d'entrée
 	err := os.WriteFile(inputFile, []byte("Test de détection de fichier corrompu."), 0644)
 	if err != nil {
 		t.Fatalf("Erreur lors de la création du fichier d'entrée: %v", err)
@@ -161,18 +163,18 @@ func TestCorruptedFileDetection(t *testing.T) {
 	}
 	defer file.Close()
 
-	_, err = file.WriteAt([]byte("corruption"), 10) // Écrit un texte corrompu à l'offset 10
+	_, err = file.WriteAt([]byte("corruption"), 10) // Ajoute une corruption au fichier
 	if err != nil {
 		t.Fatalf("Erreur lors de la corruption du fichier: %v", err)
 	}
 
-	// Déchiffrement attendu comme invalide
+	// Tentative de déchiffrement (attendu comme invalide)
 	err = communication.DecryptFile(encryptedFile, "corrupted_output.txt", testKey)
 	if err == nil {
 		t.Error("Le fichier corrompu a été accepté alors qu'il aurait dû être rejeté.")
 	}
 
-	// Suppression manuelle du fichier corrompu
+	// Nettoyage du fichier corrompu
 	t.Cleanup(func() {
 		os.Remove("corrupted_output.txt")
 	})
