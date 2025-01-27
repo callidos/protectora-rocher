@@ -92,6 +92,26 @@ func TerminateSecureCall(conn io.ReadWriter, key []byte) {
 	StopSecureCall(conn, key)
 }
 
+// EncryptFileAPI est une fonction simplifiée pour chiffrer un fichier.
+func EncryptFileAPI(inputPath, outputPath string, key []byte) error {
+	return EncryptFile(inputPath, outputPath, key)
+}
+
+// DecryptFileAPI est une fonction simplifiée pour déchiffrer un fichier.
+func DecryptFileAPI(inputPath, outputPath string, key []byte) error {
+	return DecryptFile(inputPath, outputPath, key)
+}
+
+// SecureFileTransferAPI transfère un fichier de manière sécurisée.
+func SecureFileTransferAPI(writer io.Writer, filePath string, key []byte) error {
+	return SecureFileTransfer(writer, filePath, key)
+}
+
+// ReceiveSecureFileAPI reçoit un fichier de manière sécurisée.
+func ReceiveSecureFileAPI(reader io.Reader, outputPath string, key []byte) error {
+	return ReceiveSecureFile(reader, outputPath, key)
+}
+
 // ResetSecurityState réinitialise l'état de sécurité du système, supprimant les clés et l'historique des messages.
 func ResetSecurityState() {
 	ResetMessageHistory()
