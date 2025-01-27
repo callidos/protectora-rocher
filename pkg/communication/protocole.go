@@ -10,20 +10,11 @@ import (
 )
 
 const (
-	replayWindow      = 5 * time.Minute
-	messageSizeLimit  = 8192
-	SessionEphemeral  = "ephemeral"
-	SessionPersistent = "persistent"
+	replayWindow     = 5 * time.Minute
+	messageSizeLimit = 8192
 )
 
 var messageHistory sync.Map
-
-func SetSessionMode(mode string) error {
-	if mode != SessionEphemeral && mode != SessionPersistent {
-		return fmt.Errorf("mode de session invalide")
-	}
-	return nil
-}
 
 func SendMessage(writer io.Writer, message string, sharedKey []byte, sequenceNumber uint64, duration int) error {
 	if duration < 0 {

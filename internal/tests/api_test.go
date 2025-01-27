@@ -12,19 +12,6 @@ import (
 	"time"
 )
 
-// TestInitializeSession vérifie l'initialisation des sessions.
-func TestInitializeSession(t *testing.T) {
-	err := communication.InitializeSession(communication.SessionEphemeral)
-	if err != nil {
-		t.Errorf("Échec de l'initialisation de session: %v", err)
-	}
-
-	err = communication.InitializeSession("invalid_mode")
-	if err == nil {
-		t.Errorf("Le mode invalide n'a pas été détecté")
-	}
-}
-
 // TestEncryptDecryptMessage vérifie le chiffrement et déchiffrement des messages.
 func TestEncryptDecryptMessage(t *testing.T) {
 	key := []byte("supersecretdemotestkey12345678901234")

@@ -5,18 +5,6 @@ import (
 	"io"
 )
 
-// InitializeSession configure le mode de session (éphemère ou persistante).
-// - Paramètres:
-//   - mode: `communication.SessionEphemeral` ou `communication.SessionPersistent`
-//
-// - Retour: erreur si le mode est invalide.
-func InitializeSession(mode string) error {
-	if mode != SessionEphemeral && mode != SessionPersistent {
-		return errors.New("mode de session invalide, utilisez SessionEphemeral ou SessionPersistent")
-	}
-	return SetSessionMode(mode)
-}
-
 // EncryptMessage chiffre un message avec une clé partagée.
 // - Paramètres:
 //   - message: texte clair à chiffrer.
