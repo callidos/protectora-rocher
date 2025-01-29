@@ -1,6 +1,7 @@
 package communication
 
 import (
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hmac"
@@ -101,45 +102,59 @@ func DecryptFile(inputPath, outputPath string, key []byte) error {
 		return fmt.Errorf("erreur initialisation GCM: %w", err)
 	}
 
-	nonce := make([]byte, aesGCM.NonceSize())
+	nonceSize := aesGCM.NonceSize()
+	nonce := make([]byte, nonceSize)
 	if _, err := io.ReadFull(inputFile, nonce); err != nil {
 		return fmt.Errorf("erreur lecture nonce: %w", err)
 	}
 
+	// Lire le reste du fichier
+	fileData, err := io.ReadAll(inputFile)
+	if err != nil {
+		return fmt.Errorf("erreur lecture données du fichier: %w", err)
+	}
+
+	// Séparer HMAC (32 derniers octets)
+	hmacSize := 32
+	if len(fileData) < hmacSize {
+		return fmt.Errorf("fichier trop court pour contenir HMAC")
+	}
+	hmacData := fileData[len(fileData)-hmacSize:]
+	encryptedData := fileData[:len(fileData)-hmacSize]
+
 	hmacHash := hmac.New(sha3.New256, key[32:])
+	reader := bytes.NewReader(encryptedData)
+
 	for {
-		blockSize := make([]byte, 4)
-		if _, err := io.ReadFull(inputFile, blockSize); err != nil {
+		blockSizeBytes := make([]byte, 4)
+		if _, err := io.ReadFull(reader, blockSizeBytes); err != nil {
 			if err == io.EOF {
 				break
 			}
 			return fmt.Errorf("erreur lecture taille bloc: %w", err)
 		}
 
-		size := binary.BigEndian.Uint32(blockSize)
-		encrypted := make([]byte, size)
-		if _, err := io.ReadFull(inputFile, encrypted); err != nil {
+		size := binary.BigEndian.Uint32(blockSizeBytes)
+		encryptedBlock := make([]byte, size)
+		if _, err := io.ReadFull(reader, encryptedBlock); err != nil {
 			return fmt.Errorf("erreur lecture bloc chiffré: %w", err)
 		}
 
-		hmacHash.Write(encrypted)
+		hmacHash.Write(encryptedBlock)
 
-		decrypted, err := aesGCM.Open(nil, nonce, encrypted, nil)
+		decryptedBlock, err := aesGCM.Open(nil, nonce, encryptedBlock, nil)
 		if err != nil {
 			return fmt.Errorf("erreur déchiffrement: %w", err)
 		}
 
-		if _, err := outputFile.Write(decrypted); err != nil {
+		if _, err := outputFile.Write(decryptedBlock); err != nil {
 			return fmt.Errorf("erreur écriture données déchiffrées: %w", err)
 		}
 	}
 
+	// Vérification HMAC
 	expectedHMAC := hmacHash.Sum(nil)
-	fileHMAC := make([]byte, len(expectedHMAC))
-	if _, err := io.ReadFull(inputFile, fileHMAC); err != nil {
-		return fmt.Errorf("erreur lecture HMAC: %w", err)
-	}
-	if !hmac.Equal(expectedHMAC, fileHMAC) {
+	if !hmac.Equal(expectedHMAC, hmacData) {
 		return fmt.Errorf("HMAC invalide : fichier corrompu ou altéré")
 	}
 
