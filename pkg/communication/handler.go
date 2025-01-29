@@ -11,12 +11,34 @@ import (
 	"time"
 )
 
-const bufferSize = 1024 * 1024
+const (
+	bufferSize       = 1024 * 1024
+	messageSizeLimit = 16 * 1024 * 1024
+)
+
+type SecureError struct {
+	Code    int
+	Message string
+	Wrapped error
+}
+
+func (e *SecureError) Error() string {
+	return fmt.Sprintf("[%d] %s: %v", e.Code, e.Message, e.Wrapped)
+}
+
+func securityError(code int, msg string, err error) *SecureError {
+	return &SecureError{
+		Code:    code,
+		Message: msg,
+		Wrapped: err,
+	}
+}
 
 func HandleConnection(reader io.Reader, writer io.Writer, sharedKey []byte) {
 	utils.Logger.Info("Nouvelle connexion traitée", nil)
 
-	scanner := bufio.NewScanner(reader)
+	limitedReader := io.LimitReader(reader, messageSizeLimit)
+	scanner := bufio.NewScanner(limitedReader)
 	scanner.Buffer(make([]byte, bufferSize), bufferSize)
 
 	username, err := readUsername(scanner, writer)
@@ -53,13 +75,13 @@ func HandleConnection(reader io.Reader, writer io.Writer, sharedKey []byte) {
 func readUsername(scanner *bufio.Scanner, writer io.Writer) (string, error) {
 	if !scanner.Scan() {
 		fmt.Fprintln(writer, "Erreur: Impossible de lire le nom d'utilisateur")
-		return "", fmt.Errorf("lecture du nom d'utilisateur échouée")
+		return "", securityError(1001, "lecture du nom d'utilisateur échouée", scanner.Err())
 	}
 
 	username := strings.TrimSpace(scanner.Text())
 	if username == "" {
 		fmt.Fprintln(writer, "Erreur: Nom d'utilisateur vide")
-		return "", fmt.Errorf("nom d'utilisateur vide")
+		return "", securityError(1002, "nom d'utilisateur vide", nil)
 	}
 
 	return username, nil
@@ -85,27 +107,25 @@ func processIncomingMessages(scanner *bufio.Scanner, messageChan chan<- string, 
 func processMessage(msg string, sharedKey []byte, writer io.Writer, username string) error {
 	parts := strings.SplitN(msg, "|", 2)
 	if len(parts) != 2 {
-		return fmt.Errorf("message mal formé")
+		return securityError(2001, "message mal formé", nil)
 	}
 
 	encryptedMsg, receivedHMACBase64 := parts[0], strings.TrimSpace(parts[1])
 
-	// Décodage du HMAC reçu
 	receivedHMAC, err := base64.StdEncoding.DecodeString(receivedHMACBase64)
 	if err != nil {
-		return fmt.Errorf("HMAC invalide, décodage échoué: %v", err)
+		return securityError(2002, "HMAC invalide", err)
 	}
 
-	// Calcul du HMAC attendu
 	computedHMAC := computeHMAC([]byte(encryptedMsg), sharedKey)
 
 	if !hmac.Equal(computedHMAC, receivedHMAC) {
-		return fmt.Errorf("HMAC invalide, message rejeté")
+		return securityError(2003, "HMAC invalide", nil)
 	}
 
 	decryptedMsg, err := DecryptAESGCM(encryptedMsg, sharedKey)
 	if err != nil {
-		return fmt.Errorf("erreur de déchiffrement : %v", err)
+		return securityError(2004, "erreur de déchiffrement", err)
 	}
 
 	utils.Logger.Info("Message reçu et déchiffré", map[string]interface{}{"user": username, "message": string(decryptedMsg)})
@@ -124,7 +144,7 @@ func sendAcknowledgment(writer io.Writer, sharedKey []byte) error {
 func sendMessage(writer io.Writer, message string, sharedKey []byte) error {
 	encryptedMsg, err := EncryptAESGCM([]byte(message), sharedKey)
 	if err != nil {
-		return fmt.Errorf("erreur chiffrement message : %v", err)
+		return securityError(3001, "erreur chiffrement message", err)
 	}
 
 	hmac := GenerateHMAC(encryptedMsg, sharedKey)
@@ -134,7 +154,7 @@ func sendMessage(writer io.Writer, message string, sharedKey []byte) error {
 	}
 
 	if _, err := fmt.Fprintf(writer, "%s|%s\n", encryptedMsg, hmac); err != nil {
-		return fmt.Errorf("erreur envoi message : %v", err)
+		return securityError(3002, "erreur envoi message", err)
 	}
 
 	utils.Logger.Info("Message envoyé avec succès", nil)

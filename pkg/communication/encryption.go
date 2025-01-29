@@ -10,9 +10,17 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 
+	"golang.org/x/crypto/chacha20"
 	"golang.org/x/crypto/hkdf"
 )
+
+var bufPool = sync.Pool{
+	New: func() interface{} {
+		return make([]byte, 4096)
+	},
+}
 
 func DeriveKeys(masterKey []byte) (encKey, hmacKey []byte, err error) {
 	if len(masterKey) == 0 {
@@ -20,7 +28,7 @@ func DeriveKeys(masterKey []byte) (encKey, hmacKey []byte, err error) {
 	}
 
 	h := hkdf.New(sha256.New, masterKey, nil, nil)
-	encKey = make([]byte, 32) // AES-256
+	encKey = make([]byte, 32)
 	if _, err := io.ReadFull(h, encKey); err != nil {
 		return nil, nil, fmt.Errorf("key derivation failed: %w", err)
 	}
@@ -36,9 +44,6 @@ func DeriveKeys(masterKey []byte) (encKey, hmacKey []byte, err error) {
 func EncryptAESGCM(plaintext, masterKey []byte) (string, error) {
 	if len(plaintext) == 0 {
 		return "", errors.New("input data cannot be empty")
-	}
-	if len(masterKey) == 0 {
-		return "", errors.New("master key cannot be empty")
 	}
 
 	encryptionKey, hmacKey, err := DeriveKeys(masterKey)
@@ -57,17 +62,15 @@ func EncryptAESGCM(plaintext, masterKey []byte) (string, error) {
 	}
 
 	nonce := make([]byte, aesGCM.NonceSize())
-	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+	if _, err := rand.Read(nonce); err != nil {
 		return "", fmt.Errorf("nonce generation failed: %w", err)
 	}
 
-	hmacValue := computeHMAC(plaintext, hmacKey)
-
-	dataToEncrypt := append(hmacValue, plaintext...)
-
-	ciphertext := aesGCM.Seal(nil, nonce, dataToEncrypt, nil)
-
+	ciphertext := aesGCM.Seal(nil, nonce, plaintext, nil)
 	finalMessage := append(nonce, ciphertext...)
+
+	mac := computeHMAC(finalMessage, hmacKey)
+	finalMessage = append(finalMessage, mac...)
 
 	return base64.StdEncoding.EncodeToString(finalMessage), nil
 }
@@ -87,6 +90,15 @@ func DecryptAESGCM(ciphertextBase64 string, masterKey []byte) ([]byte, error) {
 		return nil, fmt.Errorf("key derivation failed: %w", err)
 	}
 
+	if len(data) < sha256.Size {
+		return nil, errors.New("invalid ciphertext length")
+	}
+
+	data, mac := data[:len(data)-sha256.Size], data[len(data)-sha256.Size:]
+	if !hmac.Equal(computeHMAC(data, hmacKey), mac) {
+		return nil, errors.New("HMAC verification failed")
+	}
+
 	block, err := aes.NewCipher(encryptionKey)
 	if err != nil {
 		return nil, fmt.Errorf("AES cipher creation failed: %w", err)
@@ -102,21 +114,10 @@ func DecryptAESGCM(ciphertextBase64 string, masterKey []byte) ([]byte, error) {
 		return nil, errors.New("ciphertext too short")
 	}
 
-	nonce, encryptedData := data[:nonceSize], data[nonceSize:]
-
-	decryptedData, err := aesGCM.Open(nil, nonce, encryptedData, nil)
+	nonce, ciphertext := data[:nonceSize], data[nonceSize:]
+	plaintext, err := aesGCM.Open(nil, nonce, ciphertext, nil)
 	if err != nil {
-		return nil, errors.New("decryption failed")
-	}
-
-	if len(decryptedData) < sha256.Size {
-		return nil, errors.New("decrypted data too short to contain valid HMAC")
-	}
-
-	expectedHMAC, plaintext := decryptedData[:sha256.Size], decryptedData[sha256.Size:]
-
-	if !hmac.Equal(expectedHMAC, computeHMAC(plaintext, hmacKey)) {
-		return nil, errors.New("HMAC verification failed, message rejected")
+		return nil, fmt.Errorf("decryption failed: %w", err)
 	}
 
 	return plaintext, nil
@@ -130,4 +131,18 @@ func computeHMAC(data, key []byte) []byte {
 	mac := hmac.New(sha256.New, key)
 	mac.Write(data)
 	return mac.Sum(nil)
+}
+
+func MemzeroSecure(b []byte) {
+	buf := bufPool.Get().([]byte)
+	defer bufPool.Put(buf)
+
+	for i := 0; i < len(b); i += len(buf) {
+		chunk := b[i:]
+		if len(chunk) > len(buf) {
+			chunk = chunk[:len(buf)]
+		}
+		cipher, _ := chacha20.NewUnauthenticatedCipher(make([]byte, 32), make([]byte, 24))
+		cipher.XORKeyStream(chunk, chunk)
+	}
 }

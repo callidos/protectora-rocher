@@ -3,6 +3,7 @@ package tests
 import (
 	"bytes"
 	"crypto/ed25519"
+	"encoding/binary"
 	"fmt"
 	"net"
 	"protectora-rocher/pkg/communication"
@@ -11,106 +12,98 @@ import (
 	"github.com/cloudflare/circl/kem/kyber/kyber768"
 )
 
-// TestFullKyberExchange performs a full client-server key exchange simulation
 func TestFullKyberExchange(t *testing.T) {
-	serverPubKey, serverPrivKey, err := communication.GenerateEd25519KeyPair()
+	serverPubEd25519, serverPrivEd25519, err := communication.GenerateEd25519KeyPair()
 	if err != nil {
-		t.Fatalf("Failed to generate server Ed25519 keys: %v", err)
+		t.Fatalf("Échec génération clés serveur : %v", err)
 	}
 
 	serverConn, clientConn := net.Pipe()
+	defer serverConn.Close()
+	defer clientConn.Close()
 
-	// Pass the private key as ed25519.PrivateKey
-	resultChan, err := communication.PerformAuthenticatedKeyExchange(
-		serverConn,
-		serverPrivKey, // We use the private key directly, since the public key is not needed in this function.
-	)
+	resultChan, err := communication.PerformAuthenticatedKeyExchange(serverConn, serverPrivEd25519)
 	if err != nil {
-		t.Fatalf("Server setup error: %v", err)
+		t.Fatalf("Échec initialisation serveur : %v", err)
 	}
 
-	// Simulate client-side logic
-	clientSharedKey, clientErr := simulateClient(clientConn, serverPubKey)
+	clientSharedKey, clientErr := simulateClient(clientConn, serverPubEd25519)
 	if clientErr != nil {
-		t.Fatalf("Client error: %v", clientErr)
+		t.Fatalf("Erreur client : %v", clientErr)
 	}
-	clientConn.Close()
 
-	// Get the key exchange result from the server
 	result := <-resultChan
 	if result.Err != nil {
-		t.Fatalf("Server error: %v", result.Err)
+		t.Fatalf("Erreur serveur : %v", result.Err)
 	}
 
-	// Check if the shared keys match
 	if !bytes.Equal(result.Key[:], clientSharedKey) {
-		t.Fatalf("Shared keys do not match.\nServer: %x\nClient: %x", result.Key[:], clientSharedKey)
+		t.Fatalf("Clés différentes\nServeur: %x\nClient: %x", result.Key, clientSharedKey)
 	}
 }
 
-// simulateClient handles the client-side logic of the Kyber exchange
 func simulateClient(conn net.Conn, serverPubEd25519 ed25519.PublicKey) ([]byte, error) {
-	// Read the Kyber public key and signature
-	pkBytes, err := readBytesWithLength(conn)
+	pkBytes, err := readBytes(conn)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read Kyber public key: %v", err)
+		return nil, fmt.Errorf("échec lecture clé publique: %v", err)
 	}
 
-	signature, err := readBytesWithLength(conn)
+	signature, err := readBytes(conn)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read Ed25519 signature: %v", err)
+		return nil, fmt.Errorf("échec lecture signature: %v", err)
 	}
 
-	// Verify the signature using the server's public key
 	if !ed25519.Verify(serverPubEd25519, pkBytes, signature) {
-		return nil, fmt.Errorf("invalid Ed25519 signature")
+		return nil, fmt.Errorf("signature invalide")
 	}
 
-	// Unpack the Kyber public key (no return value for Unpack)
-	var pkServer kyber768.PublicKey
-	pkServer.Unpack(pkBytes) // This modifies pkServer directly
+	var serverPubKyber kyber768.PublicKey
+	serverPubKyber.Unpack(pkBytes)
 
-	// Prepare ciphertext and shared key
-	ct := make([]byte, kyber768.CiphertextSize)
-	sharedKey := make([]byte, kyber768.SharedKeySize)
-	pkServer.EncapsulateTo(ct, sharedKey, nil)
+	ciphertext := make([]byte, kyber768.CiphertextSize)
+	sharedSecret := make([]byte, kyber768.SharedKeySize)
+	serverPubKyber.EncapsulateTo(ciphertext, sharedSecret, nil)
 
-	// Send the ciphertext to the server
-	if err := writeBytesWithLength(conn, ct); err != nil {
-		return nil, fmt.Errorf("failed to send Kyber ciphertext: %v", err)
+	sessionKey := communication.DeriveSessionKey(sharedSecret)
+	communication.Memzero(sharedSecret)
+
+	if err := sendBytes(conn, ciphertext); err != nil {
+		return nil, fmt.Errorf("échec envoi ciphertext: %v", err)
 	}
 
-	return sharedKey, nil
+	return sessionKey[:], nil
 }
 
-// readBytesWithLength reads length-prefixed data from the connection
-func readBytesWithLength(conn net.Conn) ([]byte, error) {
+func readBytes(conn net.Conn) ([]byte, error) {
 	lenBuf := make([]byte, 4)
 	if _, err := conn.Read(lenBuf); err != nil {
 		return nil, err
 	}
 
-	length := (uint32(lenBuf[0]) << 24) | (uint32(lenBuf[1]) << 16) | (uint32(lenBuf[2]) << 8) | uint32(lenBuf[3])
-	data := make([]byte, length)
+	length := binary.BigEndian.Uint32(lenBuf)
+	if length > 65536 {
+		return nil, fmt.Errorf("taille excessive")
+	}
 
+	data := make([]byte, length)
 	if _, err := conn.Read(data); err != nil {
 		return nil, err
 	}
+
 	return data, nil
 }
 
-// writeBytesWithLength sends length-prefixed data to the connection
-func writeBytesWithLength(conn net.Conn, data []byte) error {
-	length := uint32(len(data))
-	lenBuf := []byte{
-		byte(length >> 24),
-		byte(length >> 16),
-		byte(length >> 8),
-		byte(length),
-	}
+func sendBytes(conn net.Conn, data []byte) error {
+	lenBuf := make([]byte, 4)
+	binary.BigEndian.PutUint32(lenBuf, uint32(len(data)))
+
 	if _, err := conn.Write(lenBuf); err != nil {
 		return err
 	}
-	_, err := conn.Write(data)
-	return err
+
+	if _, err := conn.Write(data); err != nil {
+		return err
+	}
+
+	return nil
 }

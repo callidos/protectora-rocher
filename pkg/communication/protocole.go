@@ -13,8 +13,7 @@ import (
 )
 
 const (
-	replayWindow     = 5 * time.Minute
-	messageSizeLimit = 8192
+	replayWindow = 5 * time.Minute
 )
 
 var messageHistory sync.Map
