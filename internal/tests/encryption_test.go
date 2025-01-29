@@ -20,7 +20,7 @@ func TestDeriveKeys(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Key derivation failed: %v", err)
 	}
-	if len(encryptionKey) != 16 || len(hmacKey) != 16 {
+	if len(encryptionKey) != 32 || len(hmacKey) != 32 {
 		t.Errorf("Derived keys have incorrect lengths")
 	}
 }

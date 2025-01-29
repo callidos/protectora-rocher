@@ -7,20 +7,16 @@ import (
 	"fmt"
 	"io"
 	"sync"
-	"time"
 
 	"github.com/cloudflare/circl/kem/kyber/kyber768"
 )
 
 const (
-	keyRotationInterval = 10 * time.Minute
-	maxDataSize         = 65536
+	maxDataSize = 65536
 )
 
 var (
-	mutex       sync.Mutex
-	currentKey  [32]byte
-	lastKeyTime time.Time
+	mutex sync.Mutex
 )
 
 type KeyExchangeResult struct {
@@ -32,53 +28,45 @@ func GenerateEd25519KeyPair() (ed25519.PublicKey, ed25519.PrivateKey, error) {
 	return ed25519.GenerateKey(rand.Reader)
 }
 
-func PerformAuthenticatedKeyExchange(conn io.ReadWriter, privateKey ed25519.PrivateKey) (<-chan KeyExchangeResult, error) {
+func PerformAuthenticatedKeyExchange(conn io.ReadWriter, privKey []byte) (<-chan KeyExchangeResult, error) {
 	resultChan := make(chan KeyExchangeResult, 1)
+
 	go func() {
 		defer close(resultChan)
 
-		mutex.Lock()
-		defer mutex.Unlock()
-
-		if time.Since(lastKeyTime) > keyRotationInterval || currentKey == [32]byte{} {
-			if err := performKyberKeyExchange(conn, privateKey); err != nil {
-				resultChan <- KeyExchangeResult{Err: fmt.Errorf("échec de l'échange de clé Kyber : %w", err)}
-				return
-			}
-			lastKeyTime = time.Now()
+		pk, sk, err := kyber768.GenerateKeyPair(rand.Reader)
+		if err != nil {
+			resultChan <- KeyExchangeResult{Err: fmt.Errorf("keygen failed: %w", err)}
+			return
 		}
 
-		resultChan <- KeyExchangeResult{Key: currentKey}
+		pkBytes, _ := pk.MarshalBinary()
+		signature := ed25519.Sign(ed25519.PrivateKey(privKey), pkBytes)
+
+		// Envoi clé publique + signature
+		if err := sendData(conn, pkBytes, signature); err != nil {
+			resultChan <- KeyExchangeResult{Err: fmt.Errorf("send failed: %w", err)}
+			return
+		}
+
+		// Réception ciphertext client
+		ct, err := receiveBytes(conn)
+		if err != nil {
+			resultChan <- KeyExchangeResult{Err: fmt.Errorf("receive failed: %w", err)}
+			return
+		}
+
+		// Dérivation clé de session
+		sharedSecret := make([]byte, kyber768.SharedKeySize)
+		sk.DecapsulateTo(sharedSecret, ct)
+
+		sessionKey := [32]byte{}
+		copy(sessionKey[:], sharedSecret[:32])
+
+		resultChan <- KeyExchangeResult{Key: sessionKey}
 	}()
+
 	return resultChan, nil
-}
-
-func performKyberKeyExchange(conn io.ReadWriter, privateKey ed25519.PrivateKey) error {
-	pkServer, skServer, err := kyber768.GenerateKeyPair(rand.Reader)
-	if err != nil {
-		return fmt.Errorf("échec génération paire Kyber768 : %w", err)
-	}
-
-	pkBytes, _ := pkServer.MarshalBinary()
-	signature := ed25519.Sign(privateKey, pkBytes)
-
-	if err := sendData(conn, pkBytes, signature); err != nil {
-		return fmt.Errorf("échec de l'envoi des données Kyber : %w", err)
-	}
-
-	ctClient, err := receiveBytes(conn)
-	if err != nil {
-		return fmt.Errorf("erreur réception ciphertext Kyber : %w", err)
-	}
-
-	if len(ctClient) != kyber768.CiphertextSize {
-		return fmt.Errorf("taille du ciphertext Kyber invalide : reçu %d octets", len(ctClient))
-	}
-
-	sharedSecret := make([]byte, kyber768.SharedKeySize)
-	skServer.DecapsulateTo(sharedSecret, ctClient)
-	copy(currentKey[:], sharedSecret)
-	return nil
 }
 
 func sendData(conn io.Writer, pkBytes, signature []byte) error {
@@ -121,5 +109,4 @@ func receiveBytes(conn io.Reader) ([]byte, error) {
 func ResetKeyExchangeState() {
 	mutex.Lock()
 	defer mutex.Unlock()
-	currentKey, lastKeyTime = [32]byte{}, time.Time{}
 }

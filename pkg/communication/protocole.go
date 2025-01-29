@@ -1,6 +1,9 @@
 package communication
 
 import (
+	"crypto/hmac"
+	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"strconv"
@@ -46,6 +49,9 @@ func ReceiveMessage(reader io.Reader, sharedKey []byte) (string, error) {
 	parts := strings.SplitN(message, "|", 2)
 	if len(parts) != 2 || !validateHMAC(parts[0], parts[1], sharedKey) {
 		return "", fmt.Errorf("message invalide ou corrompu")
+	}
+	if !validateHMAC(parts[0], parts[1], sharedKey) {
+		return "", errors.New("intégrité message compromise")
 	}
 
 	return validateAndStoreMessage(parts[0], sharedKey)
@@ -103,5 +109,10 @@ func ResetMessageHistory() {
 }
 
 func validateHMAC(message, receivedHMAC string, key []byte) bool {
-	return GenerateHMAC(message, key) == receivedHMAC
+	expectedMAC := computeHMAC([]byte(message), key)
+	receivedMAC, err := base64.StdEncoding.DecodeString(receivedHMAC)
+	if err != nil {
+		return false
+	}
+	return hmac.Equal(expectedMAC, receivedMAC)
 }

@@ -88,12 +88,18 @@ func processMessage(msg string, sharedKey []byte, writer io.Writer, username str
 		return fmt.Errorf("message mal formé")
 	}
 
-	encryptedMsg, receivedHMAC := parts[0], strings.TrimSpace(parts[1])
-	if _, err := base64.StdEncoding.DecodeString(encryptedMsg); err != nil {
-		return fmt.Errorf("message mal encodé : %v", err)
+	encryptedMsg, receivedHMACBase64 := parts[0], strings.TrimSpace(parts[1])
+
+	// Décodage du HMAC reçu
+	receivedHMAC, err := base64.StdEncoding.DecodeString(receivedHMACBase64)
+	if err != nil {
+		return fmt.Errorf("HMAC invalide, décodage échoué: %v", err)
 	}
 
-	if !hmac.Equal([]byte(receivedHMAC), []byte(GenerateHMAC(encryptedMsg, sharedKey))) {
+	// Calcul du HMAC attendu
+	computedHMAC := computeHMAC([]byte(encryptedMsg), sharedKey)
+
+	if !hmac.Equal(computedHMAC, receivedHMAC) {
 		return fmt.Errorf("HMAC invalide, message rejeté")
 	}
 

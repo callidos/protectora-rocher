@@ -10,14 +10,27 @@ import (
 	"errors"
 	"fmt"
 	"io"
+
+	"golang.org/x/crypto/hkdf"
 )
 
 func DeriveKeys(masterKey []byte) (encKey, hmacKey []byte, err error) {
 	if len(masterKey) == 0 {
 		return nil, nil, errors.New("master key cannot be empty")
 	}
-	hash := sha256.Sum256(masterKey)
-	return hash[:16], hash[16:], nil
+
+	h := hkdf.New(sha256.New, masterKey, nil, nil)
+	encKey = make([]byte, 32) // AES-256
+	if _, err := io.ReadFull(h, encKey); err != nil {
+		return nil, nil, fmt.Errorf("key derivation failed: %w", err)
+	}
+
+	hmacKey = make([]byte, 32)
+	if _, err := io.ReadFull(h, hmacKey); err != nil {
+		return nil, nil, fmt.Errorf("key derivation failed: %w", err)
+	}
+
+	return encKey, hmacKey, nil
 }
 
 func EncryptAESGCM(plaintext, masterKey []byte) (string, error) {
