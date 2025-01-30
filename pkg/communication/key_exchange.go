@@ -120,27 +120,6 @@ func receiveBytes(conn io.Reader) ([]byte, error) {
 	return buf, nil
 }
 
-func receivePeerData(conn io.Reader) ([]byte, []byte, error) {
-	pkBytes, err := receiveBytes(conn)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	sigBytes, err := receiveBytes(conn)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	return pkBytes, sigBytes, nil
-}
-
-func verifyPeerSignature(pubKey ed25519.PublicKey, sig, data []byte) error {
-	if !ed25519.Verify(pubKey, data, sig) {
-		return fmt.Errorf("signature verification failed")
-	}
-	return nil
-}
-
 func ResetKeyExchangeState() {
 	mutex.Lock()
 	defer mutex.Unlock()

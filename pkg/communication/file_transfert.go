@@ -37,16 +37,9 @@ func EncryptFile(inputPath, outputPath string, key []byte) error {
 		return fmt.Errorf("erreur initialisation GCM: %w", err)
 	}
 
-	nonce := make([]byte, aesGCM.NonceSize())
-	if _, err := rand.Read(nonce); err != nil {
-		return fmt.Errorf("erreur génération nonce: %w", err)
-	}
-
-	if _, err := outputFile.Write(nonce); err != nil {
-		return fmt.Errorf("erreur écriture nonce: %w", err)
-	}
-
+	// Préparation du HMAC
 	hmacHash := hmac.New(sha3.New256, key[32:])
+
 	buffer := make([]byte, bufferSize)
 	for {
 		n, err := inputFile.Read(buffer)
@@ -57,21 +50,35 @@ func EncryptFile(inputPath, outputPath string, key []byte) error {
 			break
 		}
 
-		encrypted := aesGCM.Seal(nil, nonce, buffer[:n], nil)
-		hmacHash.Write(encrypted)
+		// Générer un nonce pour chaque bloc
+		nonce := make([]byte, aesGCM.NonceSize())
+		if _, err := rand.Read(nonce); err != nil {
+			return fmt.Errorf("erreur génération nonce: %w", err)
+		}
 
-		// Écrire la taille du bloc chiffré avant les données
+		// Chiffrement du bloc
+		encryptedBlock := aesGCM.Seal(nil, nonce, buffer[:n], nil)
+
+		// Combiner nonce + données chiffrées
+		combined := append(nonce, encryptedBlock...)
+
+		// Mise à jour du HMAC
+		hmacHash.Write(combined)
+
+		// Écrire la taille du bloc
 		blockSize := make([]byte, 4)
-		binary.BigEndian.PutUint32(blockSize, uint32(len(encrypted)))
+		binary.BigEndian.PutUint32(blockSize, uint32(len(combined)))
 		if _, err := outputFile.Write(blockSize); err != nil {
 			return fmt.Errorf("erreur écriture taille bloc: %w", err)
 		}
 
-		if _, err := outputFile.Write(encrypted); err != nil {
+		// Écrire le bloc nonce + données chiffrées
+		if _, err := outputFile.Write(combined); err != nil {
 			return fmt.Errorf("erreur écriture bloc chiffré: %w", err)
 		}
 	}
 
+	// Écrire le HMAC final
 	hmacSum := hmacHash.Sum(nil)
 	if _, err := outputFile.Write(hmacSum); err != nil {
 		return fmt.Errorf("erreur écriture HMAC: %w", err)
@@ -102,19 +109,13 @@ func DecryptFile(inputPath, outputPath string, key []byte) error {
 		return fmt.Errorf("erreur initialisation GCM: %w", err)
 	}
 
-	nonceSize := aesGCM.NonceSize()
-	nonce := make([]byte, nonceSize)
-	if _, err := io.ReadFull(inputFile, nonce); err != nil {
-		return fmt.Errorf("erreur lecture nonce: %w", err)
-	}
-
-	// Lire le reste du fichier
+	// Lire tout le contenu du fichier
 	fileData, err := io.ReadAll(inputFile)
 	if err != nil {
 		return fmt.Errorf("erreur lecture données du fichier: %w", err)
 	}
 
-	// Séparer HMAC (32 derniers octets)
+	// Extraire le HMAC (32 octets en fin de fichier)
 	hmacSize := 32
 	if len(fileData) < hmacSize {
 		return fmt.Errorf("fichier trop court pour contenir HMAC")
@@ -122,37 +123,56 @@ func DecryptFile(inputPath, outputPath string, key []byte) error {
 	hmacData := fileData[len(fileData)-hmacSize:]
 	encryptedData := fileData[:len(fileData)-hmacSize]
 
+	// Calcul du HMAC sur tous les blocs
 	hmacHash := hmac.New(sha3.New256, key[32:])
 	reader := bytes.NewReader(encryptedData)
 
 	for {
+		// Lecture de la taille du bloc
 		blockSizeBytes := make([]byte, 4)
-		if _, err := io.ReadFull(reader, blockSizeBytes); err != nil {
-			if err == io.EOF {
-				break
-			}
+		_, err := io.ReadFull(reader, blockSizeBytes)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
 			return fmt.Errorf("erreur lecture taille bloc: %w", err)
 		}
 
 		size := binary.BigEndian.Uint32(blockSizeBytes)
-		encryptedBlock := make([]byte, size)
-		if _, err := io.ReadFull(reader, encryptedBlock); err != nil {
+		if size == 0 {
+			return fmt.Errorf("taille de bloc invalide (0)")
+		}
+
+		// Lecture du bloc (nonce + données chiffrées)
+		chunk := make([]byte, size)
+		if _, err := io.ReadFull(reader, chunk); err != nil {
 			return fmt.Errorf("erreur lecture bloc chiffré: %w", err)
 		}
 
-		hmacHash.Write(encryptedBlock)
+		// Mise à jour du HMAC
+		hmacHash.Write(chunk)
 
+		// Séparation du nonce et du ciphertext
+		nonceSize := aesGCM.NonceSize()
+		if len(chunk) < nonceSize {
+			return fmt.Errorf("bloc trop court pour contenir le nonce")
+		}
+		nonce := chunk[:nonceSize]
+		encryptedBlock := chunk[nonceSize:]
+
+		// Déchiffrement
 		decryptedBlock, err := aesGCM.Open(nil, nonce, encryptedBlock, nil)
 		if err != nil {
 			return fmt.Errorf("erreur déchiffrement: %w", err)
 		}
 
+		// Écriture des données déchiffrées
 		if _, err := outputFile.Write(decryptedBlock); err != nil {
 			return fmt.Errorf("erreur écriture données déchiffrées: %w", err)
 		}
 	}
 
-	// Vérification HMAC
+	// Vérification du HMAC final
 	expectedHMAC := hmacHash.Sum(nil)
 	if !hmac.Equal(expectedHMAC, hmacData) {
 		return fmt.Errorf("HMAC invalide : fichier corrompu ou altéré")
@@ -177,15 +197,6 @@ func SecureFileTransfer(writer io.Writer, filePath string, key []byte) error {
 		return fmt.Errorf("erreur initialisation GCM: %w", err)
 	}
 
-	nonce := make([]byte, aesGCM.NonceSize())
-	if _, err := rand.Read(nonce); err != nil {
-		return fmt.Errorf("erreur génération nonce: %w", err)
-	}
-
-	if _, err := writer.Write(nonce); err != nil {
-		return fmt.Errorf("erreur écriture nonce: %w", err)
-	}
-
 	buffer := make([]byte, 4096)
 	for {
 		n, err := file.Read(buffer)
@@ -196,14 +207,27 @@ func SecureFileTransfer(writer io.Writer, filePath string, key []byte) error {
 			break
 		}
 
+		// Générer un nonce pour chaque bloc
+		nonce := make([]byte, aesGCM.NonceSize())
+		if _, err := rand.Read(nonce); err != nil {
+			return fmt.Errorf("erreur génération nonce: %w", err)
+		}
+
+		// Chiffrement du bloc
 		encrypted := aesGCM.Seal(nil, nonce, buffer[:n], nil)
 
+		// Combinaison nonce + données chiffrées
+		combined := append(nonce, encrypted...)
+
+		// Écriture de la taille du bloc
 		blockSize := make([]byte, 4)
-		binary.BigEndian.PutUint32(blockSize, uint32(len(encrypted)))
+		binary.BigEndian.PutUint32(blockSize, uint32(len(combined)))
 		if _, err := writer.Write(blockSize); err != nil {
 			return fmt.Errorf("erreur écriture taille bloc: %w", err)
 		}
-		if _, err := writer.Write(encrypted); err != nil {
+
+		// Écriture du bloc
+		if _, err := writer.Write(combined); err != nil {
 			return fmt.Errorf("erreur écriture bloc chiffré: %w", err)
 		}
 	}
@@ -227,12 +251,8 @@ func ReceiveSecureFile(reader io.Reader, outputPath string, key []byte) error {
 		return fmt.Errorf("erreur initialisation GCM: %w", err)
 	}
 
-	nonce := make([]byte, aesGCM.NonceSize())
-	if _, err := io.ReadFull(reader, nonce); err != nil {
-		return fmt.Errorf("erreur lecture nonce: %w", err)
-	}
-
 	for {
+		// Lecture de la taille du bloc
 		blockSize := make([]byte, 4)
 		if _, err := io.ReadFull(reader, blockSize); err != nil {
 			if err == io.EOF {
@@ -242,16 +262,31 @@ func ReceiveSecureFile(reader io.Reader, outputPath string, key []byte) error {
 		}
 
 		size := binary.BigEndian.Uint32(blockSize)
-		encrypted := make([]byte, size)
-		if _, err := io.ReadFull(reader, encrypted); err != nil {
+		if size == 0 {
+			return fmt.Errorf("taille de bloc invalide (0)")
+		}
+
+		// Lecture du bloc (nonce + données chiffrées)
+		combined := make([]byte, size)
+		if _, err := io.ReadFull(reader, combined); err != nil {
 			return fmt.Errorf("erreur lecture bloc chiffré: %w", err)
 		}
 
+		// Séparer le nonce et le ciphertext
+		nonceSize := aesGCM.NonceSize()
+		if len(combined) < nonceSize {
+			return fmt.Errorf("bloc trop court pour contenir le nonce")
+		}
+		nonce := combined[:nonceSize]
+		encrypted := combined[nonceSize:]
+
+		// Déchiffrement
 		decrypted, err := aesGCM.Open(nil, nonce, encrypted, nil)
 		if err != nil {
 			return fmt.Errorf("erreur déchiffrement: %w", err)
 		}
 
+		// Écriture des données déchiffrées
 		if _, err := file.Write(decrypted); err != nil {
 			return fmt.Errorf("erreur écriture données déchiffrées: %w", err)
 		}

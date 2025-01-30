@@ -10,17 +10,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"sync"
+	"runtime"
 
-	"golang.org/x/crypto/chacha20"
 	"golang.org/x/crypto/hkdf"
 )
-
-var bufPool = sync.Pool{
-	New: func() interface{} {
-		return make([]byte, 4096)
-	},
-}
 
 func DeriveKeys(masterKey []byte) (encKey, hmacKey []byte, err error) {
 	if len(masterKey) == 0 {
@@ -133,16 +126,11 @@ func computeHMAC(data, key []byte) []byte {
 	return mac.Sum(nil)
 }
 
-func MemzeroSecure(b []byte) {
-	buf := bufPool.Get().([]byte)
-	defer bufPool.Put(buf)
-
-	for i := 0; i < len(b); i += len(buf) {
-		chunk := b[i:]
-		if len(chunk) > len(buf) {
-			chunk = chunk[:len(buf)]
-		}
-		cipher, _ := chacha20.NewUnauthenticatedCipher(make([]byte, 32), make([]byte, 24))
-		cipher.XORKeyStream(chunk, chunk)
+func MemzeroSecure(b *[]byte) {
+	// Pour chaque indice du slice, on force la mise à zéro
+	for i := range *b {
+		(*b)[i] = 0
 	}
+	// Éventuellement un keep-alive
+	runtime.KeepAlive(b)
 }
