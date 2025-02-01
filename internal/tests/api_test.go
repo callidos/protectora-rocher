@@ -12,26 +12,35 @@ import (
 // TestEncryptDecryptMessage vérifie le chiffrement et le déchiffrement des messages via la session.
 func TestEncryptDecryptMessage(t *testing.T) {
 	// Pour ce test, nous créons une session de test avec une clé connue.
+	// On utilise cette clé pour initialiser le double ratchet.
 	key := []byte("supersecretdemotestkey12345678901234")
 	message := "Test du chiffrement"
 
-	// Création manuelle d'une session (le champ Conn n'est pas utilisé ici).
+	dr, err := communication.InitializeDoubleRatchet(key)
+	if err != nil {
+		t.Fatalf("Erreur d'initialisation du double ratchet : %v", err)
+	}
+	// Pour ce test unitaire, forçons la symétrie pour pouvoir déchiffrer
+	// le message chiffré par la même instance.
+	dr.ReceivingChain = dr.SendingChain
+
+	// Création manuelle d'une session de test (le champ Conn n'est pas utilisé ici).
 	session := &communication.Session{
-		Key: key,
+		Ratchet: dr,
 	}
 
 	encrypted, err := session.EncryptMessage(message)
 	if err != nil {
-		t.Fatalf("Erreur de chiffrement: %v", err)
+		t.Fatalf("Erreur de chiffrement : %v", err)
 	}
 
 	decrypted, err := session.DecryptMessage(encrypted)
 	if err != nil {
-		t.Fatalf("Erreur de déchiffrement: %v", err)
+		t.Fatalf("Erreur de déchiffrement : %v", err)
 	}
 
 	if decrypted != message {
-		t.Errorf("Les messages ne correspondent pas: attendu %s, obtenu %s", message, decrypted)
+		t.Errorf("Les messages ne correspondent pas : attendu %s, obtenu %s", message, decrypted)
 	}
 }
 
@@ -41,24 +50,31 @@ func TestSendReceiveMessage(t *testing.T) {
 	message := "Message sécurisé test"
 	var buffer bytes.Buffer
 
+	dr, err := communication.InitializeDoubleRatchet(key)
+	if err != nil {
+		t.Fatalf("Erreur d'initialisation du double ratchet : %v", err)
+	}
+	// Pour ce test unitaire, forçons la symétrie en utilisant la même chaîne pour l'envoi et la réception.
+	dr.ReceivingChain = dr.SendingChain
+
 	// Création d'une session de test avec le buffer comme connexion.
 	session := &communication.Session{
-		Conn: &buffer,
-		Key:  key,
+		Conn:    &buffer,
+		Ratchet: dr,
 	}
 
-	err := session.SendSecureMessage(message, 1, 60)
+	err = session.SendSecureMessage(message, 1, 60)
 	if err != nil {
-		t.Fatalf("Erreur d'envoi du message sécurisé: %v", err)
+		t.Fatalf("Erreur d'envoi du message sécurisé : %v", err)
 	}
 
 	received, err := session.ReceiveSecureMessage()
 	if err != nil {
-		t.Fatalf("Erreur de réception du message sécurisé: %v", err)
+		t.Fatalf("Erreur de réception du message sécurisé : %v", err)
 	}
 
 	if received != message {
-		t.Errorf("Les messages reçus ne correspondent pas: attendu %s, obtenu %s", message, received)
+		t.Errorf("Les messages reçus ne correspondent pas : attendu %s, obtenu %s", message, received)
 	}
 }
 
@@ -74,7 +90,7 @@ func TestBase64Encoding(t *testing.T) {
 
 	decoded, err := base64.StdEncoding.DecodeString(encoded)
 	if err != nil {
-		t.Fatalf("Erreur de décodage Base64: %v", err)
+		t.Fatalf("Erreur de décodage Base64 : %v", err)
 	}
 
 	if string(decoded) != data {
