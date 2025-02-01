@@ -2,59 +2,66 @@ package main
 
 import (
 	"bufio"
+	"crypto/ed25519"
+	"crypto/rand"
 	"fmt"
+	"log"
 	"net"
 	"os"
+	"strings"
 
 	"protectora-rocher/pkg/communication"
 )
 
 func main() {
+	// Connexion au serveur sur localhost:8080.
 	conn, err := net.Dial("tcp", "localhost:8080")
 	if err != nil {
-		fmt.Println("Erreur de connexion au serveur:", err)
-		return
+		log.Fatalf("Erreur de connexion : %v", err)
 	}
 	defer conn.Close()
+	log.Println("Connecté au serveur sur localhost:8080")
 
-	sharedKey := []byte("thisisaverysecurekey!")
+	// Générer la paire de clés Ed25519 du client (pour signer le handshake).
+	pubKey, privKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		log.Fatalf("Erreur lors de la génération de la clé Ed25519 : %v", err)
+	}
+	log.Printf("Clé publique du client : %x", pubKey)
 
-	// Goroutine pour écouter les messages entrants
-	go func() {
-		for {
-			response, err := bufio.NewReader(conn).ReadString('\n')
-			if err != nil {
-				fmt.Println("Erreur de réception:", err)
-				break
-			}
+	// Réaliser le handshake côté client et établir une session sécurisée.
+	session, err := communication.NewClientSessionWithHandshake(conn, privKey)
+	if err != nil {
+		log.Fatalf("Erreur lors du handshake : %v", err)
+	}
+	log.Println("Handshake réussi, session sécurisée établie")
 
-			decryptedMsg, err := communication.DecryptMessage(response, sharedKey)
-			if err != nil {
-				fmt.Println("Erreur de déchiffrement:", err)
-			} else {
-				fmt.Println("Message reçu :", decryptedMsg)
-			}
-		}
-	}()
-
-	fmt.Println("Tapez vos messages (exit pour quitter):")
+	// Boucle d'envoi et de réception de messages.
+	reader := bufio.NewReader(os.Stdin)
 	for {
-		fmt.Print("> ")
-		text, _ := bufio.NewReader(os.Stdin).ReadString('\n')
-		if text == "exit\n" {
+		fmt.Print("Entrez un message (ou 'quit' pour quitter) : ")
+		text, err := reader.ReadString('\n')
+		if err != nil {
+			log.Printf("Erreur de lecture : %v", err)
+			continue
+		}
+		text = strings.TrimSpace(text)
+		if text == "quit" {
 			break
 		}
 
-		encryptedMsg, err := communication.EncryptMessage(text, sharedKey)
-		if err != nil {
-			fmt.Println("Erreur de chiffrement:", err)
+		// Envoyer le message via la session sécurisée.
+		if err := session.SendSecureMessage(text, 1, 60); err != nil {
+			log.Printf("Erreur lors de l'envoi du message : %v", err)
 			continue
 		}
 
-		_, err = conn.Write([]byte(encryptedMsg + "\n"))
+		// Recevoir la réponse du serveur.
+		reply, err := session.ReceiveSecureMessage()
 		if err != nil {
-			fmt.Println("Erreur d'envoi du message:", err)
-			break
+			log.Printf("Erreur lors de la réception de la réponse : %v", err)
+			continue
 		}
+		fmt.Printf("Réponse du serveur : %s\n", reply)
 	}
 }

@@ -1,118 +1,81 @@
 package communication
 
 import (
+	"crypto/ed25519"
 	"errors"
+	"fmt"
 	"io"
 )
 
-// EncryptMessage chiffre un message avec une clé partagée.
-// - Paramètres:
-//   - message: texte clair à chiffrer.
-//   - key: clé partagée (32 octets).
-//
-// - Retour: message chiffré (base64) ou erreur.
-func EncryptMessage(message string, key []byte) (string, error) {
-	if len(key) == 0 {
-		return "", errors.New("la clé ne peut pas être vide")
-	}
-	return EncryptAESGCM([]byte(message), key)
+// Session représente une connexion sécurisée dont le protocole gère automatiquement la clé de session.
+type Session struct {
+	Conn io.ReadWriter // Connexion réseau ou flux de communication.
+	Key  []byte        // Clé de session établie via le handshake.
 }
 
-// DecryptMessage déchiffre un message chiffré.
-// - Paramètres:
-//   - encryptedMessage: message chiffré (base64).
-//   - key: clé partagée (32 octets).
-//
-// - Retour: message en clair ou erreur.
-func DecryptMessage(encryptedMessage string, key []byte) (string, error) {
-	decrypted, err := DecryptAESGCM(encryptedMessage, key)
+// NewClientSessionWithHandshake réalise la partie handshake côté client (initiateur).
+// Il n'est pas nécessaire de fournir une clé pré-partagée ; la clé de session est dérivée automatiquement.
+func NewClientSessionWithHandshake(conn io.ReadWriter, privKey ed25519.PrivateKey) (*Session, error) {
+	handshakeChan, err := ClientPerformKeyExchange(conn, privKey)
+	if err != nil {
+		return nil, fmt.Errorf("client handshake error: %w", err)
+	}
+	result := <-handshakeChan
+	if result.Err != nil {
+		return nil, fmt.Errorf("client handshake error: %w", result.Err)
+	}
+	sessionKey := result.Key[:]
+	return &Session{
+		Conn: conn,
+		Key:  sessionKey,
+	}, nil
+}
+
+// NewServerSessionWithHandshake réalise la partie handshake côté serveur (répondeur).
+func NewServerSessionWithHandshake(conn io.ReadWriter, privKey ed25519.PrivateKey) (*Session, error) {
+	handshakeChan, err := ServerPerformKeyExchange(conn, privKey)
+	if err != nil {
+		return nil, fmt.Errorf("server handshake error: %w", err)
+	}
+	result := <-handshakeChan
+	if result.Err != nil {
+		return nil, fmt.Errorf("server handshake error: %w", result.Err)
+	}
+	sessionKey := result.Key[:]
+	return &Session{
+		Conn: conn,
+		Key:  sessionKey,
+	}, nil
+}
+
+// EncryptMessage chiffre un message en clair avec la clé de session et retourne le message encodé en base64.
+func (s *Session) EncryptMessage(message string) (string, error) {
+	if len(s.Key) == 0 {
+		return "", errors.New("la clé de session n'est pas initialisée")
+	}
+	return EncryptAESGCM([]byte(message), s.Key)
+}
+
+// DecryptMessage déchiffre un message encodé en base64 avec la clé de session.
+func (s *Session) DecryptMessage(encryptedMessage string) (string, error) {
+	decrypted, err := DecryptAESGCM(encryptedMessage, s.Key)
 	if err != nil {
 		return "", err
 	}
 	return string(decrypted), nil
 }
 
-// SendSecureMessage envoie un message sécurisé via un writer.
-// - Paramètres:
-//   - writer: connexion réseau ou fichier pour envoyer les données.
-//   - message: texte clair à envoyer.
-//   - key: clé partagée (32 octets).
-//   - seqNum: numéro de séquence unique.
-//   - duration: durée avant expiration (secondes).
-//
-// - Retour: erreur si l'envoi échoue.
-func SendSecureMessage(writer io.Writer, message string, key []byte, seqNum uint64, duration int) error {
-	return SendMessage(writer, message, key, seqNum, duration)
+// SendSecureMessage envoie un message sécurisé via la connexion associée à la session.
+func (s *Session) SendSecureMessage(message string, seqNum uint64, duration int) error {
+	return SendMessage(s.Conn, message, s.Key, seqNum, duration)
 }
 
-// ReceiveSecureMessage reçoit un message sécurisé via un reader.
-// - Paramètres:
-//   - reader: connexion réseau ou fichier pour recevoir les données.
-//   - key: clé partagée (32 octets).
-//
-// - Retour: message en clair ou erreur.
-func ReceiveSecureMessage(reader io.Reader, key []byte) (string, error) {
-	return ReceiveMessage(reader, key)
+// ReceiveSecureMessage reçoit un message sécurisé via la connexion associée à la session.
+func (s *Session) ReceiveSecureMessage() (string, error) {
+	return ReceiveMessage(s.Conn, s.Key)
 }
 
-// HandleNewConnection gère une nouvelle connexion client en boucle.
-// - Paramètres:
-//   - reader: connexion entrante (client).
-//   - writer: connexion sortante (serveur).
-//   - sharedKey: clé partagée pour l'échange sécurisé.
-func HandleNewConnection(reader io.Reader, writer io.Writer, sharedKey []byte) {
-	HandleConnection(reader, writer, sharedKey)
-}
-
-// PerformKeyExchange effectue un échange de clés sécurisé avec le protocole Kyber.
-// - Paramètres:
-//   - conn: connexion réseau bidirectionnelle.
-//   - privKey: clé privée Ed25519 (32 octets).
-//
-// - Retour: canal recevant le résultat de l'échange de clé, ou erreur.
-func PerformKeyExchange(conn io.ReadWriter, privKey []byte) (<-chan KeyExchangeResult, error) {
-	return PerformAuthenticatedKeyExchange(conn, privKey)
-}
-
-// InitiateSecureCall démarre un appel vocal sécurisé.
-// - Paramètres:
-//   - conn: connexion réseau bidirectionnelle.
-//   - key: clé partagée (32 octets).
-//
-// - Retour: erreur si l'appel ne peut pas être initié.
-func InitiateSecureCall(conn io.ReadWriter, key []byte) error {
-	return StartSecureCall(conn, key)
-}
-
-// TerminateSecureCall met fin à un appel vocal sécurisé.
-// - Paramètres:
-//   - conn: connexion réseau bidirectionnelle.
-//   - key: clé partagée (32 octets).
-func TerminateSecureCall(conn io.ReadWriter, key []byte) {
-	StopSecureCall(conn, key)
-}
-
-// EncryptFileAPI est une fonction simplifiée pour chiffrer un fichier.
-func EncryptFileAPI(inputPath, outputPath string, key []byte) error {
-	return EncryptFile(inputPath, outputPath, key)
-}
-
-// DecryptFileAPI est une fonction simplifiée pour déchiffrer un fichier.
-func DecryptFileAPI(inputPath, outputPath string, key []byte) error {
-	return DecryptFile(inputPath, outputPath, key)
-}
-
-// SecureFileTransferAPI transfère un fichier de manière sécurisée.
-func SecureFileTransferAPI(writer io.Writer, filePath string, key []byte) error {
-	return SecureFileTransfer(writer, filePath, key)
-}
-
-// ReceiveSecureFileAPI reçoit un fichier de manière sécurisée.
-func ReceiveSecureFileAPI(reader io.Reader, outputPath string, key []byte) error {
-	return ReceiveSecureFile(reader, outputPath, key)
-}
-
-// ResetSecurityState réinitialise l'état de sécurité du système, supprimant les clés et l'historique des messages.
+// ResetSecurityState réinitialise l'état global de sécurité.
 func ResetSecurityState() {
 	ResetMessageHistory()
 	ResetKeyExchangeState()
