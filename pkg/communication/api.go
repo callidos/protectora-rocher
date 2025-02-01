@@ -17,9 +17,7 @@ type Session struct {
 	Ratchet *DoubleRatchet // État du double ratchet.
 }
 
-// NewClientSessionWithHandshake réalise le handshake côté client (initiateur) et échange
-// ensuite des clés DH pour initialiser le double ratchet. La clé de session initiale est obtenue
-// via le protocole Kyber, puis complétée par l’échange des clés Diffie‑Hellman.
+// NewClientSessionWithHandshake réalise le handshake côté client et initialise le double ratchet.
 func NewClientSessionWithHandshake(conn io.ReadWriter, privKey ed25519.PrivateKey) (*Session, error) {
 	// 1. Réaliser le handshake Kyber pour obtenir une clé de session initiale.
 	handshakeChan, err := ClientPerformKeyExchange(conn, privKey)
@@ -30,7 +28,7 @@ func NewClientSessionWithHandshake(conn io.ReadWriter, privKey ed25519.PrivateKe
 	if result.Err != nil {
 		return nil, fmt.Errorf("client handshake error: %w", result.Err)
 	}
-	sessionKey := result.Key[:] // Clé de session issue du handshake Kyber.
+	sessionKey := result.Key[:]
 
 	// 2. Générer notre paire de clés DH (Curve25519).
 	ourDH, err := GenerateDHKeyPair()
@@ -59,6 +57,7 @@ func NewClientSessionWithHandshake(conn io.ReadWriter, privKey ed25519.PrivateKe
 	if err != nil {
 		return nil, fmt.Errorf("client error initializing double ratchet: %w", err)
 	}
+	dr.IsServer = false // Indique que c'est le client.
 
 	return &Session{
 		Conn:    conn,
@@ -66,9 +65,7 @@ func NewClientSessionWithHandshake(conn io.ReadWriter, privKey ed25519.PrivateKe
 	}, nil
 }
 
-// NewServerSessionWithHandshake réalise le handshake côté serveur (répondeur) et échange
-// ensuite des clés DH pour initialiser le double ratchet. Le serveur reçoit d'abord la clé DH du client,
-// génère sa propre paire, puis renvoie sa clé DH.
+// NewServerSessionWithHandshake réalise le handshake côté serveur et initialise le double ratchet.
 func NewServerSessionWithHandshake(conn io.ReadWriter, privKey ed25519.PrivateKey) (*Session, error) {
 	// 1. Réaliser le handshake Kyber pour obtenir une clé de session initiale.
 	handshakeChan, err := ServerPerformKeyExchange(conn, privKey)
@@ -79,7 +76,7 @@ func NewServerSessionWithHandshake(conn io.ReadWriter, privKey ed25519.PrivateKe
 	if result.Err != nil {
 		return nil, fmt.Errorf("server handshake error: %w", result.Err)
 	}
-	sessionKey := result.Key[:] // Clé de session issue du handshake Kyber.
+	sessionKey := result.Key[:]
 
 	// 2. Recevoir la clé publique DH du client.
 	remoteDHPublicBytes, err := receiveBytes(conn)
@@ -108,9 +105,9 @@ func NewServerSessionWithHandshake(conn io.ReadWriter, privKey ed25519.PrivateKe
 	if err != nil {
 		return nil, fmt.Errorf("server error initializing double ratchet: %w", err)
 	}
-
-	// Pour le serveur, inverser les chaînes d'envoi et de réception pour correspondre aux rôles.
+	// Inverser les chaînes pour aligner les rôles.
 	dr.SendingChain, dr.ReceivingChain = dr.ReceivingChain, dr.SendingChain
+	dr.IsServer = true // Indique que c'est le serveur.
 
 	return &Session{
 		Conn:    conn,
@@ -118,8 +115,7 @@ func NewServerSessionWithHandshake(conn io.ReadWriter, privKey ed25519.PrivateKe
 	}, nil
 }
 
-// EncryptMessage chiffre un message en clair en utilisant la chaîne d'envoi du double ratchet.
-// La clé de message est dérivée via une mise à jour de la chaîne, et le message est chiffré avec AES‑GCM.
+// EncryptMessage chiffre un message en utilisant la clé dérivée via le double ratchet.
 func (s *Session) EncryptMessage(message string) (string, error) {
 	if s.Ratchet == nil {
 		return "", errors.New("double ratchet is not initialized")
@@ -132,7 +128,7 @@ func (s *Session) EncryptMessage(message string) (string, error) {
 	return EncryptAESGCM([]byte(message), messageKey)
 }
 
-// DecryptMessage déchiffre un message encodé en base64 en utilisant la chaîne de réception du double ratchet.
+// DecryptMessage déchiffre un message en utilisant la clé dérivée via le double ratchet.
 func (s *Session) DecryptMessage(encryptedMessage string) (string, error) {
 	if s.Ratchet == nil {
 		return "", errors.New("double ratchet is not initialized")
@@ -149,24 +145,24 @@ func (s *Session) DecryptMessage(encryptedMessage string) (string, error) {
 	return string(plaintext), nil
 }
 
-// SendSecureMessage envoie un message sécurisé via la connexion associée à la session.
-// Le message est formaté et signé par un HMAC basé sur la clé racine.
+// SendSecureMessage envoie un message sécurisé en formatant le message et en ajoutant un HMAC.
 func (s *Session) SendSecureMessage(message string, seqNum uint64, duration int) error {
 	timestamp := time.Now().Unix()
-	// Format du message : "seqNum|timestamp|duration|ciphertext"
 	ciphertext, err := s.EncryptMessage(message)
 	if err != nil {
 		return fmt.Errorf("encryption error: %w", err)
 	}
+	ciphertext = strings.TrimSpace(ciphertext)
 	formatted := fmt.Sprintf("%d|%d|%d|%s", seqNum, timestamp, duration, ciphertext)
 	hmacVal := GenerateHMAC(formatted, s.Ratchet.RootKey)
 	finalMessage := fmt.Sprintf("%s|%s\n", formatted, hmacVal)
+	// (Optionnel) Log de débogage
+	// fmt.Printf("DEBUG SendSecureMessage: %q\n", finalMessage)
 	_, err = s.Conn.Write([]byte(finalMessage))
 	return err
 }
 
-// ReceiveSecureMessage reçoit un message sécurisé depuis la connexion associée à la session.
-// Le message est découpé en ses éléments, le HMAC est vérifié, et le contenu est déchiffré.
+// ReceiveSecureMessage reçoit un message, vérifie le HMAC et déchiffre le ciphertext.
 func (s *Session) ReceiveSecureMessage() (string, error) {
 	reader := bufio.NewReader(s.Conn)
 	line, err := reader.ReadString('\n')
@@ -178,17 +174,18 @@ func (s *Session) ReceiveSecureMessage() (string, error) {
 	if len(parts) != 5 {
 		return "", errors.New("invalid message format")
 	}
-	// Reconstituer le message sans le HMAC et vérifier l'intégrité.
 	msgWithoutHMAC := strings.Join(parts[:4], "|")
 	expectedHMAC := GenerateHMAC(msgWithoutHMAC, s.Ratchet.RootKey)
+	// Log de débogage
+	// fmt.Printf("DEBUG ReceiveSecureMessage:\n msgWithoutHMAC: %q\n HMAC reçu: %q\n HMAC attendu: %q\n", msgWithoutHMAC, parts[4], expectedHMAC)
 	if expectedHMAC != parts[4] {
 		return "", errors.New("HMAC verification failed")
 	}
-	ciphertext := parts[3]
+	ciphertext := strings.TrimSpace(parts[3])
 	return s.DecryptMessage(ciphertext)
 }
 
-// ResetSecurityState réinitialise l'état global de sécurité (historique, états de clés, etc.).
+// ResetSecurityState réinitialise l'état global.
 func ResetSecurityState() {
 	ResetMessageHistory()
 	ResetKeyExchangeState()

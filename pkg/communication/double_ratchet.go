@@ -10,8 +10,7 @@ import (
 	"golang.org/x/crypto/hkdf"
 )
 
-// TestMode est une variable globale qui, lorsqu'elle est vraie, force l'utilisation d'un même identifiant
-// pour la mise à jour de la chaîne, afin de faciliter les tests unitaires.
+// TestMode est une variable globale pour forcer un comportement de test (optionnel).
 var TestMode bool = false
 
 // ---------- Diffie-Hellman pour le Ratchet ----------
@@ -35,8 +34,7 @@ func GenerateDHKeyPair() (*DHKeyPair, error) {
 
 // ---------- Implémentation du Double Ratchet ----------
 
-// DoubleRatchet contient l'état du double ratchet, incluant la clé racine, les chaînes d'envoi et de réception,
-// les compteurs de messages, la paire de clés DH actuelle et la clé publique DH distante.
+// DoubleRatchet contient l'état du double ratchet.
 type DoubleRatchet struct {
 	RootKey            []byte            // Clé racine.
 	SendingChain       []byte            // Chaîne d'envoi pour dériver les clés de message sortantes.
@@ -45,7 +43,9 @@ type DoubleRatchet struct {
 	RecvMsgNum         uint32            // Numéro de message pour la réception.
 	DH                 *DHKeyPair        // Notre paire de clés DH actuelle.
 	RemoteDHPublic     [32]byte          // Clé publique DH distante.
-	SkippedMessageKeys map[string][]byte // Pour stocker des clés de messages manquées (hors séquence).
+	SkippedMessageKeys map[string][]byte // Pour stocker des clés de messages sautées (hors séquence).
+	// IsServer indique si cette instance appartient au serveur.
+	IsServer bool
 }
 
 // InitializeDoubleRatchet initialise le double ratchet à partir d'une clé de session initiale,
@@ -58,7 +58,7 @@ func InitializeDoubleRatchet(sessionKey []byte, ourDH *DHKeyPair, remoteDHPublic
 	sendingChain := make([]byte, 32)
 	receivingChain := make([]byte, 32)
 
-	// Utiliser HKDF pour dériver le RootKey et les chaînes initiales.
+	// Dérivation via HKDF.
 	hkdfRoot := hkdf.New(sha256.New, sessionKey, nil, []byte("DoubleRatchet-Root"))
 	if _, err := io.ReadFull(hkdfRoot, rootKey); err != nil {
 		return nil, err
@@ -80,11 +80,12 @@ func InitializeDoubleRatchet(sessionKey []byte, ourDH *DHKeyPair, remoteDHPublic
 		DH:                 ourDH,
 		RemoteDHPublic:     remoteDHPublic,
 		SkippedMessageKeys: make(map[string][]byte),
+		IsServer:           false, // Par défaut, c'est le client.
 	}, nil
 }
 
-// ratchetChainUpdate met à jour une chaîne (envoi ou réception) et dérive une clé de message.
-// Si TestMode est activé, on ignore l'info et on utilise "DoubleRatchet-Test" pour forcer la symétrie.
+// ratchetChainUpdate met à jour une chaîne et dérive une clé de message.
+// Si TestMode est activé, on force l'utilisation de "DoubleRatchet-Test" comme info.
 func ratchetChainUpdate(chainKey []byte, info string) (newChainKey []byte, messageKey []byte, err error) {
 	if TestMode {
 		info = "DoubleRatchet-Test"
@@ -102,11 +103,19 @@ func ratchetChainUpdate(chainKey []byte, info string) (newChainKey []byte, messa
 	return newChainKey, messageKey, nil
 }
 
-// RatchetEncrypt dérive une clé de message à partir de la chaîne d'envoi, met à jour la chaîne, et incrémente SendMsgNum.
+// RatchetEncrypt dérive une clé de message à partir de la chaîne d'envoi et met à jour cette chaîne.
+// Pour le client (IsServer == false), on utilise "DoubleRatchet-Sending".
+// Pour le serveur (IsServer == true), la chaîne a été inversée, donc pour l'encryptage on utilise "DoubleRatchet-Receiving".
 func (dr *DoubleRatchet) RatchetEncrypt() ([]byte, error) {
+	var info string
+	if dr.IsServer {
+		info = "DoubleRatchet-Receiving"
+	} else {
+		info = "DoubleRatchet-Sending"
+	}
 	var err error
 	var key []byte
-	dr.SendingChain, key, err = ratchetChainUpdate(dr.SendingChain, "DoubleRatchet-Sending")
+	dr.SendingChain, key, err = ratchetChainUpdate(dr.SendingChain, info)
 	if err != nil {
 		return nil, err
 	}
@@ -114,11 +123,19 @@ func (dr *DoubleRatchet) RatchetEncrypt() ([]byte, error) {
 	return key, nil
 }
 
-// RatchetDecrypt dérive une clé de message à partir de la chaîne de réception, met à jour la chaîne, et incrémente RecvMsgNum.
+// RatchetDecrypt dérive une clé de message à partir de la chaîne de réception et met à jour cette chaîne.
+// Pour le client, on utilise "DoubleRatchet-Receiving".
+// Pour le serveur, on utilise "DoubleRatchet-Sending" (puisque ses chaînes ont été inversées).
 func (dr *DoubleRatchet) RatchetDecrypt() ([]byte, error) {
+	var info string
+	if dr.IsServer {
+		info = "DoubleRatchet-Sending"
+	} else {
+		info = "DoubleRatchet-Receiving"
+	}
 	var err error
 	var key []byte
-	dr.ReceivingChain, key, err = ratchetChainUpdate(dr.ReceivingChain, "DoubleRatchet-Receiving")
+	dr.ReceivingChain, key, err = ratchetChainUpdate(dr.ReceivingChain, info)
 	if err != nil {
 		return nil, err
 	}
@@ -127,20 +144,17 @@ func (dr *DoubleRatchet) RatchetDecrypt() ([]byte, error) {
 }
 
 // DHRatchet effectue une mise à jour DH ratchet lorsque l'on reçoit une nouvelle clé publique DH distante.
-// Cela met à jour la clé racine, réinitialise les chaînes et les compteurs, et génère une nouvelle paire DH.
 func (dr *DoubleRatchet) DHRatchet(newRemotePublic [32]byte) error {
 	sharedSecret, err := curve25519.X25519(dr.DH.Private[:], newRemotePublic[:])
 	if err != nil {
 		return err
 	}
-	// Mise à jour de la RootKey via HKDF.
 	hkdfRoot := hkdf.New(sha256.New, sharedSecret, dr.RootKey, []byte("DoubleRatchet-DHRatchet"))
 	newRootKey := make([]byte, 32)
 	if _, err := io.ReadFull(hkdfRoot, newRootKey); err != nil {
 		return err
 	}
 	dr.RootKey = newRootKey
-	// Dériver de nouvelles chaînes d'envoi et de réception.
 	hkdfSend := hkdf.New(sha256.New, dr.RootKey, nil, []byte("DoubleRatchet-NewSending"))
 	newSendingChain := make([]byte, 32)
 	if _, err := io.ReadFull(hkdfSend, newSendingChain); err != nil {
@@ -155,7 +169,6 @@ func (dr *DoubleRatchet) DHRatchet(newRemotePublic [32]byte) error {
 	dr.ReceivingChain = newReceivingChain
 	dr.SendMsgNum = 0
 	dr.RecvMsgNum = 0
-	// Générer une nouvelle paire DH.
 	newDH, err := GenerateDHKeyPair()
 	if err != nil {
 		return err
@@ -165,8 +178,7 @@ func (dr *DoubleRatchet) DHRatchet(newRemotePublic [32]byte) error {
 	return nil
 }
 
-// GetSkippedMessageKey et StoreSkippedMessageKey gèrent le stockage des clés de messages sautées pour la gestion
-// de messages hors séquence. (Implémentation simplifiée.)
+// GetSkippedMessageKey et StoreSkippedMessageKey gèrent le stockage des clés de messages sautées.
 func (dr *DoubleRatchet) GetSkippedMessageKey(identifier string) ([]byte, bool) {
 	key, ok := dr.SkippedMessageKeys[identifier]
 	return key, ok

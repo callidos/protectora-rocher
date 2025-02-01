@@ -14,10 +14,10 @@ import (
 )
 
 func main() {
-	// Connexion au serveur sur localhost:8080.
+	// Connexion au serveur (ici, localhost:8080).
 	conn, err := net.Dial("tcp", "localhost:8080")
 	if err != nil {
-		log.Fatalf("Erreur de connexion : %v", err)
+		log.Fatalf("Erreur de connexion au serveur : %v", err)
 	}
 	defer conn.Close()
 	log.Println("Connecté au serveur sur localhost:8080")
@@ -25,18 +25,18 @@ func main() {
 	// Générer la paire de clés Ed25519 du client (pour signer le handshake).
 	pubKey, privKey, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
-		log.Fatalf("Erreur lors de la génération de la clé Ed25519 : %v", err)
+		log.Fatalf("Erreur lors de la génération de la clé Ed25519 du client : %v", err)
 	}
 	log.Printf("Clé publique du client : %x", pubKey)
 
-	// Réaliser le handshake côté client et établir une session sécurisée.
+	// Établir une session sécurisée côté client.
 	session, err := communication.NewClientSessionWithHandshake(conn, privKey)
 	if err != nil {
-		log.Fatalf("Erreur lors du handshake : %v", err)
+		log.Fatalf("Erreur lors du handshake côté client : %v", err)
 	}
-	log.Println("Handshake réussi, session sécurisée établie")
+	log.Println("Session sécurisée établie avec le serveur")
 
-	// Boucle d'envoi et de réception de messages.
+	// Boucle de saisie et d'envoi de messages.
 	reader := bufio.NewReader(os.Stdin)
 	for {
 		fmt.Print("Entrez un message (ou 'quit' pour quitter) : ")
@@ -50,13 +50,13 @@ func main() {
 			break
 		}
 
-		// Envoyer le message via la session sécurisée.
+		// Envoyer le message sécurisé.
 		if err := session.SendSecureMessage(text, 1, 60); err != nil {
 			log.Printf("Erreur lors de l'envoi du message : %v", err)
 			continue
 		}
 
-		// Recevoir la réponse du serveur.
+		// Recevoir et afficher la réponse du serveur.
 		reply, err := session.ReceiveSecureMessage()
 		if err != nil {
 			log.Printf("Erreur lors de la réception de la réponse : %v", err)

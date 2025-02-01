@@ -116,8 +116,11 @@ func DecryptAESGCM(ciphertextBase64 string, masterKey []byte) ([]byte, error) {
 	return plaintext, nil
 }
 
+// GenerateHMAC calcule un HMAC en utilisant SHA-256 et renvoie le résultat encodé en base64.
 func GenerateHMAC(message string, key []byte) string {
-	return base64.StdEncoding.EncodeToString(computeHMAC([]byte(message), key))
+	mac := hmac.New(sha256.New, key)
+	mac.Write([]byte(message))
+	return base64.StdEncoding.EncodeToString(mac.Sum(nil))
 }
 
 func computeHMAC(data, key []byte) []byte {
