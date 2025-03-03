@@ -6,6 +6,7 @@ toolchain go1.23.5
 
 require (
 	github.com/cloudflare/circl v1.5.0
+	github.com/klauspost/compress v1.18.0
 	github.com/pion/webrtc/v4 v4.0.8
 )
 

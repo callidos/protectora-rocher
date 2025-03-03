@@ -188,5 +188,4 @@ func (s *Session) ReceiveSecureMessage() (string, error) {
 // ResetSecurityState réinitialise l'état global.
 func ResetSecurityState() {
 	ResetMessageHistory()
-	ResetKeyExchangeState()
 }

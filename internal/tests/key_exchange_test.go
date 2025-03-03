@@ -4,13 +4,9 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
-	"encoding/binary"
-	"fmt"
 	"net"
 	"protectora-rocher/pkg/communication"
 	"testing"
-
-	"github.com/cloudflare/circl/kem/kyber/kyber768"
 )
 
 func TestFullKyberExchange(t *testing.T) {
@@ -59,69 +55,4 @@ func TestFullKyberExchange(t *testing.T) {
 	if !bytes.Equal(serverResult.Key[:], clientResult.Key[:]) {
 		t.Fatalf("Clés différentes\nServeur: %x\nClient: %x", serverResult.Key, clientResult.Key)
 	}
-}
-func simulateClient(conn net.Conn, serverPubEd25519 ed25519.PublicKey) ([]byte, error) {
-	pkBytes, err := readBytes(conn)
-	if err != nil {
-		return nil, fmt.Errorf("échec lecture clé publique: %v", err)
-	}
-
-	signature, err := readBytes(conn)
-	if err != nil {
-		return nil, fmt.Errorf("échec lecture signature: %v", err)
-	}
-
-	if !ed25519.Verify(serverPubEd25519, pkBytes, signature) {
-		return nil, fmt.Errorf("signature invalide")
-	}
-
-	var serverPubKyber kyber768.PublicKey
-	serverPubKyber.Unpack(pkBytes)
-
-	ciphertext := make([]byte, kyber768.CiphertextSize)
-	sharedSecret := make([]byte, kyber768.SharedKeySize)
-	serverPubKyber.EncapsulateTo(ciphertext, sharedSecret, nil)
-
-	sessionKey := communication.DeriveSessionKey(sharedSecret)
-	communication.Memzero(sharedSecret)
-
-	if err := sendBytes(conn, ciphertext); err != nil {
-		return nil, fmt.Errorf("échec envoi ciphertext: %v", err)
-	}
-
-	return sessionKey[:], nil
-}
-
-func readBytes(conn net.Conn) ([]byte, error) {
-	lenBuf := make([]byte, 4)
-	if _, err := conn.Read(lenBuf); err != nil {
-		return nil, err
-	}
-
-	length := binary.BigEndian.Uint32(lenBuf)
-	if length > 65536 {
-		return nil, fmt.Errorf("taille excessive")
-	}
-
-	data := make([]byte, length)
-	if _, err := conn.Read(data); err != nil {
-		return nil, err
-	}
-
-	return data, nil
-}
-
-func sendBytes(conn net.Conn, data []byte) error {
-	lenBuf := make([]byte, 4)
-	binary.BigEndian.PutUint32(lenBuf, uint32(len(data)))
-
-	if _, err := conn.Write(lenBuf); err != nil {
-		return err
-	}
-
-	if _, err := conn.Write(data); err != nil {
-		return err
-	}
-
-	return nil
 }

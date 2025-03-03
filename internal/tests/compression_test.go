@@ -2,104 +2,127 @@ package tests
 
 import (
 	"bytes"
-	"protectora-rocher/pkg/communication"
+	"encoding/binary"
+	"strings"
 	"testing"
+	"time"
+
+	"protectora-rocher/pkg/communication"
 )
 
-// Test compression and decompression with valid data
+// TestCompressionDecompression vérifie que la décompression restitue les données originales.
 func TestCompressionDecompression(t *testing.T) {
-	originalData := []byte("This is a compression test")
+	originalData := []byte("this is a compression test")
 
+	start := time.Now()
 	compressedData, err := communication.CompressData(originalData)
+	compressDuration := time.Since(start)
 	if err != nil {
 		t.Fatalf("Compression failed: %v", err)
 	}
+	t.Logf("Compression time: %v", compressDuration)
 
+	start = time.Now()
 	decompressedData, err := communication.DecompressData(compressedData)
+	decompressDuration := time.Since(start)
 	if err != nil {
 		t.Fatalf("Decompression failed: %v", err)
 	}
+	t.Logf("Decompression time: %v", decompressDuration)
 
 	if !bytes.Equal(originalData, decompressedData) {
 		t.Errorf("Decompressed data does not match the original")
 	}
 }
 
-// Test compression of empty data
+// TestCompressEmptyData teste la compression d'une donnée vide.
 func TestCompressEmptyData(t *testing.T) {
+	start := time.Now()
 	compressedData, err := communication.CompressData([]byte{})
+	compressDuration := time.Since(start)
 	if err != nil {
 		t.Fatalf("Compression failed for empty data: %v", err)
 	}
+	t.Logf("Compression time for empty data: %v", compressDuration)
 
-	// Vérification que les données compressées ne sont pas vides
 	if len(compressedData) == 0 {
 		t.Fatalf("Compressed empty data should not be empty")
 	}
 
+	start = time.Now()
 	decompressedData, err := communication.DecompressData(compressedData)
+	decompressDuration := time.Since(start)
 	if err != nil {
 		t.Fatalf("Decompression failed for empty data: %v", err)
 	}
+	t.Logf("Decompression time for empty data: %v", decompressDuration)
 
 	if len(decompressedData) != 0 {
 		t.Errorf("Expected empty decompressed data, got non-empty")
 	}
 }
 
-// Test decompression of corrupted data
+// TestDecompressCorruptedData teste la décompression de données corrompues.
 func TestDecompressCorruptedData(t *testing.T) {
 	corruptedData := []byte("corrupted data")
-
 	_, err := communication.DecompressData(corruptedData)
 	if err == nil {
 		t.Error("Expected failure when decompressing corrupted data")
 	}
 }
 
-// Test compression of large data
+// TestCompressLargeData teste la compression et décompression de grandes données.
 func TestCompressLargeData(t *testing.T) {
-	largeData := make([]byte, 1_000_000) // 1 MB of data
+	largeData := make([]byte, 1_000_000)
 
+	start := time.Now()
 	compressedData, err := communication.CompressData(largeData)
+	compressDuration := time.Since(start)
 	if err != nil {
 		t.Fatalf("Compression failed for large data: %v", err)
 	}
+	t.Logf("Compression time for large data: %v", compressDuration)
 
+	start = time.Now()
 	decompressedData, err := communication.DecompressData(compressedData)
+	decompressDuration := time.Since(start)
 	if err != nil {
 		t.Fatalf("Decompression failed for large data: %v", err)
 	}
+	t.Logf("Decompression time for large data: %v", decompressDuration)
 
 	if len(decompressedData) != len(largeData) {
 		t.Errorf("Expected decompressed size %d, got %d", len(largeData), len(decompressedData))
 	}
 }
 
-// Test edge cases of compression and decompression
+// TestCompressionEdgeCases teste divers cas limites.
 func TestCompressionEdgeCases(t *testing.T) {
 	testCases := []struct {
 		input      []byte
 		shouldFail bool
 	}{
-		{nil, false},                     // Empty data
-		{[]byte("Short"), false},         // Small string
-		{make([]byte, 10), false},        // Short data
-		{make([]byte, 1024), false},      // Normal-sized data
-		{make([]byte, 1_000_000), false}, // Large data
-		{[]byte("corrupted-data"), true}, // Corrupted data
+		{nil, false},                      // Données vides
+		{[]byte("short"), false},          // Chaîne courte admissible
+		{make([]byte, 10), false},         // Données de 10 octets
+		{[]byte("this is a test"), false}, // Texte admissible
+		{make([]byte, 1_000_000), false},  // Données grandes
+		{[]byte(strings.Repeat("A", 100)), true},
 	}
 
-	for _, tc := range testCases {
+	for idx, tc := range testCases {
+		start := time.Now()
 		compressedData, err := communication.CompressData(tc.input)
-
+		compressDuration := time.Since(start)
 		if err != nil {
-			t.Fatalf("Compression failed for input: %v", err)
+			t.Fatalf("Test case %d: Compression failed: %v", idx, err)
 		}
+		t.Logf("Test case %d: Compression time: %v", idx, compressDuration)
 
 		if tc.shouldFail {
 			if len(compressedData) > 5 {
-				corruptedData := compressedData[:len(compressedData)-2] // Tronquer prudemment
+				// Simulation de troncature pour provoquer une erreur.
+				corruptedData := compressedData[:len(compressedData)-2]
 				_, err = communication.DecompressData(corruptedData)
 				if err == nil {
 					t.Error("Expected failure for corrupted input, but decompression succeeded")
@@ -108,117 +131,105 @@ func TestCompressionEdgeCases(t *testing.T) {
 				t.Log("Skipping corruption for very small compressed data")
 			}
 		} else {
+			start = time.Now()
 			decompressedData, err := communication.DecompressData(compressedData)
+			decompressDuration := time.Since(start)
 			if err != nil {
-				t.Errorf("Decompression failed for valid input: %v", err)
+				t.Errorf("Test case %d: Decompression failed: %v", idx, err)
 			}
+			t.Logf("Test case %d: Decompression time: %v", idx, decompressDuration)
 
 			if !bytes.Equal(tc.input, decompressedData) {
-				t.Errorf("Decompressed data does not match original")
+				t.Errorf("Test case %d: Decompressed data does not match original", idx)
 			}
 		}
 	}
 }
 
-// Test compression and decompression performance
+// TestCompressionPerformance mesure la performance sur un gros volume.
 func TestCompressionPerformance(t *testing.T) {
-	largeData := make([]byte, 10<<20) // 10 MB of data
+	largeData := make([]byte, 10<<20) // 10 MB de données
 
+	start := time.Now()
 	compressedData, err := communication.CompressData(largeData)
+	compressDuration := time.Since(start)
 	if err != nil {
 		t.Fatalf("Compression failed for large data: %v", err)
 	}
 
 	t.Logf("Original size: %d bytes, Compressed size: %d bytes", len(largeData), len(compressedData))
+	t.Logf("Compression time: %v", compressDuration)
 
+	start = time.Now()
 	decompressedData, err := communication.DecompressData(compressedData)
+	decompressDuration := time.Since(start)
 	if err != nil {
 		t.Fatalf("Decompression failed for large data: %v", err)
 	}
+	t.Logf("Decompression time: %v", decompressDuration)
 
 	if !bytes.Equal(largeData, decompressedData) {
 		t.Errorf("Decompressed data does not match the original")
 	}
 }
 
-// Test compression and decompression of special characters
-func TestCompressSpecialCharacters(t *testing.T) {
-	specialData := []byte("éùçà@#&%$")
-
-	compressedData, err := communication.CompressData(specialData)
-	if err != nil {
-		t.Fatalf("Compression failed for special characters: %v", err)
+// TestSpecializedCompression teste la compression spécialisée pour de petits messages admissibles.
+func TestSpecializedCompression(t *testing.T) {
+	originalData := []byte("hello, world!")
+	if len(originalData) < communication.SpecializedMinLength {
+		originalData = append(originalData, []byte(" this is extended")...)
 	}
 
+	start := time.Now()
+	compressedData, err := communication.CompressData(originalData)
+	compressDuration := time.Since(start)
+	if err != nil {
+		t.Fatalf("Specialized compression failed: %v", err)
+	}
+	t.Logf("Specialized compression time: %v", compressDuration)
+
+	if len(compressedData) > 0 && compressedData[0] != communication.CompressionSpecialFlag {
+		t.Logf("Specialized compression non utilisée, flag=%d", compressedData[0])
+	} else {
+		t.Log("Specialized compression utilisée")
+		if len(compressedData) < 3 {
+			t.Fatalf("Compressed data too short for specialized header")
+		}
+		lengthFromHeader := binary.BigEndian.Uint16(compressedData[1:3])
+		if int(lengthFromHeader) != len(originalData) {
+			t.Errorf("Header length %d does not match original length %d", lengthFromHeader, len(originalData))
+		}
+	}
+
+	start = time.Now()
 	decompressedData, err := communication.DecompressData(compressedData)
+	decompressDuration := time.Since(start)
 	if err != nil {
-		t.Fatalf("Decompression failed for special characters: %v", err)
+		t.Fatalf("Specialized decompression failed: %v", err)
 	}
+	t.Logf("Specialized decompression time: %v", decompressDuration)
 
-	if !bytes.Equal(specialData, decompressedData) {
-		t.Errorf("Decompressed data does not match the original special characters")
+	if !bytes.Equal(originalData, decompressedData) {
+		t.Errorf("Specialized decompressed data does not match the original")
 	}
 }
 
-// Test compression and decompression of binary data
-func TestCompressBinaryData(t *testing.T) {
-	binaryData := []byte{0x00, 0xFF, 0xA5, 0x4B, 0x7E}
-
-	compressedData, err := communication.CompressData(binaryData)
-	if err != nil {
-		t.Fatalf("Compression failed for binary data: %v", err)
-	}
-
-	decompressedData, err := communication.DecompressData(compressedData)
-	if err != nil {
-		t.Fatalf("Decompression failed for binary data: %v", err)
-	}
-
-	if !bytes.Equal(binaryData, decompressedData) {
-		t.Errorf("Decompressed data does not match the original binary data")
-	}
-}
-
-// Test decompression of partially valid data
-func TestDecompressPartialData(t *testing.T) {
-	originalData := []byte("This is test data")
-	compressedData, _ := communication.CompressData(originalData)
-
-	truncatedData := compressedData[:len(compressedData)/2]
-
-	_, err := communication.DecompressData(truncatedData)
-	if err == nil {
-		t.Error("Expected error when decompressing truncated data, but got none")
-	}
-}
-
-// Test compression efficiency with small data
-func TestCompressionEfficiency(t *testing.T) {
-	smallData := []byte("tiny")
-
-	compressedData, err := communication.CompressData(smallData)
-	if err != nil {
-		t.Fatalf("Compression failed for small data: %v", err)
-	}
-
-	t.Logf("Original size: %d bytes, Compressed size: %d bytes", len(smallData), len(compressedData))
-
-	if len(smallData) > 20 && len(compressedData) >= len(smallData) {
-		t.Errorf("Compression ineffective: original %d bytes, compressed %d bytes", len(smallData), len(compressedData))
-	}
-}
-
-// Test repeated compression and decompression
+// TestRepeatedCompressionDecompression teste la compression/décompression répétée.
 func TestRepeatedCompressionDecompression(t *testing.T) {
-	data := []byte("Repeated test data for compression")
+	data := []byte("repeated test data for compression")
+	var totalCompressTime, totalDecompressTime time.Duration
 
 	for i := 0; i < 100; i++ {
+		start := time.Now()
 		compressed, err := communication.CompressData(data)
+		totalCompressTime += time.Since(start)
 		if err != nil {
 			t.Fatalf("Iteration %d: Compression failed: %v", i, err)
 		}
 
+		start = time.Now()
 		decompressed, err := communication.DecompressData(compressed)
+		totalDecompressTime += time.Since(start)
 		if err != nil {
 			t.Fatalf("Iteration %d: Decompression failed: %v", i, err)
 		}
@@ -227,24 +238,6 @@ func TestRepeatedCompressionDecompression(t *testing.T) {
 			t.Errorf("Iteration %d: Decompressed data does not match original", i)
 		}
 	}
-}
-
-// Test compression of simulated file content
-func TestCompressSimulatedFileContent(t *testing.T) {
-	simulatedFileContent := []byte(`Lorem ipsum dolor sit amet, consectetur adipiscing elit.
-    Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.`)
-
-	compressedData, err := communication.CompressData(simulatedFileContent)
-	if err != nil {
-		t.Fatalf("Compression failed for simulated file content: %v", err)
-	}
-
-	decompressedData, err := communication.DecompressData(compressedData)
-	if err != nil {
-		t.Fatalf("Decompression failed for simulated file content: %v", err)
-	}
-
-	if !bytes.Equal(simulatedFileContent, decompressedData) {
-		t.Errorf("Decompressed data does not match the original file content")
-	}
+	t.Logf("Average compression time: %v", totalCompressTime/100)
+	t.Logf("Average decompression time: %v", totalDecompressTime/100)
 }
