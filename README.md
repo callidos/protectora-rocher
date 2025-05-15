@@ -1,3 +1,4 @@
+
 # R.O.C.H.E.R Protocol (Robust and Optimized Communication Harnessing Enhanced Resilience)
 
 **R.O.C.H.E.R** is an ultra-secure communication protocol designed for critical environments, such as military applications and highly confidential systems. It relies on a robust and modern architecture using advanced technologies to ensure the confidentiality, integrity, and availability of communications.
@@ -73,7 +74,7 @@ The protocol follows a strict client-server architecture with clear separation o
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/callidos/protectora-rocher.git
+   git clone https://github.com/callidos/protectora-rocher
    cd protectora-rocher
    ```
 
@@ -91,7 +92,7 @@ The protocol follows a strict client-server architecture with clear separation o
 
 ## Usage Example
 
-Below is an example demonstrating how to use the R.O.C.H.E.R protocol for secure communication between a client and a server.
+Below is an example demonstrating how to use the R.O.C.H.E.R protocol for secure communication between a client and a server using sessions.
 
 ### Client Code
 
@@ -99,18 +100,19 @@ Below is an example demonstrating how to use the R.O.C.H.E.R protocol for secure
 package main
 
 import (
+    "crypto/ed25519"
     "net"
     "github.com/callidos/protectora-rocher/pkg/communication"
 )
 
 func main() {
     conn, _ := net.Dial("tcp", "localhost:8080")
-    sharedKey := []byte("thisisaverysecurekeythisisaverysecurekey")
-
-    err := communication.SendSecureMessage(conn, "Hello, secure world!", sharedKey, 1, 3600)
+    _, priv, _ := ed25519.GenerateKey(nil)
+    session, err := communication.NewClientSessionWithHandshake(conn, priv)
     if err != nil {
         panic(err)
     }
+    session.SendSecureMessage("Hello, secure world!", 1, 3600)
 }
 ```
 
@@ -120,6 +122,7 @@ func main() {
 package main
 
 import (
+    "crypto/ed25519"
     "net"
     "github.com/callidos/protectora-rocher/pkg/communication"
 )
@@ -128,8 +131,18 @@ func main() {
     listener, _ := net.Listen("tcp", ":8080")
     for {
         conn, _ := listener.Accept()
-        sharedKey := []byte("thisisaverysecurekeythisisaverysecurekey")
-        go communication.HandleNewConnection(conn, conn, sharedKey)
+        _, priv, _ := ed25519.GenerateKey(nil)
+        go func(c net.Conn) {
+            session, err := communication.NewServerSessionWithHandshake(c, priv)
+            if err != nil {
+                panic(err)
+            }
+            msg, err := session.ReceiveSecureMessage()
+            if err != nil {
+                panic(err)
+            }
+            fmt.Println("Received:", msg)
+        }(conn)
     }
 }
 ```
@@ -138,33 +151,32 @@ func main() {
 
 ## API Overview
 
-The R.O.C.H.E.R protocol provides an easy-to-use API for developers:
+The R.O.C.H.E.R protocol provides a structured API for secure sessions:
 
-### Session Management
+### Session Initialization
+
 ```go
-err := communication.InitializeSession(communication.SessionEphemeral)
-if err != nil {
-    log.Fatal("Session initialization failed:", err)
-}
+session, err := communication.NewClientSessionWithHandshake(conn, privKey)
+```
+
+```go
+session, err := communication.NewServerSessionWithHandshake(conn, privKey)
 ```
 
 ### Secure Message Transmission
+
 ```go
-err := communication.SendSecureMessage(conn, "Confidential Data", sharedKey, 42, 3600)
-if err != nil {
-    log.Fatal("Failed to send message:", err)
-}
+err := session.SendSecureMessage("Confidential Data", 42, 3600)
 ```
 
-### Key Exchange
 ```go
-resultChan, err := communication.PerformKeyExchange(conn, privateKey)
-if err != nil {
-    log.Fatal("Key exchange failed:", err)
-}
+msg, err := session.ReceiveSecureMessage()
+```
 
-result := <-resultChan
-fmt.Println("Derived key:", base64.StdEncoding.EncodeToString(result.Key[:]))
+### Reset Security State
+
+```go
+communication.ResetSecurityState()
 ```
 
 ---

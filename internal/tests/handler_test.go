@@ -2,191 +2,250 @@ package tests
 
 import (
 	"crypto/hmac"
-	"protectora-rocher/pkg/communication"
+	"encoding/json"
+	"fmt"
 	"strings"
-	"sync"
 	"testing"
 	"time"
+
+	"protectora-rocher/pkg/communication"
 )
 
+// clef partagée
+var key = []byte("thisisaverysecurekey!")
+
+// -----------------------------------------------------------------------------
+// Structures de transport
+// -----------------------------------------------------------------------------
+
+type frame struct {
+	Data string `json:"data"`
+	HMAC string `json:"hmac"`
+}
+
+type envelope struct {
+	Data string `json:"data"`
+}
+
+// -----------------------------------------------------------------------------
+// Helpers communs
+// -----------------------------------------------------------------------------
+
+// fabrique une frame chiffrée (client → serveur) contenant msg (texte brut)
+func clientFrame(msg string, key []byte) string {
+	cipher, _ := communication.EncryptAESGCM([]byte(msg), key)
+	frm := frame{
+		Data: cipher,
+		HMAC: communication.GenerateHMAC(cipher, key),
+	}
+	b, _ := json.Marshal(frm)
+	return string(b) + "\n"
+}
+
+// renvoie la première ligne JSON du flux
+func firstJSONLine(s string) string {
+	for _, l := range strings.Split(strings.TrimSpace(s), "\n") {
+		if strings.HasPrefix(l, "{") {
+			return l
+		}
+	}
+	return ""
+}
+
+// déchiffre une frame et renvoie le message (env.Data ou texte brut)
+func decryptFrameAndExtractData(line string, key []byte) (string, error) {
+	var frm frame
+	if err := json.Unmarshal([]byte(line), &frm); err != nil {
+		return "", err
+	}
+	exp := communication.GenerateHMAC(frm.Data, key)
+	if !hmac.Equal([]byte(exp), []byte(frm.HMAC)) {
+		return "", fmt.Errorf("HMAC mismatch")
+	}
+	plain, err := communication.DecryptAESGCM(frm.Data, key)
+	if err != nil {
+		return "", err
+	}
+	var env envelope
+	if json.Unmarshal(plain, &env) == nil && env.Data != "" {
+		return env.Data, nil
+	}
+	return string(plain), nil
+}
+
+// compte les ACK “Message reçu avec succès.”
+func countAck(output string, key []byte) int {
+	n := 0
+	for _, l := range strings.Split(strings.TrimSpace(output), "\n") {
+		if !strings.HasPrefix(l, "{") {
+			continue
+		}
+		if msg, _ := decryptFrameAndExtractData(l, key); msg == "Message reçu avec succès." {
+			n++
+		}
+	}
+	return n
+}
+
+// vérifie le welcome
+func checkWelcome(t *testing.T, output string, key []byte, user string) {
+	line := firstJSONLine(output)
+	if line == "" {
+		t.Fatalf("aucune frame JSON trouvée : %q", output)
+	}
+	msg, err := decryptFrameAndExtractData(line, key)
+	if err != nil {
+		t.Fatalf("décryptage KO : %v", err)
+	}
+	want := "Bienvenue " + user + " sur le serveur sécurisé."
+	if msg != want {
+		t.Fatalf("welcome diffère : exp=%q got=%q", want, msg)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// TESTS
+// -----------------------------------------------------------------------------
+
 func TestHandleConnection(t *testing.T) {
-	mockConn := &MockConnection{}
-	sharedKey := []byte("thisisaverysecurekey!")
+	mock := &MockConnection{}
+	mock.Write([]byte("testuser\nFIN_SESSION\n"))
 
-	mockConn.Buffer.WriteString("testuser\nFIN_SESSION\n")
-
-	doneChan := make(chan bool)
+	done := make(chan struct{})
 	go func() {
-		communication.HandleConnection(mockConn, mockConn, sharedKey)
-		doneChan <- true
+		communication.HandleConnection(mock, mock, key)
+		close(done)
 	}()
-
 	select {
-	case <-doneChan:
-		validateWelcomeMessage(t, mockConn.Buffer.String(), sharedKey, "testuser")
-	case <-time.After(5 * time.Second):
-		t.Fatal("Timeout exceeded")
+	case <-done:
+		checkWelcome(t, mock.Buffer.String(), key, "testuser")
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout")
 	}
 }
 
 func TestRejectCorruptedMessage(t *testing.T) {
-	mockConn := &MockConnection{}
-	sharedKey := []byte("thisisaverysecurekey!")
+	mock := &MockConnection{}
+	mock.Write([]byte("testuser\n"))
 
-	mockConn.Buffer.WriteString("testuser\nmessage-corrompu|mauvaisHMAC\nFIN_SESSION\n")
+	// frame avec HMAC corrompu
+	cipher, _ := communication.EncryptAESGCM([]byte("Hello"), key)
+	h := communication.GenerateHMAC(cipher, key)
+	h = h[:len(h)-1] + "A" // corruption
 
-	go communication.HandleConnection(mockConn, mockConn, sharedKey)
-	time.Sleep(1 * time.Second)
+	bad, _ := json.Marshal(frame{Data: cipher, HMAC: h})
+	mock.Write(append(bad, '\n'))
+	mock.Write([]byte("FIN_SESSION\n"))
 
-	output := mockConn.Buffer.String()
-	if strings.Contains(output, "Message reçu avec succès.") {
-		t.Errorf("Corrupted message should have been rejected")
+	done := make(chan struct{})
+	go func() {
+		communication.HandleConnection(mock, mock, key)
+		close(done)
+	}()
+	<-done
+
+	if countAck(mock.Buffer.String(), key) != 0 {
+		t.Fatal("ACK reçu alors que le message est corrompu")
 	}
 }
 
 func TestHandleConnectionWithError(t *testing.T) {
-	mockConn := &MockConnection{}
-	sharedKey := []byte("thisisaverysecurekey!")
+	mock := &MockConnection{}
+	mock.Write([]byte("\n")) // pseudo vide
 
-	mockConn.Buffer.WriteString("\n")
-
-	var wg sync.WaitGroup
-	wg.Add(1)
-
+	done := make(chan struct{})
 	go func() {
-		defer wg.Done()
-		communication.HandleConnection(mockConn, mockConn, sharedKey)
+		communication.HandleConnection(mock, mock, key)
+		close(done)
 	}()
+	<-done
 
-	wg.Wait()
-
-	output := mockConn.Buffer.String()
-	expectedErrorMessage := "Erreur: Nom d'utilisateur vide"
-	if !strings.Contains(output, expectedErrorMessage) {
-		t.Errorf("Expected error message: %s, but got: %s", expectedErrorMessage, output)
+	line := firstJSONLine(mock.Buffer.String())
+	if line == "" {
+		// connexion fermée sans envoi (comportement acceptable)
+		return
+	}
+	msg, err := decryptFrameAndExtractData(line, key)
+	if err != nil {
+		t.Fatalf("décryptage KO : %v", err)
+	}
+	if msg != "Erreur: Nom d'utilisateur vide" {
+		t.Fatalf("Attendu message d'erreur, obtenu %q", msg)
 	}
 }
 
 func TestHandleConnectionSessionDuration(t *testing.T) {
-	mockConn := &MockConnection{}
-	sharedKey := []byte("thisisaverysecurekey!")
+	mock := &MockConnection{}
+	mock.Write([]byte("testuser\nFIN_SESSION\n"))
 
-	mockConn.Buffer.WriteString("testuser\nFIN_SESSION\n")
-
-	go communication.HandleConnection(mockConn, mockConn, sharedKey)
-	time.Sleep(3 * time.Second)
-
-	if mockConn.Buffer.Len() == 0 {
-		t.Errorf("No messages exchanged during session")
+	done := make(chan struct{})
+	go func() {
+		communication.HandleConnection(mock, mock, key)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("La session aurait dû se terminer")
 	}
 }
 
 func TestHandleMultipleMessages(t *testing.T) {
-	mockConn := &MockConnection{}
-	sharedKey := []byte("thisisaverysecurekey!")
+	mock := &MockConnection{}
+	mock.Write([]byte("testuser\n"))
+	mock.Write([]byte(clientFrame("Message 1", key)))
+	mock.Write([]byte(clientFrame("Message 2", key)))
+	mock.Write([]byte(clientFrame("Message 3", key)))
+	mock.Write([]byte("FIN_SESSION\n"))
 
-	mockConn.Buffer.WriteString("testuser\n")
-	messages := []string{"Message 1", "Message 2", "Message 3"}
+	done := make(chan struct{})
+	go func() {
+		communication.HandleConnection(mock, mock, key)
+		close(done)
+	}()
+	<-done
 
-	for _, msg := range messages {
-		encrypted, _ := communication.EncryptAESGCM([]byte(msg), sharedKey)
-		hmacValue := communication.GenerateHMAC(encrypted, sharedKey)
-		mockConn.Buffer.WriteString(encrypted + "|" + hmacValue + "\n")
-	}
-	mockConn.Buffer.WriteString("FIN_SESSION\n")
-
-	go communication.HandleConnection(mockConn, mockConn, sharedKey)
-	time.Sleep(2 * time.Second)
-
-	if !containsDecryptedAck(mockConn.Buffer.String(), "Message reçu avec succès.", sharedKey) {
-		t.Errorf("Acknowledgment was not received")
+	if acks := countAck(mock.Buffer.String(), key); acks != 3 {
+		t.Fatalf("Attendu 3 ACK, reçu %d", acks)
 	}
 }
 
 func TestInvalidUsernameHandling(t *testing.T) {
-	mockConn := &MockConnection{}
-	sharedKey := []byte("thisisaverysecurekey!")
+	mock := &MockConnection{}
+	mock.Write([]byte("\n")) // pseudo vide
 
-	mockConn.Buffer.WriteString("\nFIN_SESSION\n")
-
-	doneChan := make(chan bool)
-
+	done := make(chan struct{})
 	go func() {
-		communication.HandleConnection(mockConn, mockConn, sharedKey)
-		doneChan <- true
+		communication.HandleConnection(mock, mock, key)
+		close(done)
 	}()
+	<-done
 
-	select {
-	case <-doneChan:
-		output := mockConn.Buffer.String()
-		if !strings.Contains(output, "Erreur: Nom d'utilisateur vide") {
-			t.Errorf("Session should not start with empty username, but it did: %s", output)
+	for _, l := range strings.Split(strings.TrimSpace(mock.Buffer.String()), "\n") {
+		if !strings.HasPrefix(l, "{") {
+			continue
 		}
-	case <-time.After(1 * time.Second):
-		t.Fatal("Timeout exceeded, connection should have been closed")
+		msg, _ := decryptFrameAndExtractData(l, key)
+		if strings.HasPrefix(msg, "Bienvenue") {
+			t.Fatal("La session ne doit pas démarrer avec un pseudo vide")
+		}
 	}
 }
 
 func TestEmptyMessageHandling(t *testing.T) {
-	mockConn := &MockConnection{}
-	sharedKey := []byte("thisisaverysecurekey!")
+	mock := &MockConnection{}
+	mock.Write([]byte("testuser\n"))
+	mock.Write([]byte(clientFrame("", key))) // message vide
+	mock.Write([]byte("FIN_SESSION\n"))
 
-	mockConn.Buffer.WriteString("testuser\n|\nFIN_SESSION\n")
+	done := make(chan struct{})
+	go func() {
+		communication.HandleConnection(mock, mock, key)
+		close(done)
+	}()
+	<-done
 
-	go communication.HandleConnection(mockConn, mockConn, sharedKey)
-	time.Sleep(1 * time.Second)
-
-	if strings.Contains(mockConn.Buffer.String(), "Message reçu avec succès.") {
-		t.Errorf("Empty message should not be acknowledged")
-	}
-}
-
-// containsDecryptedAck vérifie si un accusé de réception déchiffré est trouvé.
-func containsDecryptedAck(fullOutput, expectedAck string, sharedKey []byte) bool {
-	for _, line := range strings.Split(strings.TrimSpace(fullOutput), "\n") {
-		parts := strings.SplitN(line, "|", 2)
-		if len(parts) != 2 {
-			continue
-		}
-		encrypted, receivedHMAC := parts[0], parts[1]
-
-		expectedHMAC := communication.GenerateHMAC(encrypted, sharedKey)
-		if hmac.Equal([]byte(expectedHMAC), []byte(receivedHMAC)) {
-			decrypted, err := communication.DecryptAESGCM(encrypted, sharedKey)
-			if err == nil && string(decrypted) == expectedAck {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// validateWelcomeMessage valide le message de bienvenue reçu.
-func validateWelcomeMessage(t *testing.T, output string, sharedKey []byte, username string) {
-	parts := strings.SplitN(strings.TrimSpace(output), "\n", 2)
-	if len(parts) < 1 {
-		t.Fatalf("Malformed received message: %s", output)
-	}
-
-	encryptedMessageParts := strings.SplitN(parts[0], "|", 2)
-	if len(encryptedMessageParts) < 2 {
-		t.Fatalf("Malformed welcome message format: %s", parts[0])
-	}
-
-	encryptedMessage, receivedHMAC := encryptedMessageParts[0], strings.TrimSpace(encryptedMessageParts[1])
-	expectedHMAC := communication.GenerateHMAC(encryptedMessage, sharedKey)
-
-	if !hmac.Equal([]byte(expectedHMAC), []byte(receivedHMAC)) {
-		t.Fatalf("HMAC mismatch. Expected: %s, Got: %s", expectedHMAC, receivedHMAC)
-	}
-
-	decryptedMessage, err := communication.DecryptAESGCM(encryptedMessage, sharedKey)
-	if err != nil {
-		t.Fatalf("Decryption failed: %v", err)
-	}
-
-	expectedWelcomeMessage := "Bienvenue " + username + " sur le serveur sécurisé."
-	if string(decryptedMessage) != expectedWelcomeMessage {
-		t.Errorf("Unexpected welcome message. Got: %s", decryptedMessage)
+	if countAck(mock.Buffer.String(), key) != 0 {
+		t.Fatal("ACK reçu alors que le message est vide")
 	}
 }

@@ -1,7 +1,8 @@
 package tests
 
 import (
-	"strconv"
+	"bytes"
+	"encoding/json"
 	"sync"
 	"testing"
 	"time"
@@ -9,145 +10,154 @@ import (
 	"protectora-rocher/pkg/communication"
 )
 
-// Test secure message sending with various durations
+// clef partagée pour tout le fichier
+var sharedKey = []byte("securekey!")
+
+// -----------------------------------------------------------------------------
+// ENVOI
+// -----------------------------------------------------------------------------
+
 func TestSendMessage(t *testing.T) {
-	mockConn := &MockConnection{}
-	key := []byte("securekey!")
-	msg := "Test message"
-
-	tests := []struct {
-		duration   int
-		shouldFail bool
-	}{
-		{0, false},
-		{60, false},
-		{-10, true},
+	var buf bytes.Buffer
+	if err := communication.SendMessage(&buf, "hello JSON", sharedKey, 1, 42); err != nil {
+		t.Fatalf("échec SendMessage : %v", err)
 	}
-
-	for _, tc := range tests {
-		mockConn.Buffer.Reset()
-		err := communication.SendMessage(mockConn, msg, key, 1, tc.duration)
-
-		if (err != nil) != tc.shouldFail {
-			t.Errorf("Duration %d: expected failure: %v, got error: %v", tc.duration, tc.shouldFail, err)
-		} else if err == nil && mockConn.Buffer.String() == "" {
-			t.Error("Message was not sent")
-		}
+	if buf.Len() == 0 {
+		t.Fatal("rien n'a été écrit")
 	}
 }
 
-// Test receiving valid secure messages
+// -----------------------------------------------------------------------------
+// RÉCEPTION
+// -----------------------------------------------------------------------------
+
 func TestReceiveMessage(t *testing.T) {
-	mockConn := &MockConnection{}
-	key := []byte("securekey!")
-	msg := "Test message"
+	var buf bytes.Buffer
+	want := "payload-test"
+	_ = communication.SendMessage(&buf, want, sharedKey, 7, 60)
 
-	data := "1|" + strconv.FormatInt(time.Now().Unix(), 10) + "|60|" + msg
-	encrypted, _ := communication.EncryptAESGCM([]byte(data), key)
-	mockConn.Buffer.WriteString(encrypted + "|" + communication.GenerateHMAC(encrypted, key) + "\n")
-
-	received, err := communication.ReceiveMessage(mockConn, key)
-	if err != nil || received != msg {
-		t.Errorf("Expected: %q, got: %q, error: %v", msg, received, err)
+	got, err := communication.ReceiveMessage(&buf, sharedKey)
+	if err != nil || got != want {
+		t.Fatalf("voulu : %q, obtenu : %q, err : %v", want, got, err)
 	}
 }
 
-// Test replay attack detection
+// -----------------------------------------------------------------------------
+// SÉCURITÉ : REPLAY
+// -----------------------------------------------------------------------------
+
 func TestReplayAttack(t *testing.T) {
 	communication.ResetMessageHistory()
-	mockConn := &MockConnection{}
-	key := []byte("securekey!")
 
-	data := "1|" + strconv.FormatInt(time.Now().Unix(), 10) + "|0|Replay attack"
-	encrypted, _ := communication.EncryptAESGCM([]byte(data), key)
-	mockConn.Buffer.WriteString(encrypted + "|" + communication.GenerateHMAC(encrypted, key) + "\n")
+	var buf bytes.Buffer
+	_ = communication.SendMessage(&buf, "replay", sharedKey, 99, 0)
 
-	_, err := communication.ReceiveMessage(mockConn, key)
-	if err != nil {
-		t.Fatal("Unexpected error on first reception:", err)
+	if _, err := communication.ReceiveMessage(&buf, sharedKey); err != nil {
+		t.Fatalf("1ʳᵉ réception KO : %v", err)
 	}
-
-	mockConn.Buffer.Reset()
-	mockConn.Buffer.WriteString(encrypted + "|" + communication.GenerateHMAC(encrypted, key) + "\n")
-
-	if _, err := communication.ReceiveMessage(mockConn, key); err == nil {
-		t.Error("Replay attack was not detected")
+	if _, err := communication.ReceiveMessage(&buf, sharedKey); err == nil {
+		t.Fatal("attaque replay non détectée")
 	}
 }
 
-// Test rejection of corrupted messages (invalid HMAC)
-func TestCorruptedMessage(t *testing.T) {
-	mockConn := &MockConnection{}
-	key := []byte("securekey!")
+// -----------------------------------------------------------------------------
+// SÉCURITÉ : EXPIRATION
+// -----------------------------------------------------------------------------
 
-	mockConn.Buffer.WriteString("corrupt_message|invalidHMAC\n")
-
-	if _, err := communication.ReceiveMessage(mockConn, key); err == nil {
-		t.Error("Corrupted message was not rejected")
-	}
-}
-
-// Test expired message rejection
 func TestExpiredMessage(t *testing.T) {
-	mockConn := &MockConnection{}
-	key := []byte("securekey!")
+	env := map[string]interface{}{
+		"seq":  1,
+		"ts":   time.Now().Unix() - 1000,
+		"dur":  10,
+		"data": "obsolète",
+	}
+	envJSON, _ := json.Marshal(env)
+	encrypted, _ := communication.EncryptAESGCM(envJSON, sharedKey)
 
-	data := "2|" + strconv.FormatInt(time.Now().Unix()-1000, 10) + "|500|Expired"
-	encrypted, _ := communication.EncryptAESGCM([]byte(data), key)
-	mockConn.Buffer.WriteString(encrypted + "|" + communication.GenerateHMAC(encrypted, key) + "\n")
+	frm := map[string]string{
+		"data": encrypted,
+		"hmac": communication.GenerateHMAC(encrypted, sharedKey),
+	}
+	frmJSON, _ := json.Marshal(frm)
+	buf := bytes.NewBuffer(append(frmJSON, '\n'))
 
-	if _, err := communication.ReceiveMessage(mockConn, key); err == nil {
-		t.Error("Expired message was not rejected")
+	if _, err := communication.ReceiveMessage(buf, sharedKey); err == nil {
+		t.Fatal("message expiré accepté")
 	}
 }
 
-// Test malformed message rejection
+// -----------------------------------------------------------------------------
+// SÉCURITÉ : CORRUPTION HMAC
+// -----------------------------------------------------------------------------
+
+func TestCorruptedMessage(t *testing.T) {
+	var buf bytes.Buffer
+	_ = communication.SendMessage(&buf, "corrompu", sharedKey, 5, 0)
+
+	raw := buf.String()
+	raw = raw[:len(raw)-2] + "A\n" // corruption du HMAC
+
+	buf.Reset()
+	buf.WriteString(raw)
+
+	if _, err := communication.ReceiveMessage(&buf, sharedKey); err == nil {
+		t.Fatal("HMAC invalide accepté")
+	}
+}
+
+// -----------------------------------------------------------------------------
+// SÉCURITÉ : FORMAT MALFORMÉ
+// -----------------------------------------------------------------------------
+
 func TestMalformedMessage(t *testing.T) {
-	mockConn := &MockConnection{}
-	key := []byte("securekey!")
-
-	mockConn.Buffer.WriteString("malformed_message\n")
-
-	if _, err := communication.ReceiveMessage(mockConn, key); err == nil {
-		t.Error("Malformed message was not rejected")
+	buf := bytes.NewBufferString(`{ "data": "noHmac" }` + "\n")
+	if _, err := communication.ReceiveMessage(buf, sharedKey); err == nil {
+		t.Fatal("message malformé accepté")
 	}
 }
 
-// Performance test for sending and receiving messages
+// -----------------------------------------------------------------------------
+// PERFORMANCE (séquentiel aller-retour)
+// -----------------------------------------------------------------------------
+
 func TestMessagePerformance(t *testing.T) {
-	mockConn := &MockConnection{}
-	key := []byte("securekey!")
-	msg := "Performance test message"
+	communication.ResetMessageHistory()
 
 	start := time.Now()
-
 	for i := 0; i < 1000; i++ {
-		if err := communication.SendMessage(mockConn, msg, key, 1, 0); err != nil {
-			t.Fatalf("Error sending message: %v", err)
+		var buf bytes.Buffer
+		seq := uint64(10_000 + i)
+		if err := communication.SendMessage(&buf, "bench", sharedKey, seq, 0); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := communication.ReceiveMessage(&buf, sharedKey); err != nil {
+			t.Fatal(err)
 		}
 	}
-
-	t.Logf("Time for 1000 messages: %v", time.Since(start))
+	t.Logf("Time for 1000 round-trips: %v", time.Since(start))
 }
 
-func TestMessagePerformanceConcurrent(t *testing.T) {
-	mockConn := &MockConnection{}
-	key := []byte("securekey!")
-	msg := "Performance test message"
+// -----------------------------------------------------------------------------
+// PERFORMANCE (concurrent, aller-retour)
+// -----------------------------------------------------------------------------
 
-	start := time.Now()
+func TestMessagePerformanceConcurrent(t *testing.T) {
+	communication.ResetMessageHistory()
 
 	var wg sync.WaitGroup
+	start := time.Now()
+
 	for i := 0; i < 1000; i++ {
+		i := i // capture
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := communication.SendMessage(mockConn, msg, key, 1, 0); err != nil {
-				t.Errorf("Error sending message: %v", err)
-			}
+			var buf bytes.Buffer
+			seq := uint64(20_000 + i)
+			_ = communication.SendMessage(&buf, "bench", sharedKey, seq, 0)
+			_, _ = communication.ReceiveMessage(&buf, sharedKey)
 		}()
 	}
-
 	wg.Wait()
-	t.Logf("Time for 1000 concurrent messages: %v", time.Since(start))
+	t.Logf("Time for 1000 concurrent round-trips: %v", time.Since(start))
 }

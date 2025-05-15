@@ -4,16 +4,15 @@ import (
 	"bufio"
 	"crypto/hmac"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"protectora-rocher/pkg/utils"
 	"strings"
-	"time"
 )
 
 const (
-	bufferSize       = 1024 * 1024
-	messageSizeLimit = 16 * 1024 * 1024
+	bufferSize = 1024 * 1024
 )
 
 type SecureError struct {
@@ -23,146 +22,126 @@ type SecureError struct {
 }
 
 func (e *SecureError) Error() string {
+	if e.Wrapped == nil {
+		return fmt.Sprintf("[%d] %s", e.Code, e.Message)
+	}
 	return fmt.Sprintf("[%d] %s: %v", e.Code, e.Message, e.Wrapped)
 }
 
 func securityError(code int, msg string, err error) *SecureError {
-	return &SecureError{
-		Code:    code,
-		Message: msg,
-		Wrapped: err,
-	}
+	return &SecureError{Code: code, Message: msg, Wrapped: err}
 }
 
-func HandleConnection(reader io.Reader, writer io.Writer, sharedKey []byte) {
-	utils.Logger.Info("Nouvelle connexion traitée", nil)
+func HandleConnection(r io.Reader, w io.Writer, sharedKey []byte) {
+	utils.Logger.Info("Nouvelle connexion", nil)
 
-	limitedReader := io.LimitReader(reader, messageSizeLimit)
-	scanner := bufio.NewScanner(limitedReader)
+	limited := io.LimitReader(r, messageSizeLimit)
+	scanner := bufio.NewScanner(limited)
 	scanner.Buffer(make([]byte, bufferSize), bufferSize)
 
-	username, err := readUsername(scanner, writer)
+	username, err := readUsername(scanner)
 	if err != nil {
 		utils.Logger.Warning(err.Error(), nil)
 		return
 	}
 
-	utils.Logger.Info("Utilisateur connecté", map[string]interface{}{"username": username})
-
-	if err := sendWelcomeMessage(writer, sharedKey, username); err != nil {
-		utils.Logger.Error("Erreur d'envoi du message de bienvenue", map[string]interface{}{"error": err.Error()})
+	if err := sendWelcomeMessage(w, sharedKey, username); err != nil {
+		utils.Logger.Error("Envoi welcome KO", map[string]interface{}{"err": err})
 		return
 	}
 
-	messageChan, doneChan := make(chan string), make(chan struct{})
-	go processIncomingMessages(scanner, messageChan, doneChan, username)
-
-	defer closeConnection(writer)
+	msgChan := make(chan string)
+	done := make(chan struct{})
+	go processIncomingMessages(scanner, msgChan, done, username)
 
 	for {
 		select {
-		case msg := <-messageChan:
-			if err := processMessage(msg, sharedKey, writer, username); err != nil {
-				utils.Logger.Error("Erreur traitement message", map[string]interface{}{"error": err.Error(), "message": msg})
+		case raw := <-msgChan:
+			if err := processMessage(raw, sharedKey, w, username); err != nil {
+				utils.Logger.Error("Traitement message KO", map[string]interface{}{"err": err})
 			}
-		case <-doneChan:
-			utils.Logger.Info("Fin de communication", map[string]interface{}{"username": username})
+		case <-done:
+			closeConnection(w)
 			return
 		}
 	}
 }
 
-func readUsername(scanner *bufio.Scanner, writer io.Writer) (string, error) {
+func readUsername(scanner *bufio.Scanner) (string, error) {
 	if !scanner.Scan() {
-		fmt.Fprintln(writer, "Erreur: Impossible de lire le nom d'utilisateur")
-		return "", securityError(1001, "lecture du nom d'utilisateur échouée", scanner.Err())
+		return "", securityError(1001, "Impossible de lire le nom d’utilisateur", scanner.Err())
 	}
-
 	username := strings.TrimSpace(scanner.Text())
 	if username == "" {
-		fmt.Fprintln(writer, "Erreur: Nom d'utilisateur vide")
-		return "", securityError(1002, "nom d'utilisateur vide", nil)
+		return "", securityError(1002, "Nom d’utilisateur vide", nil)
 	}
-
 	return username, nil
 }
 
-func processIncomingMessages(scanner *bufio.Scanner, messageChan chan<- string, doneChan chan<- struct{}, username string) {
-	defer close(doneChan)
-
+func processIncomingMessages(scanner *bufio.Scanner, ch chan<- string, done chan<- struct{}, user string) {
 	for scanner.Scan() {
-		msg := strings.TrimSpace(scanner.Text())
-		if msg == "FIN_SESSION" {
-			utils.Logger.Info("Fin de session demandée", map[string]interface{}{"username": username})
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		if line == "FIN_SESSION" {
+			utils.Logger.Info("Fin de session demandée", map[string]interface{}{"user": user})
+			done <- struct{}{}
 			return
 		}
-		messageChan <- msg
+		ch <- line
 	}
-
-	if err := scanner.Err(); err != nil {
-		utils.Logger.Error("Erreur lecture connexion", map[string]interface{}{"error": err.Error()})
-	}
+	done <- struct{}{}
 }
 
-func processMessage(msg string, sharedKey []byte, writer io.Writer, username string) error {
-	parts := strings.SplitN(msg, "|", 2)
-	if len(parts) != 2 {
-		return securityError(2001, "message mal formé", nil)
+func processMessage(raw string, key []byte, w io.Writer, user string) error {
+	var frm frame
+	if err := json.Unmarshal([]byte(raw), &frm); err != nil {
+		parts := strings.SplitN(raw, "|", 2)
+		if len(parts) != 2 {
+			return securityError(2001, "Frame invalide", err)
+		}
+		frm = frame{Data: parts[0], HMAC: parts[1]}
 	}
 
-	encryptedMsg, receivedHMACBase64 := parts[0], strings.TrimSpace(parts[1])
-
-	receivedHMAC, err := base64.StdEncoding.DecodeString(receivedHMACBase64)
+	wantMAC := computeHMAC([]byte(frm.Data), key)
+	gotMAC, err := base64.StdEncoding.DecodeString(frm.HMAC)
 	if err != nil {
-		return securityError(2002, "HMAC invalide", err)
+		return securityError(2002, "HMAC base64 invalide", err)
+	}
+	if !hmac.Equal(wantMAC, gotMAC) {
+		return securityError(2003, "HMAC incohérent", nil)
 	}
 
-	computedHMAC := computeHMAC([]byte(encryptedMsg), sharedKey)
-
-	if !hmac.Equal(computedHMAC, receivedHMAC) {
-		return securityError(2003, "HMAC invalide", nil)
-	}
-
-	decryptedMsg, err := DecryptAESGCM(encryptedMsg, sharedKey)
+	plain, err := DecryptAESGCM(frm.Data, key)
 	if err != nil {
-		return securityError(2004, "erreur de déchiffrement", err)
+		return securityError(2004, "Déchiffrement échoué", err)
 	}
 
-	utils.Logger.Info("Message reçu et déchiffré", map[string]interface{}{"user": username, "message": string(decryptedMsg)})
+	utils.Logger.Info("Message reçu", map[string]interface{}{
+		"user": user,
+		"msg":  string(plain),
+	})
 
-	return sendAcknowledgment(writer, sharedKey)
+	return sendAcknowledgment(w, key)
 }
 
-func sendWelcomeMessage(writer io.Writer, sharedKey []byte, username string) error {
-	return sendMessage(writer, fmt.Sprintf("Bienvenue %s sur le serveur sécurisé.", username), sharedKey)
+func sendWelcomeMessage(w io.Writer, key []byte, user string) error {
+	return SendMessage(
+		w,
+		fmt.Sprintf("Bienvenue %s sur le serveur sécurisé.", user),
+		key,
+		0,
+		0,
+	)
 }
 
-func sendAcknowledgment(writer io.Writer, sharedKey []byte) error {
-	return sendMessage(writer, "Message reçu avec succès.", sharedKey)
+func sendAcknowledgment(w io.Writer, key []byte) error {
+	return SendMessage(w, "Message reçu avec succès.", key, 0, 0)
 }
 
-func sendMessage(writer io.Writer, message string, sharedKey []byte) error {
-	encryptedMsg, err := EncryptAESGCM([]byte(message), sharedKey)
-	if err != nil {
-		return securityError(3001, "erreur chiffrement message", err)
-	}
-
-	hmac := GenerateHMAC(encryptedMsg, sharedKey)
-
-	if w, ok := writer.(interface{ SetWriteDeadline(time.Time) error }); ok {
-		w.SetWriteDeadline(time.Now().Add(5 * time.Second))
-	}
-
-	if _, err := fmt.Fprintf(writer, "%s|%s\n", encryptedMsg, hmac); err != nil {
-		return securityError(3002, "erreur envoi message", err)
-	}
-
-	utils.Logger.Info("Message envoyé avec succès", nil)
-	return nil
-}
-
-func closeConnection(writer io.Writer) {
-	if closer, ok := writer.(io.Closer); ok {
-		closer.Close()
+func closeConnection(w io.Writer) {
+	if closer, ok := w.(io.Closer); ok {
+		_ = closer.Close()
 	}
 }

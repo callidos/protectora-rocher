@@ -1,8 +1,10 @@
 package communication
 
 import (
+	"bufio"
 	"crypto/hmac"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -13,105 +15,139 @@ import (
 )
 
 const (
-	replayWindow = 5 * time.Minute
+	replayWindow     = 5 * time.Minute
+	messageSizeLimit = 16 * 1024 * 1024
 )
 
 var messageHistory sync.Map
 
-func SendMessage(writer io.Writer, message string, sharedKey []byte, sequenceNumber uint64, duration int) error {
-	if duration < 0 {
-		return fmt.Errorf("durée invalide")
-	}
-
-	formattedMessage := fmt.Sprintf("%d|%d|%d|%s", sequenceNumber, time.Now().Unix(), duration, message)
-
-	encryptedMessage, err := EncryptAESGCM([]byte(formattedMessage), sharedKey)
-	if err != nil {
-		return fmt.Errorf("erreur de chiffrement: %w", err)
-	}
-
-	if _, err := fmt.Fprintf(writer, "%s|%s\n", encryptedMessage, GenerateHMAC(encryptedMessage, sharedKey)); err != nil {
-		return fmt.Errorf("erreur d'envoi du message: %w", err)
-	}
-
-	return nil
+type envelope struct {
+	Seq       uint64 `json:"seq"`
+	Timestamp int64  `json:"ts"`
+	Duration  int    `json:"dur"`
+	Data      string `json:"data"`
 }
 
-func ReceiveMessage(reader io.Reader, sharedKey []byte) (string, error) {
-	buffer := make([]byte, messageSizeLimit)
-	n, err := reader.Read(buffer)
-	if err != nil {
-		return "", fmt.Errorf("erreur de lecture: %w", err)
-	}
-
-	message := strings.TrimSpace(string(buffer[:n]))
-	parts := strings.SplitN(message, "|", 2)
-	if len(parts) != 2 || !validateHMAC(parts[0], parts[1], sharedKey) {
-		return "", fmt.Errorf("message invalide ou corrompu")
-	}
-	if !validateHMAC(parts[0], parts[1], sharedKey) {
-		return "", errors.New("intégrité message compromise")
-	}
-
-	return validateAndStoreMessage(parts[0], sharedKey)
+type frame struct {
+	Data string `json:"data"`
+	HMAC string `json:"hmac"`
 }
 
-func validateAndStoreMessage(encryptedMessage string, sharedKey []byte) (string, error) {
-	decrypted, err := DecryptAESGCM(encryptedMessage, sharedKey)
-	if err != nil {
-		return "", fmt.Errorf("erreur de déchiffrement: %w", err)
-	}
-
-	parts := strings.SplitN(string(decrypted), "|", 4)
-	if len(parts) != 4 {
-		return "", fmt.Errorf("format du message incorrect")
-	}
-
-	if err := validateMessage(parts[0], parts[1], parts[2]); err != nil {
-		return "", err
-	}
-
-	return parts[3], nil
-}
-
-func validateMessage(sequence, timestampStr, durationStr string) error {
-	timestamp, err := strconv.ParseInt(timestampStr, 10, 64)
-	if err != nil || isExpired(timestamp, durationStr) || isReplayAttack(sequence, timestamp) {
-		return fmt.Errorf("message invalide")
-	}
-	return nil
-}
-
-func isExpired(timestamp int64, durationStr string) bool {
-	duration, err := strconv.Atoi(durationStr)
-	return err != nil || (duration > 0 && time.Now().Unix() > timestamp+int64(duration))
-}
-
-func isReplayAttack(sequence string, timestamp int64) bool {
-	now := time.Now().Unix()
-	if timestamp < now-int64(replayWindow.Seconds()) || timestamp > now {
-		return true
-	}
-	if _, exists := messageHistory.Load(sequence); exists {
-		return true
-	}
-	messageHistory.Store(sequence, time.Now())
-	go func(seq string) {
-		time.Sleep(replayWindow)
-		messageHistory.Delete(seq)
-	}(sequence)
-	return false
-}
-
-func ResetMessageHistory() {
-	messageHistory = sync.Map{}
-}
+func ResetMessageHistory() { messageHistory = sync.Map{} }
 
 func validateHMAC(message, receivedHMAC string, key []byte) bool {
 	expectedMAC := computeHMAC([]byte(message), key)
 	receivedMAC, err := base64.StdEncoding.DecodeString(receivedHMAC)
-	if err != nil {
-		return false
+	return err == nil && hmac.Equal(expectedMAC, receivedMAC)
+}
+
+func SendMessage(w io.Writer, message string, key []byte, seq uint64, duration int) error {
+	if duration < 0 {
+		return fmt.Errorf("durée invalide (<0)")
 	}
-	return hmac.Equal(expectedMAC, receivedMAC)
+	env := envelope{
+		Seq:       seq,
+		Timestamp: time.Now().Unix(),
+		Duration:  duration,
+		Data:      message,
+	}
+	envJSON, err := json.Marshal(env)
+	if err != nil {
+		return fmt.Errorf("marshal enveloppe : %w", err)
+	}
+
+	encrypted, err := EncryptAESGCM(envJSON, key)
+	if err != nil {
+		return fmt.Errorf("chiffrement : %w", err)
+	}
+
+	frm := frame{
+		Data: encrypted,
+		HMAC: GenerateHMAC(encrypted, key),
+	}
+	frmJSON, err := json.Marshal(frm)
+	if err != nil {
+		return fmt.Errorf("marshal frame : %w", err)
+	}
+
+	_, err = w.Write(append(frmJSON, '\n'))
+	return err
+}
+
+func ReceiveMessage(r io.Reader, key []byte) (string, error) {
+
+	br := bufio.NewReader(io.LimitReader(r, messageSizeLimit))
+	rawLine, err := br.ReadString('\n')
+	if err != nil {
+		return "", fmt.Errorf("lecture : %w", err)
+	}
+	raw := strings.TrimSpace(rawLine)
+	if raw == "" {
+		return "", errors.New("message vide")
+	}
+
+	var frm frame
+	if err := json.Unmarshal([]byte(raw), &frm); err != nil {
+		parts := strings.SplitN(raw, "|", 2)
+		if len(parts) != 2 {
+			return "", fmt.Errorf("frame invalide (JSON ou « | »)")
+		}
+		frm = frame{Data: parts[0], HMAC: parts[1]}
+	}
+
+	if !validateHMAC(frm.Data, frm.HMAC, key) {
+		return "", errors.New("HMAC invalide ou message corrompu")
+	}
+
+	plain, err := DecryptAESGCM(frm.Data, key)
+	if err != nil {
+		return "", fmt.Errorf("déchiffrement : %w", err)
+	}
+
+	var env envelope
+	if err := json.Unmarshal(plain, &env); err != nil {
+		parts := strings.SplitN(string(plain), "|", 4)
+		if len(parts) != 4 {
+			return "", errors.New("enveloppe déchiffrée invalide")
+		}
+		seq, _ := strconv.ParseUint(parts[0], 10, 64)
+		dur, _ := strconv.Atoi(parts[2])
+		env = envelope{
+			Seq:       seq,
+			Timestamp: mustParseInt64(parts[1]),
+			Duration:  dur,
+			Data:      parts[3],
+		}
+	}
+
+	if err := validateMessage(env); err != nil {
+		return "", err
+	}
+
+	return env.Data, nil
+}
+
+func validateMessage(env envelope) error {
+	now := time.Now().Unix()
+
+	if env.Timestamp < now-int64(replayWindow.Seconds()) || env.Timestamp > now {
+		return errors.New("horodatage hors fenêtre autorisée")
+	}
+	if env.Duration > 0 && now > env.Timestamp+int64(env.Duration) {
+		return errors.New("message expiré")
+	}
+	if _, found := messageHistory.LoadOrStore(env.Seq, struct{}{}); found {
+		return errors.New("rejeu détecté")
+	}
+	go func(seq uint64) {
+		time.Sleep(replayWindow)
+		messageHistory.Delete(seq)
+	}(env.Seq)
+
+	return nil
+}
+
+func mustParseInt64(s string) int64 {
+	i, _ := strconv.ParseInt(s, 10, 64)
+	return i
 }
