@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"protectora-rocher/pkg/communication"
+	"github.com/callidos/protectora-rocher/pkg/communication"
 )
 
 // TestCompressionDecompression vérifie que la décompression restitue les données originales.

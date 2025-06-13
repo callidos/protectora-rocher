@@ -3,8 +3,9 @@ package tests
 import (
 	"bytes"
 	"os"
-	"protectora-rocher/pkg/communication"
 	"testing"
+
+	"github.com/callidos/protectora-rocher/pkg/communication"
 )
 
 var testKey = []byte("thisisaverysecurekeyforaes256!!thisisahmackey!!") // 64 octets

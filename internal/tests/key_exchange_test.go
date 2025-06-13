@@ -5,8 +5,9 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"net"
-	"protectora-rocher/pkg/communication"
 	"testing"
+
+	"github.com/callidos/protectora-rocher/pkg/communication"
 )
 
 func TestFullKyberExchange(t *testing.T) {

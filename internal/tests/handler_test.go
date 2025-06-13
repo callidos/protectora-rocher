@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"protectora-rocher/pkg/communication"
+	"github.com/callidos/protectora-rocher/pkg/communication"
 )
 
 // clef partagée

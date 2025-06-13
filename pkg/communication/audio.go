@@ -4,156 +4,362 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
+	"sync"
+	"time"
 
-	"protectora-rocher/pkg/utils"
-
-	"github.com/pion/webrtc/v4"
+	"github.com/callidos/protectora-rocher/pkg/utils"
+	"golang.org/x/crypto/hkdf"
 )
 
-func StartSecureCall(conn io.ReadWriter, sharedKey []byte) error {
-	config := webrtc.Configuration{
-		ICEServers: []webrtc.ICEServer{
-			{
-				URLs: []string{"stun:stun.l.google.com:19302"},
-			},
-		},
-	}
-
-	peerConnection, err := webrtc.NewPeerConnection(config)
-	if err != nil {
-		return fmt.Errorf("erreur lors de la création de la connexion WebRTC : %v", err)
-	}
-	defer func() {
-		if err := peerConnection.Close(); err != nil {
-			utils.Logger.Error("Erreur lors de la fermeture de la connexion WebRTC", map[string]interface{}{
-				"error": err,
-			})
-		}
-	}()
-
-	dataChannel, err := peerConnection.CreateDataChannel("secure-audio", nil)
-	if err != nil {
-		return fmt.Errorf("erreur lors de la création du DataChannel sécurisé : %v", err)
-	}
-
-	dataChannel.OnOpen(func() {
-		utils.Logger.Info("Canal de données sécurisé ouvert", map[string]interface{}{})
-	})
-
-	dataChannel.OnMessage(func(msg webrtc.DataChannelMessage) {
-		utils.Logger.Debug("Message reçu via le canal sécurisé", map[string]interface{}{
-			"data": string(msg.Data),
-		})
-	})
-
-	peerConnection.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
-		if track == nil {
-			utils.Logger.Error("La piste audio est nulle", map[string]interface{}{})
-			return
-		}
-
-		utils.Logger.Info("Piste audio reçue", map[string]interface{}{
-			"track_id": track.ID(),
-		})
-
-		go func() {
-			if err := HandleSecureAudioStream(conn, sharedKey, track); err != nil {
-				utils.Logger.Error("Erreur lors du traitement du flux audio sécurisé", map[string]interface{}{
-					"error": err,
-				})
-			}
-		}()
-	})
-
-	peerConnection.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
-		utils.Logger.Info("État de la connexion ICE", map[string]interface{}{
-			"state": state.String(),
-		})
-	})
-
-	peerConnection.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
-		if state == webrtc.PeerConnectionStateFailed {
-			utils.Logger.Error("Échec de la connexion WebRTC", map[string]interface{}{})
-		}
-	})
-
-	utils.Logger.Info("Appel vocal sécurisé démarré", map[string]interface{}{})
-	return nil
+// AudioProtocol représente le protocole de communication audio sécurisé
+type AudioProtocol struct {
+	conn        io.ReadWriter
+	sessionKey  []byte
+	aesGCM      cipher.AEAD
+	isActive    bool
+	mutex       sync.RWMutex
+	stopChannel chan struct{}
 }
 
-func HandleSecureAudioStream(writer io.Writer, key []byte, track *webrtc.TrackRemote) error {
-	if writer == nil || track == nil {
-		return fmt.Errorf("writer ou track est nil")
+// AudioMessage représente un message audio chiffré
+type AudioMessage struct {
+	Type      uint8 // 0: AUDIO_DATA, 1: CONTROL, 2: END_CALL
+	Timestamp int64
+	Nonce     []byte
+	Data      []byte
+}
+
+const (
+	AUDIO_DATA = 0
+	CONTROL    = 1
+	END_CALL   = 2
+
+	MAX_AUDIO_SIZE = 1024 * 16 // 16KB max par message
+	NONCE_SIZE     = 12
+	KEY_SIZE       = 32
+)
+
+// NewAudioProtocol crée une nouvelle instance du protocole audio avec génération automatique de clés
+func NewAudioProtocol(conn io.ReadWriter) (*AudioProtocol, error) {
+	if conn == nil {
+		return nil, errors.New("connexion nulle")
 	}
 
-	block, err := aes.NewCipher(key)
+	// Génération automatique d'une clé de session sécurisée
+	sessionKey, err := generateSessionKey()
 	if err != nil {
-		return fmt.Errorf("échec de la création du chiffrement : %v", err)
+		return nil, fmt.Errorf("échec de génération de la clé de session : %v", err)
+	}
+
+	// Création du chiffrement AES-GCM
+	block, err := aes.NewCipher(sessionKey)
+	if err != nil {
+		return nil, fmt.Errorf("échec de création du cipher AES : %v", err)
 	}
 
 	aesGCM, err := cipher.NewGCM(block)
 	if err != nil {
-		return fmt.Errorf("échec de la création de l'AES-GCM : %v", err)
+		return nil, fmt.Errorf("échec de création de l'AES-GCM : %v", err)
 	}
 
-	for {
-		sample, _, err := track.ReadRTP()
-		if err != nil {
-			if err == io.EOF {
-				utils.Logger.Info("Fin du flux audio", map[string]interface{}{})
-				break
-			}
-			utils.Logger.Error("Erreur lors de la lecture du flux audio", map[string]interface{}{
-				"error": err,
-			})
-			continue
-		}
-
-		nonce := make([]byte, aesGCM.NonceSize())
-		if _, err := rand.Read(nonce); err != nil {
-			return fmt.Errorf("échec de génération du nonce sécurisé : %v", err)
-		}
-
-		encrypted := aesGCM.Seal(nil, nonce, sample.Payload, nil)
-
-		_, err = writer.Write(append(nonce, encrypted...))
-		if err != nil {
-			return fmt.Errorf("échec d'écriture des données audio sécurisées : %v", err)
-		}
-
-		utils.Logger.Info("Données audio chiffrées envoyées", map[string]interface{}{
-			"size": len(encrypted),
-		})
+	protocol := &AudioProtocol{
+		conn:        conn,
+		sessionKey:  sessionKey,
+		aesGCM:      aesGCM,
+		isActive:    false,
+		stopChannel: make(chan struct{}),
 	}
 
+	utils.Logger.Info("Protocole audio sécurisé initialisé", map[string]interface{}{
+		"key_size": len(sessionKey),
+	})
+
+	return protocol, nil
+}
+
+// generateSessionKey génère une clé de session sécurisée de manière autonome
+func generateSessionKey() ([]byte, error) {
+	// Génération d'un salt aléatoire
+	salt := make([]byte, 32)
+	if _, err := rand.Read(salt); err != nil {
+		return nil, err
+	}
+
+	// Génération d'un secret initial aléatoire
+	secret := make([]byte, 32)
+	if _, err := rand.Read(secret); err != nil {
+		return nil, err
+	}
+
+	// Utilisation de HKDF pour dériver une clé robuste
+	hkdf := hkdf.New(sha256.New, secret, salt, []byte("protectora-rocher-audio-v1"))
+
+	key := make([]byte, KEY_SIZE)
+	if _, err := io.ReadFull(hkdf, key); err != nil {
+		return nil, err
+	}
+
+	return key, nil
+}
+
+// StartSecureCall démarre un appel audio sécurisé
+func (ap *AudioProtocol) StartSecureCall() error {
+	ap.mutex.Lock()
+	defer ap.mutex.Unlock()
+
+	if ap.isActive {
+		return errors.New("appel déjà en cours")
+	}
+
+	ap.isActive = true
+	ap.stopChannel = make(chan struct{})
+
+	// Envoi du message de début d'appel
+	if err := ap.sendControlMessage("START_CALL"); err != nil {
+		ap.isActive = false
+		return fmt.Errorf("échec d'envoi du message de début : %v", err)
+	}
+
+	utils.Logger.Info("Appel audio sécurisé démarré", map[string]interface{}{})
 	return nil
 }
 
-func StopSecureCall(conn io.ReadWriter, key []byte) error {
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return fmt.Errorf("échec de la création du chiffrement : %v", err)
+// SendAudioData envoie des données audio chiffrées
+func (ap *AudioProtocol) SendAudioData(audioData []byte) error {
+	ap.mutex.RLock()
+	defer ap.mutex.RUnlock()
+
+	if !ap.isActive {
+		return errors.New("aucun appel en cours")
 	}
 
-	aesGCM, err := cipher.NewGCM(block)
-	if err != nil {
-		return fmt.Errorf("échec de la création de l'AES-GCM : %v", err)
+	if len(audioData) > MAX_AUDIO_SIZE {
+		return errors.New("données audio trop volumineuses")
 	}
 
-	nonce := make([]byte, aesGCM.NonceSize())
+	message := AudioMessage{
+		Type:      AUDIO_DATA,
+		Timestamp: time.Now().UnixNano(),
+		Data:      audioData,
+	}
+
+	return ap.sendMessage(&message)
+}
+
+// ReceiveAudioData reçoit et déchiffre des données audio
+func (ap *AudioProtocol) ReceiveAudioData() ([]byte, error) {
+	ap.mutex.RLock()
+	defer ap.mutex.RUnlock()
+
+	if !ap.isActive {
+		return nil, errors.New("aucun appel en cours")
+	}
+
+	message, err := ap.receiveMessage()
+	if err != nil {
+		return nil, err
+	}
+
+	if message.Type != AUDIO_DATA {
+		return nil, fmt.Errorf("type de message inattendu : %d", message.Type)
+	}
+
+	return message.Data, nil
+}
+
+// StopSecureCall arrête l'appel audio sécurisé
+func (ap *AudioProtocol) StopSecureCall() error {
+	ap.mutex.Lock()
+	defer ap.mutex.Unlock()
+
+	if !ap.isActive {
+		return errors.New("aucun appel en cours")
+	}
+
+	// Envoi du message de fin d'appel
+	if err := ap.sendControlMessage("END_CALL"); err != nil {
+		utils.Logger.Error("Échec d'envoi du message de fin", map[string]interface{}{
+			"error": err,
+		})
+	}
+
+	ap.isActive = false
+	close(ap.stopChannel)
+
+	utils.Logger.Info("Appel audio sécurisé terminé", map[string]interface{}{})
+	return nil
+}
+
+// IsActive retourne l'état de l'appel
+func (ap *AudioProtocol) IsActive() bool {
+	ap.mutex.RLock()
+	defer ap.mutex.RUnlock()
+	return ap.isActive
+}
+
+// sendMessage envoie un message chiffré
+func (ap *AudioProtocol) sendMessage(message *AudioMessage) error {
+	// Génération d'un nonce unique
+	nonce := make([]byte, ap.aesGCM.NonceSize())
 	if _, err := rand.Read(nonce); err != nil {
-		return fmt.Errorf("échec de génération du nonce sécurisé : %v", err)
+		return fmt.Errorf("échec de génération du nonce : %v", err)
 	}
 
-	encryptedMessage := aesGCM.Seal(nil, nonce, []byte("END_CALL"), nil)
+	// Chiffrement des données
+	encrypted := ap.aesGCM.Seal(nil, nonce, message.Data, nil)
 
-	_, err = conn.Write(append(nonce, encryptedMessage...))
+	// Préparation du message final
+	message.Nonce = nonce
+	message.Data = encrypted
+
+	// Sérialisation du message
+	serialized, err := ap.serializeMessage(message)
 	if err != nil {
-		return fmt.Errorf("erreur lors de l'envoi du message de fin d'appel sécurisé : %v", err)
+		return fmt.Errorf("échec de sérialisation : %v", err)
 	}
 
-	utils.Logger.Info("Appel vocal sécurisé terminé", map[string]interface{}{})
+	// Envoi du message
+	if _, err := ap.conn.Write(serialized); err != nil {
+		return fmt.Errorf("échec d'envoi : %v", err)
+	}
+
+	utils.Logger.Debug("Message audio chiffré envoyé", map[string]interface{}{
+		"type": message.Type,
+		"size": len(encrypted),
+	})
+
 	return nil
+}
+
+// receiveMessage reçoit et déchiffre un message
+func (ap *AudioProtocol) receiveMessage() (*AudioMessage, error) {
+	// Lecture de l'en-tête (taille du message)
+	headerBuf := make([]byte, 4)
+	if _, err := io.ReadFull(ap.conn, headerBuf); err != nil {
+		return nil, fmt.Errorf("échec de lecture de l'en-tête : %v", err)
+	}
+
+	messageSize := binary.BigEndian.Uint32(headerBuf)
+	if messageSize > MAX_AUDIO_SIZE+1024 { // Marge pour les métadonnées
+		return nil, errors.New("message trop volumineux")
+	}
+
+	// Lecture du message complet
+	messageBuf := make([]byte, messageSize)
+	if _, err := io.ReadFull(ap.conn, messageBuf); err != nil {
+		return nil, fmt.Errorf("échec de lecture du message : %v", err)
+	}
+
+	// Désérialisation
+	message, err := ap.deserializeMessage(messageBuf)
+	if err != nil {
+		return nil, fmt.Errorf("échec de désérialisation : %v", err)
+	}
+
+	// Déchiffrement
+	decrypted, err := ap.aesGCM.Open(nil, message.Nonce, message.Data, nil)
+	if err != nil {
+		return nil, fmt.Errorf("échec de déchiffrement : %v", err)
+	}
+
+	message.Data = decrypted
+
+	utils.Logger.Debug("Message audio déchiffré reçu", map[string]interface{}{
+		"type": message.Type,
+		"size": len(decrypted),
+	})
+
+	return message, nil
+}
+
+// sendControlMessage envoie un message de contrôle
+func (ap *AudioProtocol) sendControlMessage(control string) error {
+	message := AudioMessage{
+		Type:      CONTROL,
+		Timestamp: time.Now().UnixNano(),
+		Data:      []byte(control),
+	}
+
+	return ap.sendMessage(&message)
+}
+
+// serializeMessage sérialise un message pour l'envoi
+func (ap *AudioProtocol) serializeMessage(message *AudioMessage) ([]byte, error) {
+	var buf []byte
+
+	// Ajout du type
+	buf = append(buf, message.Type)
+
+	// Ajout du timestamp
+	timestampBytes := make([]byte, 8)
+	binary.BigEndian.PutUint64(timestampBytes, uint64(message.Timestamp))
+	buf = append(buf, timestampBytes...)
+
+	// Ajout de la taille du nonce
+	buf = append(buf, byte(len(message.Nonce)))
+
+	// Ajout du nonce
+	buf = append(buf, message.Nonce...)
+
+	// Ajout des données
+	buf = append(buf, message.Data...)
+
+	// Préparation du message final avec en-tête de taille
+	finalBuf := make([]byte, 4)
+	binary.BigEndian.PutUint32(finalBuf, uint32(len(buf)))
+	finalBuf = append(finalBuf, buf...)
+
+	return finalBuf, nil
+}
+
+// deserializeMessage désérialise un message reçu
+func (ap *AudioProtocol) deserializeMessage(data []byte) (*AudioMessage, error) {
+	if len(data) < 10 { // Type(1) + Timestamp(8) + NonceSize(1)
+		return nil, errors.New("message trop court")
+	}
+
+	message := &AudioMessage{}
+	offset := 0
+
+	// Lecture du type
+	message.Type = data[offset]
+	offset++
+
+	// Lecture du timestamp
+	message.Timestamp = int64(binary.BigEndian.Uint64(data[offset : offset+8]))
+	offset += 8
+
+	// Lecture de la taille du nonce
+	nonceSize := int(data[offset])
+	offset++
+
+	if len(data) < offset+nonceSize {
+		return nil, errors.New("nonce incomplet")
+	}
+
+	// Lecture du nonce
+	message.Nonce = data[offset : offset+nonceSize]
+	offset += nonceSize
+
+	// Lecture des données
+	message.Data = data[offset:]
+
+	return message, nil
+}
+
+// GetSessionInfo retourne des informations sur la session (pour debugging)
+func (ap *AudioProtocol) GetSessionInfo() map[string]interface{} {
+	ap.mutex.RLock()
+	defer ap.mutex.RUnlock()
+
+	return map[string]interface{}{
+		"is_active":        ap.isActive,
+		"session_key_size": len(ap.sessionKey),
+		"nonce_size":       ap.aesGCM.NonceSize(),
+	}
 }

@@ -7,8 +7,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"protectora-rocher/pkg/utils"
 	"strings"
+
+	"github.com/callidos/protectora-rocher/pkg/utils"
 )
 
 const (

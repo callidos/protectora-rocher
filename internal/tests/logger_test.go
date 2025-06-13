@@ -2,8 +2,9 @@ package tests
 
 import (
 	"bytes"
-	"protectora-rocher/pkg/utils"
 	"testing"
+
+	"github.com/callidos/protectora-rocher/pkg/utils"
 )
 
 // MockLogger est une implémentation de LoggerInterface pour les tests.

@@ -5,7 +5,7 @@ import (
 	"crypto/rand"
 	"testing"
 
-	"protectora-rocher/pkg/communication"
+	"github.com/callidos/protectora-rocher/pkg/communication"
 )
 
 // TestIndependentEvolution simule l'évolution indépendante des chaînes entre deux parties (client et serveur)

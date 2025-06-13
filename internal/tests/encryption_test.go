@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"testing"
 
-	"protectora-rocher/pkg/communication"
+	"github.com/callidos/protectora-rocher/pkg/communication"
 )
 
 var (

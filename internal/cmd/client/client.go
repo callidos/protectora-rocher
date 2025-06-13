@@ -10,7 +10,7 @@ import (
 	"os"
 	"strings"
 
-	"protectora-rocher/pkg/communication"
+	"github.com/callidos/protectora-rocher/pkg/communication"
 )
 
 func main() {

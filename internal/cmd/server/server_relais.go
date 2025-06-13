@@ -6,7 +6,7 @@ import (
 	"log"
 	"net"
 
-	"protectora-rocher/pkg/communication"
+	"github.com/callidos/protectora-rocher/pkg/communication"
 )
 
 func main() {
