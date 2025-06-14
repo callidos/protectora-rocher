@@ -16,6 +16,7 @@ const (
 	bufferSize = 1024 * 1024
 )
 
+// CORRECTION: Amélioration de la gestion d'erreurs avec des codes et messages génériques
 type SecureError struct {
 	Code    int
 	Message string
@@ -23,14 +24,20 @@ type SecureError struct {
 }
 
 func (e *SecureError) Error() string {
-	if e.Wrapped == nil {
-		return fmt.Sprintf("[%d] %s", e.Code, e.Message)
-	}
-	return fmt.Sprintf("[%d] %s: %v", e.Code, e.Message, e.Wrapped)
+	// CORRECTION: Ne pas exposer l'erreur wrappée pour éviter l'information leakage
+	return fmt.Sprintf("[%d] %s", e.Code, e.Message)
 }
 
-func securityError(code int, msg string, err error) *SecureError {
-	return &SecureError{Code: code, Message: msg, Wrapped: err}
+// Messages d'erreur génériques pour éviter l'information leakage
+var (
+	ErrConnectionFailed     = &SecureError{Code: 1000, Message: "Échec de connexion"}
+	ErrAuthenticationFailed = &SecureError{Code: 2000, Message: "Échec d'authentification"}
+	ErrProcessingFailed     = &SecureError{Code: 3000, Message: "Échec de traitement"}
+	ErrInvalidInput         = &SecureError{Code: 4000, Message: "Entrée invalide"}
+)
+
+func securityError(errorType *SecureError, err error) *SecureError {
+	return &SecureError{Code: errorType.Code, Message: errorType.Message, Wrapped: err}
 }
 
 func HandleConnection(r io.Reader, w io.Writer, sharedKey []byte) {
@@ -42,7 +49,9 @@ func HandleConnection(r io.Reader, w io.Writer, sharedKey []byte) {
 
 	username, err := readUsername(scanner)
 	if err != nil {
-		utils.Logger.Warning(err.Error(), nil)
+		// CORRECTION: Log détaillé côté serveur, message générique côté client
+		utils.Logger.Warning("Lecture username échouée", map[string]interface{}{"error": err})
+		sendErrorResponse(w, ErrConnectionFailed)
 		return
 	}
 
@@ -59,7 +68,12 @@ func HandleConnection(r io.Reader, w io.Writer, sharedKey []byte) {
 		select {
 		case raw := <-msgChan:
 			if err := processMessage(raw, sharedKey, w, username); err != nil {
-				utils.Logger.Error("Traitement message KO", map[string]interface{}{"err": err})
+				// CORRECTION: Log détaillé côté serveur, réponse générique côté client
+				utils.Logger.Error("Traitement message KO", map[string]interface{}{
+					"user":  username,
+					"error": err,
+				})
+				sendErrorResponse(w, ErrProcessingFailed)
 			}
 		case <-done:
 			closeConnection(w)
@@ -70,16 +84,24 @@ func HandleConnection(r io.Reader, w io.Writer, sharedKey []byte) {
 
 func readUsername(scanner *bufio.Scanner) (string, error) {
 	if !scanner.Scan() {
-		return "", securityError(1001, "Impossible de lire le nom d’utilisateur", scanner.Err())
+		return "", securityError(ErrConnectionFailed, scanner.Err())
 	}
 	username := strings.TrimSpace(scanner.Text())
 	if username == "" {
-		return "", securityError(1002, "Nom d’utilisateur vide", nil)
+		return "", securityError(ErrInvalidInput, nil)
+	}
+	// CORRECTION: Validation basique du nom d'utilisateur
+	if len(username) > 64 || len(username) < 1 {
+		return "", securityError(ErrInvalidInput, nil)
 	}
 	return username, nil
 }
 
 func processIncomingMessages(scanner *bufio.Scanner, ch chan<- string, done chan<- struct{}, user string) {
+	defer func() {
+		done <- struct{}{}
+	}()
+
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
@@ -87,12 +109,18 @@ func processIncomingMessages(scanner *bufio.Scanner, ch chan<- string, done chan
 		}
 		if line == "FIN_SESSION" {
 			utils.Logger.Info("Fin de session demandée", map[string]interface{}{"user": user})
-			done <- struct{}{}
 			return
 		}
 		ch <- line
 	}
-	done <- struct{}{}
+
+	// CORRECTION: Logger l'erreur de scan si elle existe
+	if err := scanner.Err(); err != nil {
+		utils.Logger.Error("Erreur de lecture", map[string]interface{}{
+			"user":  user,
+			"error": err,
+		})
+	}
 }
 
 func processMessage(raw string, key []byte, w io.Writer, user string) error {
@@ -100,7 +128,7 @@ func processMessage(raw string, key []byte, w io.Writer, user string) error {
 	if err := json.Unmarshal([]byte(raw), &frm); err != nil {
 		parts := strings.SplitN(raw, "|", 2)
 		if len(parts) != 2 {
-			return securityError(2001, "Frame invalide", err)
+			return securityError(ErrAuthenticationFailed, err)
 		}
 		frm = frame{Data: parts[0], HMAC: parts[1]}
 	}
@@ -108,20 +136,26 @@ func processMessage(raw string, key []byte, w io.Writer, user string) error {
 	wantMAC := computeHMAC([]byte(frm.Data), key)
 	gotMAC, err := base64.StdEncoding.DecodeString(frm.HMAC)
 	if err != nil {
-		return securityError(2002, "HMAC base64 invalide", err)
+		return securityError(ErrAuthenticationFailed, err)
 	}
 	if !hmac.Equal(wantMAC, gotMAC) {
-		return securityError(2003, "HMAC incohérent", nil)
+		return securityError(ErrAuthenticationFailed, nil)
 	}
 
 	plain, err := DecryptAESGCM(frm.Data, key)
 	if err != nil {
-		return securityError(2004, "Déchiffrement échoué", err)
+		return securityError(ErrAuthenticationFailed, err)
+	}
+
+	// CORRECTION: Validation de la taille du message déchiffré
+	if len(plain) > 10*1024 { // 10KB max pour les messages texte
+		return securityError(ErrInvalidInput, nil)
 	}
 
 	utils.Logger.Info("Message reçu", map[string]interface{}{
 		"user": user,
-		"msg":  string(plain),
+		"size": len(plain),
+		// Ne pas logger le contenu du message pour la confidentialité
 	})
 
 	return sendAcknowledgment(w, key)
@@ -139,6 +173,17 @@ func sendWelcomeMessage(w io.Writer, key []byte, user string) error {
 
 func sendAcknowledgment(w io.Writer, key []byte) error {
 	return SendMessage(w, "Message reçu avec succès.", key, 0, 0)
+}
+
+// CORRECTION: Ajouter une fonction pour envoyer des réponses d'erreur génériques
+func sendErrorResponse(w io.Writer, secErr *SecureError) {
+	// Envoyer une réponse d'erreur générique sans détails
+	errorMsg := fmt.Sprintf("Erreur %d: %s", secErr.Code, secErr.Message)
+	if _, err := w.Write([]byte(errorMsg + "\n")); err != nil {
+		utils.Logger.Error("Échec envoi réponse d'erreur", map[string]interface{}{
+			"error": err,
+		})
+	}
 }
 
 func closeConnection(w io.Writer) {

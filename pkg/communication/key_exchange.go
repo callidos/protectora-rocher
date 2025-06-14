@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 
@@ -23,12 +24,13 @@ type KeyExchangeResult struct {
 }
 
 // ClientPerformKeyExchange effectue la partie handshake côté client (initiateur).
-func ClientPerformKeyExchange(conn io.ReadWriter, privKey ed25519.PrivateKey) (<-chan KeyExchangeResult, error) {
+func ClientPerformKeyExchange(conn io.ReadWriter, privKey ed25519.PrivateKey, serverPubKey ed25519.PublicKey) (<-chan KeyExchangeResult, error) {
 	resultChan := make(chan KeyExchangeResult, 1)
 
 	go func() {
 		defer close(resultChan)
 
+		// Générer une paire de clés Kyber pour l'échange
 		publicKey, privateKey, err := kyber768.GenerateKeyPair(rand.Reader)
 		if err != nil {
 			resultChan <- KeyExchangeResult{Err: fmt.Errorf("keygen failed: %w", err)}
@@ -38,27 +40,46 @@ func ClientPerformKeyExchange(conn io.ReadWriter, privKey ed25519.PrivateKey) (<
 		publicKeyBytes := make([]byte, kyber768.PublicKeySize)
 		publicKey.Pack(publicKeyBytes)
 
+		// Signer la clé publique Kyber avec notre clé privée Ed25519
 		signature := ed25519.Sign(privKey, publicKeyBytes)
 
+		// Envoyer notre clé publique Kyber + signature
 		if err := sendData(conn, publicKeyBytes, signature); err != nil {
 			resultChan <- KeyExchangeResult{Err: fmt.Errorf("send failed: %w", err)}
 			return
 		}
 
+		// Recevoir le ciphertext du serveur
 		ciphertext, err := receiveBytes(conn)
 		if err != nil {
-			resultChan <- KeyExchangeResult{Err: fmt.Errorf("receive failed: %w", err)}
+			resultChan <- KeyExchangeResult{Err: fmt.Errorf("receive ciphertext failed: %w", err)}
 			return
 		}
 
+		// Recevoir la signature du serveur
+		serverSignature, err := receiveBytes(conn)
+		if err != nil {
+			resultChan <- KeyExchangeResult{Err: fmt.Errorf("receive server signature failed: %w", err)}
+			return
+		}
+
+		// CORRECTION: Vérifier la signature du serveur sur le ciphertext
+		if !ed25519.Verify(serverPubKey, ciphertext, serverSignature) {
+			resultChan <- KeyExchangeResult{Err: errors.New("server signature verification failed")}
+			return
+		}
+
+		// Vérifier la taille du ciphertext
 		if len(ciphertext) != kyber768.CiphertextSize {
 			resultChan <- KeyExchangeResult{Err: fmt.Errorf("invalid ciphertext length: got %d, expected %d", len(ciphertext), kyber768.CiphertextSize)}
 			return
 		}
 
+		// Décapsuler pour obtenir le secret partagé
 		sharedSecret := make([]byte, kyber768.SharedKeySize)
 		privateKey.DecapsulateTo(sharedSecret, ciphertext)
 
+		// Dériver la clé de session
 		sessionKey := DeriveSessionKey(sharedSecret)
 		Memzero(sharedSecret)
 
@@ -68,41 +89,57 @@ func ClientPerformKeyExchange(conn io.ReadWriter, privKey ed25519.PrivateKey) (<
 	return resultChan, nil
 }
 
-func ServerPerformKeyExchange(conn io.ReadWriter, privKey ed25519.PrivateKey) (<-chan KeyExchangeResult, error) {
+// ServerPerformKeyExchange effectue la partie handshake côté serveur.
+func ServerPerformKeyExchange(conn io.ReadWriter, privKey ed25519.PrivateKey, clientPubKey ed25519.PublicKey) (<-chan KeyExchangeResult, error) {
 	resultChan := make(chan KeyExchangeResult, 1)
 
 	go func() {
 		defer close(resultChan)
 
+		// Recevoir la clé publique Kyber du client
 		clientPubKeyBytes, err := receiveBytes(conn)
 		if err != nil {
 			resultChan <- KeyExchangeResult{Err: fmt.Errorf("failed to read client public key: %w", err)}
 			return
 		}
 
-		_, err = receiveBytes(conn)
+		// Recevoir la signature du client
+		clientSignature, err := receiveBytes(conn)
 		if err != nil {
-			resultChan <- KeyExchangeResult{Err: fmt.Errorf("failed to read signature: %w", err)}
+			resultChan <- KeyExchangeResult{Err: fmt.Errorf("failed to read client signature: %w", err)}
 			return
 		}
 
-		clientPubKey, err := kyber768.Scheme().UnmarshalBinaryPublicKey(clientPubKeyBytes)
+		// CORRECTION: Vérifier la signature du client sur sa clé publique Kyber
+		if !ed25519.Verify(clientPubKey, clientPubKeyBytes, clientSignature) {
+			resultChan <- KeyExchangeResult{Err: errors.New("client signature verification failed")}
+			return
+		}
+
+		// Décoder la clé publique Kyber du client
+		clientKyberPubKey, err := kyber768.Scheme().UnmarshalBinaryPublicKey(clientPubKeyBytes)
 		if err != nil {
 			resultChan <- KeyExchangeResult{Err: fmt.Errorf("failed to unpack client public key: %w", err)}
 			return
 		}
 
-		ciphertext, sharedSecret, err := kyber768.Scheme().Encapsulate(clientPubKey)
+		// Encapsuler pour créer le ciphertext et le secret partagé
+		ciphertext, sharedSecret, err := kyber768.Scheme().Encapsulate(clientKyberPubKey)
 		if err != nil {
 			resultChan <- KeyExchangeResult{Err: fmt.Errorf("encapsulation failed: %w", err)}
 			return
 		}
 
-		if err := sendBytes(conn, ciphertext); err != nil {
-			resultChan <- KeyExchangeResult{Err: fmt.Errorf("failed to send ciphertext: %w", err)}
+		// Signer le ciphertext avec notre clé privée Ed25519
+		serverSignature := ed25519.Sign(privKey, ciphertext)
+
+		// Envoyer le ciphertext + notre signature
+		if err := sendData(conn, ciphertext, serverSignature); err != nil {
+			resultChan <- KeyExchangeResult{Err: fmt.Errorf("failed to send ciphertext and signature: %w", err)}
 			return
 		}
 
+		// Dériver la clé de session
 		sessionKey := DeriveSessionKey(sharedSecret)
 		Memzero(sharedSecret)
 
@@ -150,7 +187,7 @@ func receiveBytes(conn io.Reader) ([]byte, error) {
 }
 
 func DeriveSessionKey(sharedSecret []byte) [32]byte {
-	h := hkdf.New(sha256.New, sharedSecret, nil, nil)
+	h := hkdf.New(sha256.New, sharedSecret, nil, []byte("protectora-rocher-session-v1"))
 	key := [32]byte{}
 	_, _ = io.ReadFull(h, key[:])
 	return key

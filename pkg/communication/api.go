@@ -14,9 +14,8 @@ type Session struct {
 }
 
 // NewClientSessionWithHandshake réalise le handshake côté client et initialise le double ratchet.
-// (inchangé) :contentReference[oaicite:8]{index=8}:contentReference[oaicite:9]{index=9}
-func NewClientSessionWithHandshake(conn io.ReadWriter, privKey ed25519.PrivateKey) (*Session, error) {
-	handshakeChan, err := ClientPerformKeyExchange(conn, privKey)
+func NewClientSessionWithHandshake(conn io.ReadWriter, privKey ed25519.PrivateKey, serverPubKey ed25519.PublicKey) (*Session, error) {
+	handshakeChan, err := ClientPerformKeyExchange(conn, privKey, serverPubKey)
 	if err != nil {
 		return nil, fmt.Errorf("client handshake error: %w", err)
 	}
@@ -55,9 +54,8 @@ func NewClientSessionWithHandshake(conn io.ReadWriter, privKey ed25519.PrivateKe
 }
 
 // NewServerSessionWithHandshake réalise le handshake côté serveur et initialise le double ratchet.
-// (inchangé) :contentReference[oaicite:10]{index=10}:contentReference[oaicite:11]{index=11}
-func NewServerSessionWithHandshake(conn io.ReadWriter, privKey ed25519.PrivateKey) (*Session, error) {
-	handshakeChan, err := ServerPerformKeyExchange(conn, privKey)
+func NewServerSessionWithHandshake(conn io.ReadWriter, privKey ed25519.PrivateKey, clientPubKey ed25519.PublicKey) (*Session, error) {
+	handshakeChan, err := ServerPerformKeyExchange(conn, privKey, clientPubKey)
 	if err != nil {
 		return nil, fmt.Errorf("server handshake error: %w", err)
 	}
@@ -89,27 +87,55 @@ func NewServerSessionWithHandshake(conn io.ReadWriter, privKey ed25519.PrivateKe
 	if err != nil {
 		return nil, fmt.Errorf("server error initializing double ratchet: %w", err)
 	}
-	// Inversion des chaînes pour le serveur
-	dr.SendingChain, dr.ReceivingChain = dr.ReceivingChain, dr.SendingChain
+	// CORRECTION: Utiliser les paramètres appropriés selon le rôle
 	dr.IsServer = true
 
 	return &Session{Conn: conn, Ratchet: dr}, nil
 }
 
-// SendSecureMessage utilise désormais JSON + HMAC (via protocole.SendMessage)
-// (modifié) :contentReference[oaicite:12]{index=12}:contentReference[oaicite:13]{index=13}
+// SendSecureMessage utilise désormais le double ratchet pour le chiffrement
 func (s *Session) SendSecureMessage(message string, seq uint64, duration int) error {
-	return SendMessage(s.Conn, message, s.Ratchet.RootKey, seq, duration)
+	// CORRECTION: Utiliser le double ratchet au lieu du protocole simple
+	messageKey, err := s.Ratchet.RatchetEncrypt()
+	if err != nil {
+		return fmt.Errorf("ratchet encrypt error: %w", err)
+	}
+
+	encrypted, err := EncryptAESGCM([]byte(message), messageKey)
+	if err != nil {
+		return fmt.Errorf("encryption error: %w", err)
+	}
+
+	// Envoyer le message chiffré directement
+	_, err = s.Conn.Write([]byte(encrypted + "\n"))
+	return err
 }
 
-// ReceiveSecureMessage lit et traite un message JSON encodé + HMAC
-// (modifié) :contentReference[oaicite:14]{index=14}:contentReference[oaicite:15]{index=15}
+// ReceiveSecureMessage lit et traite un message chiffré via le double ratchet
 func (s *Session) ReceiveSecureMessage() (string, error) {
-	// ReceiveMessage gère lecture, JSON-unmarshal, HMAC et déchiffrement
-	return ReceiveMessage(s.Conn, s.Ratchet.RootKey)
+	// CORRECTION: Utiliser le double ratchet pour le déchiffrement
+	messageKey, err := s.Ratchet.RatchetDecrypt()
+	if err != nil {
+		return "", fmt.Errorf("ratchet decrypt error: %w", err)
+	}
+
+	// Lire le message depuis la connexion
+	buffer := make([]byte, 4096)
+	n, err := s.Conn.Read(buffer)
+	if err != nil {
+		return "", fmt.Errorf("read error: %w", err)
+	}
+
+	// Déchiffrer avec la clé dérivée du ratchet
+	decrypted, err := DecryptAESGCM(string(buffer[:n-1]), messageKey) // -1 pour retirer le \n
+	if err != nil {
+		return "", fmt.Errorf("decryption error: %w", err)
+	}
+
+	return string(decrypted), nil
 }
 
-// ResetSecurityState réinitialise l’anti‐rejeu global
+// ResetSecurityState réinitialise l'anti‐rejeu global
 func ResetSecurityState() {
 	ResetMessageHistory()
 }

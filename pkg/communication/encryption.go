@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"runtime"
+	"unsafe"
 
 	"golang.org/x/crypto/hkdf"
 )
@@ -20,7 +21,8 @@ func DeriveKeys(masterKey []byte) (encKey, hmacKey []byte, err error) {
 		return nil, nil, errors.New("master key cannot be empty")
 	}
 
-	h := hkdf.New(sha256.New, masterKey, nil, nil)
+	// CORRECTION: Ajouter un contexte versionnés pour la dérivation
+	h := hkdf.New(sha256.New, masterKey, nil, []byte("protectora-rocher-keys-v1"))
 	encKey = make([]byte, 32)
 	if _, err := io.ReadFull(h, encKey); err != nil {
 		return nil, nil, fmt.Errorf("key derivation failed: %w", err)
@@ -34,13 +36,17 @@ func DeriveKeys(masterKey []byte) (encKey, hmacKey []byte, err error) {
 	return encKey, hmacKey, nil
 }
 
+// CORRECTION: Simplification - AES-GCM fournit déjà l'authentification,
+// plus besoin d'HMAC externe (suppression de la redondance cryptographique)
 func EncryptAESGCM(plaintext, masterKey []byte) (string, error) {
 	if len(plaintext) == 0 {
 		return "", errors.New("input data cannot be empty")
 	}
 
-	encryptionKey, hmacKey, err := DeriveKeys(masterKey)
-	if err != nil {
+	// Dériver uniquement la clé de chiffrement (pas besoin d'HMAC avec GCM)
+	hkdf := hkdf.New(sha256.New, masterKey, nil, []byte("protectora-rocher-aes-v1"))
+	encryptionKey := make([]byte, 32)
+	if _, err := io.ReadFull(hkdf, encryptionKey); err != nil {
 		return "", fmt.Errorf("key derivation failed: %w", err)
 	}
 
@@ -59,11 +65,12 @@ func EncryptAESGCM(plaintext, masterKey []byte) (string, error) {
 		return "", fmt.Errorf("nonce generation failed: %w", err)
 	}
 
+	// GCM fournit déjà l'authentification, pas besoin d'HMAC externe
 	ciphertext := aesGCM.Seal(nil, nonce, plaintext, nil)
 	finalMessage := append(nonce, ciphertext...)
 
-	mac := computeHMAC(finalMessage, hmacKey)
-	finalMessage = append(finalMessage, mac...)
+	// Nettoyage sécurisé de la clé
+	MemzeroSecure(&encryptionKey)
 
 	return base64.StdEncoding.EncodeToString(finalMessage), nil
 }
@@ -78,18 +85,11 @@ func DecryptAESGCM(ciphertextBase64 string, masterKey []byte) ([]byte, error) {
 		return nil, errors.New("invalid base64 encoding")
 	}
 
-	encryptionKey, hmacKey, err := DeriveKeys(masterKey)
-	if err != nil {
+	// Dériver la clé de chiffrement
+	hkdf := hkdf.New(sha256.New, masterKey, nil, []byte("protectora-rocher-aes-v1"))
+	encryptionKey := make([]byte, 32)
+	if _, err := io.ReadFull(hkdf, encryptionKey); err != nil {
 		return nil, fmt.Errorf("key derivation failed: %w", err)
-	}
-
-	if len(data) < sha256.Size {
-		return nil, errors.New("invalid ciphertext length")
-	}
-
-	data, mac := data[:len(data)-sha256.Size], data[len(data)-sha256.Size:]
-	if !hmac.Equal(computeHMAC(data, hmacKey), mac) {
-		return nil, errors.New("HMAC verification failed")
 	}
 
 	block, err := aes.NewCipher(encryptionKey)
@@ -108,15 +108,21 @@ func DecryptAESGCM(ciphertextBase64 string, masterKey []byte) ([]byte, error) {
 	}
 
 	nonce, ciphertext := data[:nonceSize], data[nonceSize:]
+
+	// GCM vérifie automatiquement l'authentification
 	plaintext, err := aesGCM.Open(nil, nonce, ciphertext, nil)
 	if err != nil {
-		return nil, fmt.Errorf("decryption failed: %w", err)
+		return nil, fmt.Errorf("decryption or authentication failed: %w", err)
 	}
+
+	// Nettoyage sécurisé de la clé
+	MemzeroSecure(&encryptionKey)
 
 	return plaintext, nil
 }
 
-// GenerateHMAC calcule un HMAC en utilisant SHA-256 et renvoie le résultat encodé en base64.
+// CORRECTION: Garder cette fonction pour la compatibilité avec le protocole existant
+// mais noter qu'elle est redondante avec GCM
 func GenerateHMAC(message string, key []byte) string {
 	mac := hmac.New(sha256.New, key)
 	mac.Write([]byte(message))
@@ -129,11 +135,33 @@ func computeHMAC(data, key []byte) []byte {
 	return mac.Sum(nil)
 }
 
+// CORRECTION: Amélioration du nettoyage mémoire sécurisé
 func MemzeroSecure(b *[]byte) {
-	// Pour chaque indice du slice, on force la mise à zéro
-	for i := range *b {
-		(*b)[i] = 0
+	if b == nil || len(*b) == 0 {
+		return
 	}
-	// Éventuellement un keep-alive
+
+	// Écriture de motifs différents pour rendre la récupération plus difficile
+	for i := range *b {
+		(*b)[i] = 0xFF
+	}
+	for i := range *b {
+		(*b)[i] = 0x00
+	}
+	for i := range *b {
+		(*b)[i] = 0xAA
+	}
+	for i := range *b {
+		(*b)[i] = 0x00
+	}
+
+	// Forcer la synchronisation mémoire
 	runtime.KeepAlive(b)
+
+	// Tentative de forcer l'effacement au niveau CPU (best effort)
+	if len(*b) > 0 {
+		ptr := unsafe.Pointer(&(*b)[0])
+		// Barrière mémoire pour empêcher l'optimisation
+		runtime.KeepAlive(ptr)
+	}
 }

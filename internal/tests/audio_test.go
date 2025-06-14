@@ -2,16 +2,27 @@ package tests
 
 import (
 	"bytes"
+	"crypto/rand"
 	"testing"
 	"time"
 
 	"github.com/callidos/protectora-rocher/pkg/communication"
 )
 
+// CORRECTION: Générer une clé de session partagée pour les tests
+var sharedSessionKey = generateTestSessionKey()
+
+func generateTestSessionKey() []byte {
+	key := make([]byte, 32)
+	rand.Read(key)
+	return key
+}
+
 func TestNewAudioProtocol(t *testing.T) {
 	mockConn := &MockConnection{EnableLogging: false}
 
-	protocol, err := communication.NewAudioProtocol(mockConn)
+	// CORRECTION: Passer la clé de session partagée
+	protocol, err := communication.NewAudioProtocol(mockConn, sharedSessionKey)
 	if err != nil {
 		t.Fatalf("Échec de création du protocole audio : %v", err)
 	}
@@ -27,15 +38,26 @@ func TestNewAudioProtocol(t *testing.T) {
 }
 
 func TestNewAudioProtocolWithNilConnection(t *testing.T) {
-	_, err := communication.NewAudioProtocol(nil)
+	_, err := communication.NewAudioProtocol(nil, sharedSessionKey)
 	if err == nil {
 		t.Error("La création avec une connexion nil doit échouer")
 	}
 }
 
+// CORRECTION: Test avec clé insuffisante
+func TestNewAudioProtocolWithInsufficientKey(t *testing.T) {
+	mockConn := &MockConnection{EnableLogging: false}
+	shortKey := make([]byte, 16) // Clé trop courte
+
+	_, err := communication.NewAudioProtocol(mockConn, shortKey)
+	if err == nil {
+		t.Error("La création avec une clé insuffisante doit échouer")
+	}
+}
+
 func TestStartStopSecureCall(t *testing.T) {
 	mockConn := &MockConnection{EnableLogging: false}
-	protocol, err := communication.NewAudioProtocol(mockConn)
+	protocol, err := communication.NewAudioProtocol(mockConn, sharedSessionKey)
 	if err != nil {
 		t.Fatalf("Échec de création du protocole : %v", err)
 	}
@@ -63,7 +85,7 @@ func TestStartStopSecureCall(t *testing.T) {
 
 func TestDoubleStartCall(t *testing.T) {
 	mockConn := &MockConnection{EnableLogging: false}
-	protocol, err := communication.NewAudioProtocol(mockConn)
+	protocol, err := communication.NewAudioProtocol(mockConn, sharedSessionKey)
 	if err != nil {
 		t.Fatalf("Échec de création du protocole : %v", err)
 	}
@@ -85,7 +107,7 @@ func TestDoubleStartCall(t *testing.T) {
 
 func TestSendAudioDataWithoutActiveCall(t *testing.T) {
 	mockConn := &MockConnection{EnableLogging: false}
-	protocol, err := communication.NewAudioProtocol(mockConn)
+	protocol, err := communication.NewAudioProtocol(mockConn, sharedSessionKey)
 	if err != nil {
 		t.Fatalf("Échec de création du protocole : %v", err)
 	}
@@ -101,16 +123,16 @@ func TestSendReceiveAudioData(t *testing.T) {
 	// Test avec un buffer partagé pour simuler la communication bidirectionnelle
 	sharedBuffer := &bytes.Buffer{}
 
-	// Création de deux connexions mock partageant le même buffer
+	// CORRECTION: Utiliser la même clé de session pour les deux protocoles
 	senderConn := &MockConnectionWithSharedBuffer{Buffer: sharedBuffer, EnableLogging: false}
 	receiverConn := &MockConnectionWithSharedBuffer{Buffer: sharedBuffer, EnableLogging: false}
 
-	senderProtocol, err := communication.NewAudioProtocol(senderConn)
+	senderProtocol, err := communication.NewAudioProtocol(senderConn, sharedSessionKey)
 	if err != nil {
 		t.Fatalf("Échec de création du protocole expéditeur : %v", err)
 	}
 
-	receiverProtocol, err := communication.NewAudioProtocol(receiverConn)
+	receiverProtocol, err := communication.NewAudioProtocol(receiverConn, sharedSessionKey)
 	if err != nil {
 		t.Fatalf("Échec de création du protocole récepteur : %v", err)
 	}
@@ -144,7 +166,7 @@ func TestSendReceiveAudioData(t *testing.T) {
 
 func TestSendOversizedAudioData(t *testing.T) {
 	mockConn := &MockConnection{EnableLogging: false}
-	protocol, err := communication.NewAudioProtocol(mockConn)
+	protocol, err := communication.NewAudioProtocol(mockConn, sharedSessionKey)
 	if err != nil {
 		t.Fatalf("Échec de création du protocole : %v", err)
 	}
@@ -167,7 +189,7 @@ func TestSendOversizedAudioData(t *testing.T) {
 
 func TestGetSessionInfo(t *testing.T) {
 	mockConn := &MockConnection{EnableLogging: false}
-	protocol, err := communication.NewAudioProtocol(mockConn)
+	protocol, err := communication.NewAudioProtocol(mockConn, sharedSessionKey)
 	if err != nil {
 		t.Fatalf("Échec de création du protocole : %v", err)
 	}
@@ -190,7 +212,7 @@ func TestGetSessionInfo(t *testing.T) {
 
 func TestStopCallWithoutActiveCall(t *testing.T) {
 	mockConn := &MockConnection{EnableLogging: false}
-	protocol, err := communication.NewAudioProtocol(mockConn)
+	protocol, err := communication.NewAudioProtocol(mockConn, sharedSessionKey)
 	if err != nil {
 		t.Fatalf("Échec de création du protocole : %v", err)
 	}
@@ -203,7 +225,7 @@ func TestStopCallWithoutActiveCall(t *testing.T) {
 
 func TestConcurrentAccess(t *testing.T) {
 	mockConn := &MockConnection{EnableLogging: false}
-	protocol, err := communication.NewAudioProtocol(mockConn)
+	protocol, err := communication.NewAudioProtocol(mockConn, sharedSessionKey)
 	if err != nil {
 		t.Fatalf("Échec de création du protocole : %v", err)
 	}
@@ -256,7 +278,7 @@ func BenchmarkNewAudioProtocol(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		protocol, err := communication.NewAudioProtocol(mockConn)
+		protocol, err := communication.NewAudioProtocol(mockConn, sharedSessionKey)
 		if err != nil {
 			b.Fatalf("Échec de création du protocole : %v", err)
 		}
@@ -266,7 +288,7 @@ func BenchmarkNewAudioProtocol(b *testing.B) {
 
 func BenchmarkSendAudioData(b *testing.B) {
 	mockConn := &MockConnection{EnableLogging: false}
-	protocol, err := communication.NewAudioProtocol(mockConn)
+	protocol, err := communication.NewAudioProtocol(mockConn, sharedSessionKey)
 	if err != nil {
 		b.Fatalf("Échec de création du protocole : %v", err)
 	}

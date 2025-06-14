@@ -4,7 +4,6 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -13,7 +12,6 @@ import (
 	"time"
 
 	"github.com/callidos/protectora-rocher/pkg/utils"
-	"golang.org/x/crypto/hkdf"
 )
 
 // AudioProtocol représente le protocole de communication audio sécurisé
@@ -44,17 +42,20 @@ const (
 	KEY_SIZE       = 32
 )
 
-// NewAudioProtocol crée une nouvelle instance du protocole audio avec génération automatique de clés
-func NewAudioProtocol(conn io.ReadWriter) (*AudioProtocol, error) {
+// CORRECTION MAJEURE: NewAudioProtocol prend maintenant une clé de session existante
+// au lieu de générer sa propre clé indépendamment
+func NewAudioProtocol(conn io.ReadWriter, sharedSessionKey []byte) (*AudioProtocol, error) {
 	if conn == nil {
 		return nil, errors.New("connexion nulle")
 	}
 
-	// Génération automatique d'une clé de session sécurisée
-	sessionKey, err := generateSessionKey()
-	if err != nil {
-		return nil, fmt.Errorf("échec de génération de la clé de session : %v", err)
+	if len(sharedSessionKey) < 32 {
+		return nil, errors.New("clé de session insuffisante (minimum 32 bytes)")
 	}
+
+	// CORRECTION: Utiliser la clé de session partagée au lieu d'en générer une nouvelle
+	sessionKey := make([]byte, 32)
+	copy(sessionKey, sharedSessionKey[:32])
 
 	// Création du chiffrement AES-GCM
 	block, err := aes.NewCipher(sessionKey)
@@ -75,37 +76,15 @@ func NewAudioProtocol(conn io.ReadWriter) (*AudioProtocol, error) {
 		stopChannel: make(chan struct{}),
 	}
 
-	utils.Logger.Info("Protocole audio sécurisé initialisé", map[string]interface{}{
+	utils.Logger.Info("Protocole audio sécurisé initialisé avec clé partagée", map[string]interface{}{
 		"key_size": len(sessionKey),
 	})
 
 	return protocol, nil
 }
 
-// generateSessionKey génère une clé de session sécurisée de manière autonome
-func generateSessionKey() ([]byte, error) {
-	// Génération d'un salt aléatoire
-	salt := make([]byte, 32)
-	if _, err := rand.Read(salt); err != nil {
-		return nil, err
-	}
-
-	// Génération d'un secret initial aléatoire
-	secret := make([]byte, 32)
-	if _, err := rand.Read(secret); err != nil {
-		return nil, err
-	}
-
-	// Utilisation de HKDF pour dériver une clé robuste
-	hkdf := hkdf.New(sha256.New, secret, salt, []byte("protectora-rocher-audio-v1"))
-
-	key := make([]byte, KEY_SIZE)
-	if _, err := io.ReadFull(hkdf, key); err != nil {
-		return nil, err
-	}
-
-	return key, nil
-}
+// CORRECTION: Fonction supprimée car remplacée par l'utilisation de clés partagées
+// generateSessionKey() n'est plus nécessaire
 
 // StartSecureCall démarre un appel audio sécurisé
 func (ap *AudioProtocol) StartSecureCall() error {
