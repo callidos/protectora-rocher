@@ -2,140 +2,301 @@ package communication
 
 import (
 	"crypto/ed25519"
+	"errors"
 	"fmt"
 	"io"
+	"sync"
+	"time"
 )
 
-// Session représente une connexion sécurisée…
+var (
+	ErrSessionNotInitialized = errors.New("session not initialized")
+	ErrHandshakeFailed       = errors.New("handshake failed")
+	ErrRatchetNotReady       = errors.New("ratchet not ready")
+	ErrConnectionClosed      = errors.New("connection closed")
+)
+
+// Session représente une connexion sécurisée avec double ratchet
 type Session struct {
-	Conn    io.ReadWriter
-	Ratchet *DoubleRatchet
-	// … autres champs éventuels
+	conn       io.ReadWriter
+	ratchet    *DoubleRatchet
+	sessionKey [32]byte
+	isClient   bool
+	isActive   bool
+	mutex      sync.RWMutex
+
+	// Compteurs de messages
+	sendSeq uint64
+	recvSeq uint64
 }
 
-// NewClientSessionWithHandshake réalise le handshake côté client et initialise le double ratchet.
-func NewClientSessionWithHandshake(conn io.ReadWriter, privKey ed25519.PrivateKey, serverPubKey ed25519.PublicKey) (*Session, error) {
-	handshakeChan, err := ClientPerformKeyExchange(conn, privKey, serverPubKey)
-	if err != nil {
-		return nil, fmt.Errorf("client handshake error: %w", err)
-	}
-	result := <-handshakeChan
-	if result.Err != nil {
-		return nil, fmt.Errorf("client handshake error: %w", result.Err)
-	}
-	sessionKey := result.Key[:]
+// SessionConfig configuration pour une session
+type SessionConfig struct {
+	IsClient bool
+	Timeout  time.Duration
+}
 
+// NewSession crée une nouvelle session avec handshake
+func NewSession(conn io.ReadWriter, privKey ed25519.PrivateKey, remotePubKey ed25519.PublicKey, config SessionConfig) (*Session, error) {
+	if config.Timeout == 0 {
+		config.Timeout = 30 * time.Second
+	}
+
+	session := &Session{
+		conn:     conn,
+		isClient: config.IsClient,
+		isActive: false,
+	}
+
+	// Effectuer le handshake
+	if err := session.performHandshake(privKey, remotePubKey, config.Timeout); err != nil {
+		return nil, fmt.Errorf("handshake failed: %w", err)
+	}
+
+	// Initialiser le double ratchet
+	if err := session.initializeRatchet(); err != nil {
+		return nil, fmt.Errorf("ratchet initialization failed: %w", err)
+	}
+
+	session.isActive = true
+	return session, nil
+}
+
+// performHandshake effectue l'échange de clés initial
+func (s *Session) performHandshake(privKey ed25519.PrivateKey, remotePubKey ed25519.PublicKey, timeout time.Duration) error {
+	resultChan := make(chan KeyExchangeResult, 1)
+	var err error
+
+	// Lancer l'échange de clés selon le rôle
+	if s.isClient {
+		var clientChan <-chan KeyExchangeResult
+		clientChan, err = ClientPerformKeyExchange(s.conn, privKey, remotePubKey)
+		if err != nil {
+			return err
+		}
+
+		go func() {
+			result := <-clientChan
+			resultChan <- result
+		}()
+	} else {
+		var serverChan <-chan KeyExchangeResult
+		serverChan, err = ServerPerformKeyExchange(s.conn, privKey, remotePubKey)
+		if err != nil {
+			return err
+		}
+
+		go func() {
+			result := <-serverChan
+			resultChan <- result
+		}()
+	}
+
+	// Attendre le résultat avec timeout
+	select {
+	case result := <-resultChan:
+		if result.Err != nil {
+			return result.Err
+		}
+		s.sessionKey = result.Key
+		return nil
+	case <-time.After(timeout):
+		return errors.New("handshake timeout")
+	}
+}
+
+// initializeRatchet initialise le double ratchet après le handshake
+func (s *Session) initializeRatchet() error {
+	// Générer nos clés DH
 	ourDH, err := GenerateDHKeyPair()
 	if err != nil {
-		return nil, fmt.Errorf("client DH key generation error: %w", err)
+		return err
 	}
 
-	if err := sendBytes(conn, ourDH.Public[:]); err != nil {
-		return nil, fmt.Errorf("client error sending DH public key: %w", err)
+	var remoteDH [32]byte
+
+	if s.isClient {
+		// Client: envoie sa clé publique DH puis reçoit celle du serveur
+		if err := sendBytes(s.conn, ourDH.Public[:]); err != nil {
+			return fmt.Errorf("failed to send DH public key: %w", err)
+		}
+
+		remoteBytes, err := receiveBytes(s.conn)
+		if err != nil {
+			return fmt.Errorf("failed to receive server DH key: %w", err)
+		}
+
+		if len(remoteBytes) != 32 {
+			return errors.New("invalid server DH key size")
+		}
+		copy(remoteDH[:], remoteBytes)
+	} else {
+		// Serveur: reçoit la clé du client puis envoie la sienne
+		clientBytes, err := receiveBytes(s.conn)
+		if err != nil {
+			return fmt.Errorf("failed to receive client DH key: %w", err)
+		}
+
+		if len(clientBytes) != 32 {
+			return errors.New("invalid client DH key size")
+		}
+		copy(remoteDH[:], clientBytes)
+
+		if err := sendBytes(s.conn, ourDH.Public[:]); err != nil {
+			return fmt.Errorf("failed to send DH public key: %w", err)
+		}
 	}
 
-	remoteBytes, err := receiveBytes(conn)
+	// Initialiser le double ratchet
+	s.ratchet, err = InitializeDoubleRatchet(s.sessionKey[:], ourDH, remoteDH)
 	if err != nil {
-		return nil, fmt.Errorf("client error receiving remote DH public key: %w", err)
+		return err
 	}
-	if len(remoteBytes) != 32 {
-		return nil, fmt.Errorf("invalid remote DH public key size")
-	}
-	var remotePub [32]byte
-	copy(remotePub[:], remoteBytes)
 
-	dr, err := InitializeDoubleRatchet(sessionKey, ourDH, remotePub)
-	if err != nil {
-		return nil, fmt.Errorf("client error initializing double ratchet: %w", err)
-	}
-	dr.IsServer = false
-
-	return &Session{Conn: conn, Ratchet: dr}, nil
+	s.ratchet.isServer = !s.isClient
+	return nil
 }
 
-// NewServerSessionWithHandshake réalise le handshake côté serveur et initialise le double ratchet.
-func NewServerSessionWithHandshake(conn io.ReadWriter, privKey ed25519.PrivateKey, clientPubKey ed25519.PublicKey) (*Session, error) {
-	handshakeChan, err := ServerPerformKeyExchange(conn, privKey, clientPubKey)
+// SendMessage envoie un message sécurisé via le double ratchet
+func (s *Session) SendMessage(message string) error {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
+	if !s.isActive {
+		return ErrSessionNotInitialized
+	}
+
+	// Générer une clé de message via le ratchet
+	messageKey, err := s.ratchet.RatchetEncrypt()
 	if err != nil {
-		return nil, fmt.Errorf("server handshake error: %w", err)
-	}
-	result := <-handshakeChan
-	if result.Err != nil {
-		return nil, fmt.Errorf("server handshake error: %w", result.Err)
-	}
-	sessionKey := result.Key[:]
-
-	clientPubBytes, err := receiveBytes(conn)
-	if err != nil {
-		return nil, fmt.Errorf("server error receiving client DH public key: %w", err)
-	}
-	if len(clientPubBytes) != 32 {
-		return nil, fmt.Errorf("invalid client DH public key size")
-	}
-	var clientPub [32]byte
-	copy(clientPub[:], clientPubBytes)
-
-	ourDH, err := GenerateDHKeyPair()
-	if err != nil {
-		return nil, fmt.Errorf("server DH key generation error: %w", err)
-	}
-	if err := sendBytes(conn, ourDH.Public[:]); err != nil {
-		return nil, fmt.Errorf("server error sending DH public key: %w", err)
+		return fmt.Errorf("ratchet encrypt failed: %w", err)
 	}
 
-	dr, err := InitializeDoubleRatchet(sessionKey, ourDH, clientPub)
-	if err != nil {
-		return nil, fmt.Errorf("server error initializing double ratchet: %w", err)
-	}
-	// CORRECTION: Utiliser les paramètres appropriés selon le rôle
-	dr.IsServer = true
-
-	return &Session{Conn: conn, Ratchet: dr}, nil
-}
-
-// SendSecureMessage utilise désormais le double ratchet pour le chiffrement
-func (s *Session) SendSecureMessage(message string, seq uint64, duration int) error {
-	// CORRECTION: Utiliser le double ratchet au lieu du protocole simple
-	messageKey, err := s.Ratchet.RatchetEncrypt()
-	if err != nil {
-		return fmt.Errorf("ratchet encrypt error: %w", err)
-	}
-
+	// Chiffrer le message
 	encrypted, err := EncryptAESGCM([]byte(message), messageKey)
 	if err != nil {
-		return fmt.Errorf("encryption error: %w", err)
+		return fmt.Errorf("encryption failed: %w", err)
 	}
 
-	// Envoyer le message chiffré directement
-	_, err = s.Conn.Write([]byte(encrypted + "\n"))
-	return err
+	// Envoyer le message chiffré avec séquence
+	s.sendSeq++
+	return SendMessage(s.conn, encrypted, s.sessionKey[:], s.sendSeq, 0)
 }
 
-// ReceiveSecureMessage lit et traite un message chiffré via le double ratchet
-func (s *Session) ReceiveSecureMessage() (string, error) {
-	// CORRECTION: Utiliser le double ratchet pour le déchiffrement
-	messageKey, err := s.Ratchet.RatchetDecrypt()
-	if err != nil {
-		return "", fmt.Errorf("ratchet decrypt error: %w", err)
+// ReceiveMessage reçoit et déchiffre un message
+func (s *Session) ReceiveMessage() (string, error) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
+	if !s.isActive {
+		return "", ErrSessionNotInitialized
 	}
 
-	// Lire le message depuis la connexion
-	buffer := make([]byte, 4096)
-	n, err := s.Conn.Read(buffer)
+	// Recevoir le message chiffré
+	encryptedMessage, err := ReceiveMessage(s.conn, s.sessionKey[:])
 	if err != nil {
-		return "", fmt.Errorf("read error: %w", err)
+		return "", fmt.Errorf("receive failed: %w", err)
 	}
 
-	// Déchiffrer avec la clé dérivée du ratchet
-	decrypted, err := DecryptAESGCM(string(buffer[:n-1]), messageKey) // -1 pour retirer le \n
+	// Générer la clé de message via le ratchet
+	messageKey, err := s.ratchet.RatchetDecrypt()
 	if err != nil {
-		return "", fmt.Errorf("decryption error: %w", err)
+		return "", fmt.Errorf("ratchet decrypt failed: %w", err)
 	}
 
+	// Déchiffrer le message
+	decrypted, err := DecryptAESGCM(encryptedMessage, messageKey)
+	if err != nil {
+		return "", fmt.Errorf("decryption failed: %w", err)
+	}
+
+	s.recvSeq++
 	return string(decrypted), nil
 }
 
-// ResetSecurityState réinitialise l'anti‐rejeu global
+// Close ferme la session proprement
+func (s *Session) Close() error {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
+	if !s.isActive {
+		return nil
+	}
+
+	s.isActive = false
+
+	// Nettoyage sécurisé
+	if s.ratchet != nil {
+		s.ratchet.Reset()
+	}
+	secureZero(s.sessionKey[:])
+
+	// Fermer la connexion si possible
+	if closer, ok := s.conn.(io.Closer); ok {
+		return closer.Close()
+	}
+
+	return nil
+}
+
+// IsActive retourne l'état de la session
+func (s *Session) IsActive() bool {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+	return s.isActive
+}
+
+// GetStats retourne les statistiques de la session
+func (s *Session) GetStats() map[string]interface{} {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+
+	stats := map[string]interface{}{
+		"is_active":  s.isActive,
+		"is_client":  s.isClient,
+		"send_count": s.sendSeq,
+		"recv_count": s.recvSeq,
+	}
+
+	if s.ratchet != nil {
+		stats["ratchet_send_num"] = s.ratchet.sendMsgNum
+		stats["ratchet_recv_num"] = s.ratchet.recvMsgNum
+	}
+
+	return stats
+}
+
+// Fonctions de convenance pour la rétrocompatibilité
+
+// NewClientSessionWithHandshake crée une session client
+func NewClientSessionWithHandshake(conn io.ReadWriter, privKey ed25519.PrivateKey, serverPubKey ed25519.PublicKey) (*Session, error) {
+	config := SessionConfig{
+		IsClient: true,
+		Timeout:  30 * time.Second,
+	}
+	return NewSession(conn, privKey, serverPubKey, config)
+}
+
+// NewServerSessionWithHandshake crée une session serveur
+func NewServerSessionWithHandshake(conn io.ReadWriter, privKey ed25519.PrivateKey, clientPubKey ed25519.PublicKey) (*Session, error) {
+	config := SessionConfig{
+		IsClient: false,
+		Timeout:  30 * time.Second,
+	}
+	return NewSession(conn, privKey, clientPubKey, config)
+}
+
+// SendSecureMessage méthode de compatibilité
+func (s *Session) SendSecureMessage(message string, seq uint64, duration int) error {
+	return s.SendMessage(message)
+}
+
+// ReceiveSecureMessage méthode de compatibilité
+func (s *Session) ReceiveSecureMessage() (string, error) {
+	return s.ReceiveMessage()
+}
+
+// ResetSecurityState réinitialise l'état de sécurité global
 func ResetSecurityState() {
 	ResetMessageHistory()
 }

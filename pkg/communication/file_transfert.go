@@ -1,296 +1,628 @@
 package communication
 
 import (
-	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
-	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"os"
-
-	"golang.org/x/crypto/sha3"
+	"sync"
+	"time"
 )
 
-func EncryptFile(inputPath, outputPath string, key []byte) error {
-	inputFile, err := os.Open(inputPath)
-	if err != nil {
-		return fmt.Errorf("erreur ouverture fichier source: %w", err)
-	}
-	defer inputFile.Close()
+const (
+	fileBufferSize = 64 * 1024 // 64KB chunks
+	nonceSize      = 12
+	hashSize       = 32
+	maxFileSize    = 100 * 1024 * 1024 // 100MB limite pour éviter les attaques DoS
+	fileTimeout    = 30 * time.Second  // AJOUT: Timeout pour les opérations de fichier
+)
 
-	outputFile, err := os.Create(outputPath)
-	if err != nil {
-		return fmt.Errorf("erreur création fichier chiffré: %w", err)
+// Erreurs spécifiques au transfert de fichiers
+var (
+	ErrEncryptionFailed = errors.New("encryption failed")
+	ErrDecryptionFailed = errors.New("decryption failed")
+	ErrFileTooLarge     = errors.New("file too large")
+	ErrFileTimeout      = errors.New("file operation timeout") // AJOUT: Erreur de timeout
+)
+
+// FileEncryptor gère le chiffrement de fichiers de manière thread-safe
+type FileEncryptor struct {
+	aesGCM cipher.AEAD
+	hasher hash.Hash
+	mu     sync.Mutex // Protection pour l'utilisation du hasher
+}
+
+// NewFileEncryptor crée un nouvel encrypteur de fichiers avec validation renforcée
+func NewFileEncryptor(key []byte) (*FileEncryptor, error) {
+	if len(key) < 32 {
+		return nil, ErrInvalidKey
 	}
-	defer outputFile.Close()
+
+	// CORRECTION: Validation plus stricte de la clé
+	if len(key) < 32 {
+		return nil, fmt.Errorf("key too short: need 32 bytes, got %d", len(key))
+	}
 
 	block, err := aes.NewCipher(key[:32])
 	if err != nil {
-		return fmt.Errorf("erreur initialisation AES: %w", err)
+		return nil, fmt.Errorf("AES cipher creation failed: %w", err)
 	}
+
 	aesGCM, err := cipher.NewGCM(block)
 	if err != nil {
-		return fmt.Errorf("erreur initialisation GCM: %w", err)
+		return nil, fmt.Errorf("GCM mode initialization failed: %w", err)
 	}
 
-	// Préparation du HMAC
-	hmacHash := hmac.New(sha3.New256, key[32:])
+	return &FileEncryptor{
+		aesGCM: aesGCM,
+		hasher: sha256.New(),
+	}, nil
+}
 
-	buffer := make([]byte, bufferSize)
+// EncryptFile chiffre un fichier avec AES-GCM et validation d'intégrité
+func (fe *FileEncryptor) EncryptFile(inputPath, outputPath string) error {
+	return fe.encryptFileWithTimeout(inputPath, outputPath, fileTimeout)
+}
+
+// encryptFileWithTimeout chiffre un fichier avec timeout configurable
+func (fe *FileEncryptor) encryptFileWithTimeout(inputPath, outputPath string, timeout time.Duration) error {
+	// Ouverture et validation du fichier source
+	inputFile, err := os.Open(inputPath)
+	if err != nil {
+		return ErrFileNotFound
+	}
+	defer inputFile.Close()
+
+	// Vérification de la taille du fichier pour éviter les attaques DoS
+	stat, err := inputFile.Stat()
+	if err != nil {
+		return fmt.Errorf("failed to get file stats: %w", err)
+	}
+
+	if stat.Size() > maxFileSize {
+		return ErrFileTooLarge
+	}
+
+	// CORRECTION: Vérification que le fichier n'est pas vide
+	if stat.Size() == 0 {
+		return fmt.Errorf("cannot encrypt empty file")
+	}
+
+	// Création du fichier de sortie avec permissions restrictives
+	outputFile, err := os.OpenFile(outputPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	if err != nil {
+		return ErrFileCreation
+	}
+	defer func() {
+		outputFile.Close()
+		// En cas d'erreur, supprimer le fichier partiellement créé
+		if err != nil {
+			os.Remove(outputPath)
+		}
+	}()
+
+	// Canal pour gérer le timeout
+	done := make(chan error, 1)
+	go func() {
+		done <- fe.performEncryption(inputFile, outputFile)
+	}()
+
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(timeout):
+		return ErrFileTimeout
+	}
+}
+
+// performEncryption effectue le chiffrement réel
+func (fe *FileEncryptor) performEncryption(inputFile *os.File, outputFile *os.File) error {
+	// Protection thread-safe pour le hasher
+	fe.mu.Lock()
+	fe.hasher.Reset()
+	fe.mu.Unlock()
+
+	buffer := make([]byte, fileBufferSize)
+	var totalProcessed int64
+
 	for {
-		n, err := inputFile.Read(buffer)
-		if err != nil && !errors.Is(err, io.EOF) {
-			return fmt.Errorf("erreur lecture fichier: %w", err)
+		n, readErr := inputFile.Read(buffer)
+		if readErr != nil && readErr != io.EOF {
+			return fmt.Errorf("read error: %w", readErr)
 		}
 		if n == 0 {
 			break
 		}
 
-		// Générer un nonce pour chaque bloc
-		nonce := make([]byte, aesGCM.NonceSize())
-		if _, err := rand.Read(nonce); err != nil {
-			return fmt.Errorf("erreur génération nonce: %w", err)
+		totalProcessed += int64(n)
+		if totalProcessed > maxFileSize {
+			return ErrFileTooLarge
 		}
 
-		// Chiffrement du bloc
-		encryptedBlock := aesGCM.Seal(nil, nonce, buffer[:n], nil)
-
-		// Combiner nonce + données chiffrées
-		combined := append(nonce, encryptedBlock...)
-
-		// Mise à jour du HMAC
-		hmacHash.Write(combined)
-
-		// Écrire la taille du bloc
-		blockSize := make([]byte, 4)
-		binary.BigEndian.PutUint32(blockSize, uint32(len(combined)))
-		if _, err := outputFile.Write(blockSize); err != nil {
-			return fmt.Errorf("erreur écriture taille bloc: %w", err)
+		// Chiffrement du chunk
+		encryptedChunk, err := fe.encryptChunk(buffer[:n])
+		if err != nil {
+			return err
 		}
 
-		// Écrire le bloc nonce + données chiffrées
-		if _, err := outputFile.Write(combined); err != nil {
-			return fmt.Errorf("erreur écriture bloc chiffré: %w", err)
+		// Mise à jour du hash global de manière thread-safe
+		fe.mu.Lock()
+		fe.hasher.Write(encryptedChunk)
+		fe.mu.Unlock()
+
+		// Écriture de la taille du chunk
+		if err := binary.Write(outputFile, binary.BigEndian, uint32(len(encryptedChunk))); err != nil {
+			return fmt.Errorf("write size error: %w", err)
+		}
+
+		// Écriture du chunk chiffré
+		if _, err := outputFile.Write(encryptedChunk); err != nil {
+			return fmt.Errorf("write chunk error: %w", err)
 		}
 	}
 
-	// Écrire le HMAC final
-	hmacSum := hmacHash.Sum(nil)
-	if _, err := outputFile.Write(hmacSum); err != nil {
-		return fmt.Errorf("erreur écriture HMAC: %w", err)
+	// Écriture du hash final pour l'intégrité du fichier
+	fe.mu.Lock()
+	finalHash := fe.hasher.Sum(nil)
+	fe.mu.Unlock()
+
+	if _, err := outputFile.Write(finalHash); err != nil {
+		return fmt.Errorf("write hash error: %w", err)
 	}
 
 	return nil
 }
 
-func DecryptFile(inputPath, outputPath string, key []byte) error {
+// DecryptFile déchiffre un fichier avec vérification d'intégrité
+func (fe *FileEncryptor) DecryptFile(inputPath, outputPath string) error {
+	return fe.decryptFileWithTimeout(inputPath, outputPath, fileTimeout)
+}
+
+// decryptFileWithTimeout déchiffre un fichier avec timeout configurable
+func (fe *FileEncryptor) decryptFileWithTimeout(inputPath, outputPath string, timeout time.Duration) error {
+	// Ouverture du fichier chiffré
 	inputFile, err := os.Open(inputPath)
 	if err != nil {
-		return fmt.Errorf("erreur ouverture fichier chiffré: %w", err)
+		return ErrFileNotFound
 	}
 	defer inputFile.Close()
 
-	outputFile, err := os.Create(outputPath)
+	// Vérification de la taille du fichier
+	stat, err := inputFile.Stat()
 	if err != nil {
-		return fmt.Errorf("erreur création fichier déchiffré: %w", err)
-	}
-	defer outputFile.Close()
-
-	block, err := aes.NewCipher(key[:32])
-	if err != nil {
-		return fmt.Errorf("erreur initialisation AES: %w", err)
-	}
-	aesGCM, err := cipher.NewGCM(block)
-	if err != nil {
-		return fmt.Errorf("erreur initialisation GCM: %w", err)
+		return fmt.Errorf("failed to get file stats: %w", err)
 	}
 
-	// Lire tout le contenu du fichier
+	if stat.Size() > maxFileSize*2 { // Marge pour les métadonnées de chiffrement
+		return ErrFileTooLarge
+	}
+
+	// CORRECTION: Vérification de la taille minimale
+	if stat.Size() < hashSize+nonceSize+16 { // Hash + nonce + tag GCM minimum
+		return ErrCorruptedFile
+	}
+
+	// Création du fichier de sortie avec permissions restrictives
+	outputFile, err := os.OpenFile(outputPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	if err != nil {
+		return ErrFileCreation
+	}
+	defer func() {
+		outputFile.Close()
+		// En cas d'erreur, supprimer le fichier partiellement créé
+		if err != nil {
+			os.Remove(outputPath)
+		}
+	}()
+
+	// Canal pour gérer le timeout
+	done := make(chan error, 1)
+	go func() {
+		done <- fe.performDecryption(inputFile, outputFile)
+	}()
+
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(timeout):
+		return ErrFileTimeout
+	}
+}
+
+// performDecryption effectue le déchiffrement réel
+func (fe *FileEncryptor) performDecryption(inputFile *os.File, outputFile *os.File) error {
+	// Lecture de tout le contenu pour vérifier le hash
 	fileData, err := io.ReadAll(inputFile)
 	if err != nil {
-		return fmt.Errorf("erreur lecture données du fichier: %w", err)
+		return fmt.Errorf("read file error: %w", err)
 	}
 
-	// Extraire le HMAC (32 octets en fin de fichier)
-	hmacSize := 32
-	if len(fileData) < hmacSize {
-		return fmt.Errorf("fichier trop court pour contenir HMAC")
+	// Extraction du hash final
+	if len(fileData) < hashSize {
+		return ErrCorruptedFile
 	}
-	hmacData := fileData[len(fileData)-hmacSize:]
-	encryptedData := fileData[:len(fileData)-hmacSize]
 
-	// Calcul du HMAC sur tous les blocs
-	hmacHash := hmac.New(sha3.New256, key[32:])
-	reader := bytes.NewReader(encryptedData)
+	expectedHash := fileData[len(fileData)-hashSize:]
+	encryptedData := fileData[:len(fileData)-hashSize]
 
-	for {
-		// Lecture de la taille du bloc
-		blockSizeBytes := make([]byte, 4)
-		_, err := io.ReadFull(reader, blockSizeBytes)
-		if err == io.EOF {
+	// Vérification de l'intégrité globale de manière thread-safe
+	fe.mu.Lock()
+	fe.hasher.Reset()
+	fe.hasher.Write(encryptedData)
+	computedHash := fe.hasher.Sum(nil)
+	fe.mu.Unlock()
+
+	// Utilisation de ConstantTimeCompare pour éviter les attaques de timing
+	if subtle.ConstantTimeCompare(expectedHash, computedHash) != 1 {
+		// Nettoyage sécurisé des données sensibles
+		secureZero(fileData)
+		return ErrCorruptedFile
+	}
+
+	// Déchiffrement chunk par chunk
+	offset := 0
+	for offset < len(encryptedData) {
+		// Lecture de la taille du chunk
+		if offset+4 > len(encryptedData) {
 			break
 		}
+
+		chunkSize := binary.BigEndian.Uint32(encryptedData[offset : offset+4])
+		offset += 4
+
+		// Validation de la taille du chunk pour éviter les attaques
+		if chunkSize > fileBufferSize*2 || offset+int(chunkSize) > len(encryptedData) {
+			secureZero(fileData)
+			return ErrCorruptedFile
+		}
+
+		// Déchiffrement du chunk
+		encryptedChunk := encryptedData[offset : offset+int(chunkSize)]
+		decryptedChunk, err := fe.decryptChunk(encryptedChunk)
 		if err != nil {
-			return fmt.Errorf("erreur lecture taille bloc: %w", err)
+			secureZero(fileData)
+			return err
 		}
 
-		size := binary.BigEndian.Uint32(blockSizeBytes)
-		if size == 0 {
-			return fmt.Errorf("taille de bloc invalide (0)")
+		// Écriture du chunk déchiffré
+		if _, err := outputFile.Write(decryptedChunk); err != nil {
+			secureZero(fileData)
+			secureZero(decryptedChunk)
+			return fmt.Errorf("write decrypted error: %w", err)
 		}
 
-		// Lecture du bloc (nonce + données chiffrées)
-		chunk := make([]byte, size)
-		if _, err := io.ReadFull(reader, chunk); err != nil {
-			return fmt.Errorf("erreur lecture bloc chiffré: %w", err)
-		}
-
-		// Mise à jour du HMAC
-		hmacHash.Write(chunk)
-
-		// Séparation du nonce et du ciphertext
-		nonceSize := aesGCM.NonceSize()
-		if len(chunk) < nonceSize {
-			return fmt.Errorf("bloc trop court pour contenir le nonce")
-		}
-		nonce := chunk[:nonceSize]
-		encryptedBlock := chunk[nonceSize:]
-
-		// Déchiffrement
-		decryptedBlock, err := aesGCM.Open(nil, nonce, encryptedBlock, nil)
-		if err != nil {
-			return fmt.Errorf("erreur déchiffrement: %w", err)
-		}
-
-		// Écriture des données déchiffrées
-		if _, err := outputFile.Write(decryptedBlock); err != nil {
-			return fmt.Errorf("erreur écriture données déchiffrées: %w", err)
-		}
+		// Nettoyage sécurisé du chunk déchiffré
+		secureZero(decryptedChunk)
+		offset += int(chunkSize)
 	}
 
-	// Vérification du HMAC final
-	expectedHMAC := hmacHash.Sum(nil)
-	if !hmac.Equal(expectedHMAC, hmacData) {
-		return fmt.Errorf("HMAC invalide : fichier corrompu ou altéré")
-	}
-
+	// Nettoyage sécurisé des données
+	secureZero(fileData)
 	return nil
 }
 
+// encryptChunk chiffre un chunk de données
+func (fe *FileEncryptor) encryptChunk(data []byte) ([]byte, error) {
+	if len(data) == 0 {
+		return nil, errors.New("empty chunk")
+	}
+
+	nonce := make([]byte, fe.aesGCM.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, ErrEncryptionFailed
+	}
+
+	ciphertext := fe.aesGCM.Seal(nil, nonce, data, nil)
+
+	// Format: nonce + ciphertext
+	result := make([]byte, 0, len(nonce)+len(ciphertext))
+	result = append(result, nonce...)
+	result = append(result, ciphertext...)
+
+	return result, nil
+}
+
+// decryptChunk déchiffre un chunk de données
+func (fe *FileEncryptor) decryptChunk(encryptedData []byte) ([]byte, error) {
+	if len(encryptedData) < fe.aesGCM.NonceSize() {
+		return nil, ErrDecryptionFailed
+	}
+
+	nonce := encryptedData[:fe.aesGCM.NonceSize()]
+	ciphertext := encryptedData[fe.aesGCM.NonceSize():]
+
+	plaintext, err := fe.aesGCM.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		return nil, ErrDecryptionFailed
+	}
+
+	return plaintext, nil
+}
+
+// Fonctions de commodité pour la rétrocompatibilité
+
+// EncryptFile fonction globale pour chiffrer un fichier
+func EncryptFile(inputPath, outputPath string, key []byte) error {
+	encryptor, err := NewFileEncryptor(key)
+	if err != nil {
+		return err
+	}
+	return encryptor.EncryptFile(inputPath, outputPath)
+}
+
+// DecryptFile fonction globale pour déchiffrer un fichier
+func DecryptFile(inputPath, outputPath string, key []byte) error {
+	encryptor, err := NewFileEncryptor(key)
+	if err != nil {
+		return err
+	}
+	return encryptor.DecryptFile(inputPath, outputPath)
+}
+
+// SecureFileTransfer transmet un fichier chiffré via un writer avec timeout
 func SecureFileTransfer(writer io.Writer, filePath string, key []byte) error {
+	return SecureFileTransferWithTimeout(writer, filePath, key, fileTimeout)
+}
+
+// SecureFileTransferWithTimeout transmet un fichier chiffré via un writer avec timeout configurable
+func SecureFileTransferWithTimeout(writer io.Writer, filePath string, key []byte, timeout time.Duration) error {
+	if writer == nil {
+		return errors.New("writer cannot be nil")
+	}
+
+	encryptor, err := NewFileEncryptor(key)
+	if err != nil {
+		return err
+	}
+
 	file, err := os.Open(filePath)
 	if err != nil {
-		return fmt.Errorf("erreur ouverture fichier: %w", err)
+		return ErrFileNotFound
 	}
 	defer file.Close()
 
-	block, err := aes.NewCipher(key[:32])
+	// Vérification de la taille du fichier
+	stat, err := file.Stat()
 	if err != nil {
-		return fmt.Errorf("erreur initialisation AES: %w", err)
-	}
-	aesGCM, err := cipher.NewGCM(block)
-	if err != nil {
-		return fmt.Errorf("erreur initialisation GCM: %w", err)
+		return fmt.Errorf("failed to get file stats: %w", err)
 	}
 
-	buffer := make([]byte, 4096)
+	if stat.Size() > maxFileSize {
+		return ErrFileTooLarge
+	}
+
+	// Canal pour gérer le timeout
+	done := make(chan error, 1)
+	go func() {
+		done <- encryptor.performFileTransfer(file, writer)
+	}()
+
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(timeout):
+		return ErrFileTimeout
+	}
+}
+
+// performFileTransfer effectue le transfert réel
+func (fe *FileEncryptor) performFileTransfer(file *os.File, writer io.Writer) error {
+	buffer := make([]byte, fileBufferSize)
+	var totalProcessed int64
+
 	for {
-		n, err := file.Read(buffer)
-		if err != nil && err != io.EOF {
-			return fmt.Errorf("erreur lecture fichier: %w", err)
+		n, readErr := file.Read(buffer)
+		if readErr != nil && readErr != io.EOF {
+			return fmt.Errorf("read error: %w", readErr)
 		}
 		if n == 0 {
 			break
 		}
 
-		// Générer un nonce pour chaque bloc
-		nonce := make([]byte, aesGCM.NonceSize())
-		if _, err := rand.Read(nonce); err != nil {
-			return fmt.Errorf("erreur génération nonce: %w", err)
+		totalProcessed += int64(n)
+		if totalProcessed > maxFileSize {
+			return ErrFileTooLarge
 		}
 
-		// Chiffrement du bloc
-		encrypted := aesGCM.Seal(nil, nonce, buffer[:n], nil)
-
-		// Combinaison nonce + données chiffrées
-		combined := append(nonce, encrypted...)
-
-		// Écriture de la taille du bloc
-		blockSize := make([]byte, 4)
-		binary.BigEndian.PutUint32(blockSize, uint32(len(combined)))
-		if _, err := writer.Write(blockSize); err != nil {
-			return fmt.Errorf("erreur écriture taille bloc: %w", err)
+		// Chiffrement du chunk
+		encryptedChunk, err := fe.encryptChunk(buffer[:n])
+		if err != nil {
+			return err
 		}
 
-		// Écriture du bloc
-		if _, err := writer.Write(combined); err != nil {
-			return fmt.Errorf("erreur écriture bloc chiffré: %w", err)
+		// Envoi de la taille du chunk
+		if err := binary.Write(writer, binary.BigEndian, uint32(len(encryptedChunk))); err != nil {
+			return fmt.Errorf("write size error: %w", err)
 		}
+
+		// Envoi du chunk chiffré
+		if _, err := writer.Write(encryptedChunk); err != nil {
+			return fmt.Errorf("write chunk error: %w", err)
+		}
+
+		// Nettoyage sécurisé du chunk chiffré
+		secureZero(encryptedChunk)
 	}
 
 	return nil
 }
 
+// ReceiveSecureFile reçoit et déchiffre un fichier depuis un reader avec timeout
 func ReceiveSecureFile(reader io.Reader, outputPath string, key []byte) error {
-	file, err := os.Create(outputPath)
-	if err != nil {
-		return fmt.Errorf("erreur création fichier: %w", err)
-	}
-	defer file.Close()
+	return ReceiveSecureFileWithTimeout(reader, outputPath, key, fileTimeout)
+}
 
-	block, err := aes.NewCipher(key[:32])
-	if err != nil {
-		return fmt.Errorf("erreur initialisation AES: %w", err)
+// ReceiveSecureFileWithTimeout reçoit et déchiffre un fichier depuis un reader avec timeout configurable
+func ReceiveSecureFileWithTimeout(reader io.Reader, outputPath string, key []byte, timeout time.Duration) error {
+	if reader == nil {
+		return errors.New("reader cannot be nil")
 	}
-	aesGCM, err := cipher.NewGCM(block)
+
+	encryptor, err := NewFileEncryptor(key)
 	if err != nil {
-		return fmt.Errorf("erreur initialisation GCM: %w", err)
+		return err
 	}
+
+	file, err := os.OpenFile(outputPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	if err != nil {
+		return ErrFileCreation
+	}
+	defer func() {
+		file.Close()
+		// En cas d'erreur, supprimer le fichier partiellement créé
+		if err != nil {
+			os.Remove(outputPath)
+		}
+	}()
+
+	// Canal pour gérer le timeout
+	done := make(chan error, 1)
+	go func() {
+		done <- encryptor.performFileReception(reader, file)
+	}()
+
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(timeout):
+		return ErrFileTimeout
+	}
+}
+
+// performFileReception effectue la réception réelle
+func (fe *FileEncryptor) performFileReception(reader io.Reader, file *os.File) error {
+	var totalReceived int64
 
 	for {
-		// Lecture de la taille du bloc
-		blockSize := make([]byte, 4)
-		if _, err := io.ReadFull(reader, blockSize); err != nil {
+		// Lecture de la taille du chunk
+		var chunkSize uint32
+		if err := binary.Read(reader, binary.BigEndian, &chunkSize); err != nil {
 			if err == io.EOF {
 				break
 			}
-			return fmt.Errorf("erreur lecture taille bloc: %w", err)
+			return fmt.Errorf("read size error: %w", err)
 		}
 
-		size := binary.BigEndian.Uint32(blockSize)
-		if size == 0 {
-			return fmt.Errorf("taille de bloc invalide (0)")
+		// Validation de la taille du chunk pour éviter les attaques DoS
+		if chunkSize == 0 || chunkSize > fileBufferSize*2 {
+			return ErrCorruptedFile
 		}
 
-		// Lecture du bloc (nonce + données chiffrées)
-		combined := make([]byte, size)
-		if _, err := io.ReadFull(reader, combined); err != nil {
-			return fmt.Errorf("erreur lecture bloc chiffré: %w", err)
+		// Vérification que le total ne dépasse pas la limite
+		totalReceived += int64(chunkSize)
+		if totalReceived > maxFileSize*2 {
+			return ErrFileTooLarge
 		}
 
-		// Séparer le nonce et le ciphertext
-		nonceSize := aesGCM.NonceSize()
-		if len(combined) < nonceSize {
-			return fmt.Errorf("bloc trop court pour contenir le nonce")
+		// Lecture du chunk chiffré
+		encryptedChunk := make([]byte, chunkSize)
+		if _, err := io.ReadFull(reader, encryptedChunk); err != nil {
+			return fmt.Errorf("read chunk error: %w", err)
 		}
-		nonce := combined[:nonceSize]
-		encrypted := combined[nonceSize:]
 
-		// Déchiffrement
-		decrypted, err := aesGCM.Open(nil, nonce, encrypted, nil)
+		// Déchiffrement du chunk
+		decryptedChunk, err := fe.decryptChunk(encryptedChunk)
 		if err != nil {
-			return fmt.Errorf("erreur déchiffrement: %w", err)
+			secureZero(encryptedChunk)
+			return err
 		}
 
-		// Écriture des données déchiffrées
-		if _, err := file.Write(decrypted); err != nil {
-			return fmt.Errorf("erreur écriture données déchiffrées: %w", err)
+		// Écriture du chunk déchiffré
+		if _, err := file.Write(decryptedChunk); err != nil {
+			secureZero(encryptedChunk)
+			secureZero(decryptedChunk)
+			return fmt.Errorf("write decrypted error: %w", err)
 		}
+
+		// Nettoyage sécurisé des chunks
+		secureZero(encryptedChunk)
+		secureZero(decryptedChunk)
 	}
 
 	return nil
+}
+
+// ValidateEncryptedFile valide qu'un fichier est correctement chiffré
+func ValidateEncryptedFile(filePath string) error {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return ErrFileNotFound
+	}
+	defer file.Close()
+
+	stat, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("failed to get file stats: %w", err)
+	}
+
+	// Vérification basique de la taille
+	if stat.Size() < hashSize+nonceSize+16 { // hash + nonce minimum + tag GCM
+		return ErrCorruptedFile
+	}
+
+	// Lecture du début pour vérifier la structure
+	header := make([]byte, 8) // Taille d'un premier chunk
+	if _, err := file.Read(header); err != nil {
+		return fmt.Errorf("failed to read header: %w", err)
+	}
+
+	// Vérification que la première valeur ressemble à une taille de chunk valide
+	chunkSize := binary.BigEndian.Uint32(header[:4])
+	if chunkSize == 0 || chunkSize > fileBufferSize*2 {
+		return ErrCorruptedFile
+	}
+
+	return nil
+}
+
+// GetFileEncryptionOverhead retourne l'overhead du chiffrement pour un fichier
+func GetFileEncryptionOverhead(fileSize int64) int64 {
+	if fileSize == 0 {
+		return hashSize + nonceSize + 16 // Hash + nonce minimum + tag GCM
+	}
+
+	// Calcul approximatif : chunks + nonces + tags + hash final + tailles des chunks
+	numChunks := (fileSize + fileBufferSize - 1) / fileBufferSize
+	overhead := numChunks*(nonceSize+16+4) + hashSize // nonce + tag + taille par chunk + hash final
+
+	return overhead
+}
+
+// GetFileStats retourne les statistiques d'un fichier chiffré
+func GetFileStats(filePath string) map[string]interface{} {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return map[string]interface{}{
+			"error": err.Error(),
+		}
+	}
+	defer file.Close()
+
+	stat, err := file.Stat()
+	if err != nil {
+		return map[string]interface{}{
+			"error": err.Error(),
+		}
+	}
+
+	// Estimation du nombre de chunks
+	estimatedChunks := (stat.Size() - hashSize) / (fileBufferSize + nonceSize + 16 + 4)
+	if estimatedChunks < 0 {
+		estimatedChunks = 0
+	}
+
+	return map[string]interface{}{
+		"file_size":        stat.Size(),
+		"estimated_chunks": estimatedChunks,
+		"overhead":         GetFileEncryptionOverhead(stat.Size()),
+		"is_valid":         ValidateEncryptedFile(filePath) == nil,
+		"last_modified":    stat.ModTime(),
+	}
 }

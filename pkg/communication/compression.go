@@ -2,78 +2,123 @@ package communication
 
 import (
 	"encoding/binary"
-	"fmt"
+	"errors"
 	"hash/crc32"
 	"sync"
 
 	"github.com/klauspost/compress/zstd"
 )
 
-// Flags pour indiquer la méthode de compression utilisée.
 const (
-	CompressionNoneFlag    byte = 0 // Données non compressées
-	CompressionZstdFlag    byte = 1 // Compression avec Zstandard (avec checksum)
-	CompressionSpecialFlag byte = 2 // Compression spécialisée (encodage fixe sur 5 bits)
-)
+	CompressionNone   byte = 0 // Pas de compression
+	CompressionZstd   byte = 1 // Compression Zstandard avec CRC
+	CompressionCustom byte = 2 // Compression optimisée pour l'alphabet restreint
 
-// Seuil minimal pour tenter la compression spécialisée.
-const SpecializedMinLength = 16
+	minCompressionSize = 64          // Taille minimale pour tenter la compression
+	maxCompressionSize = 1024 * 1024 // 1MB max
+)
 
 var (
-	encoderPool sync.Pool
-	decoderPool sync.Pool
-
-	// Alphabet autorisé pour la compression spécialisée.
-	// On autorise l'espace, les 26 lettres minuscules et 4 signes de ponctuation (',', '.', '!', '?').
-	// Total : 1 + 26 + 4 = 31 symboles, qui tiennent en 5 bits.
-	allowedAlphabet = " abcdefghijklmnopqrstuvwxyz,.!?"
-	// Tables d'encodage et de décodage.
-	charToCode map[byte]uint8
-	codeToChar map[uint8]byte
+	ErrCorruptedData     = errors.New("data corrupted")
+	ErrUnsupportedFormat = errors.New("unsupported compression format")
 )
 
-func init() {
-	// Initialisation du pool pour l'encodeur Zstandard (sans option de checksum puisque nous le faisons manuellement).
-	enc, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedBetterCompression))
-	if err != nil {
-		panic(fmt.Sprintf("failed to create zstd encoder: %v", err))
-	}
+// Pools pour réutiliser les encodeurs/décodeurs
+var (
 	encoderPool = sync.Pool{
 		New: func() interface{} {
-			enc, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedBetterCompression))
-			if err != nil {
-				panic(err)
-			}
+			enc, _ := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedBetterCompression))
 			return enc
 		},
 	}
-	encoderPool.Put(enc)
 
-	dec, err := zstd.NewReader(nil)
-	if err != nil {
-		panic(fmt.Sprintf("failed to create zstd decoder: %v", err))
-	}
 	decoderPool = sync.Pool{
 		New: func() interface{} {
-			dec, err := zstd.NewReader(nil)
-			if err != nil {
-				panic(err)
-			}
+			dec, _ := zstd.NewReader(nil)
 			return dec
 		},
 	}
-	decoderPool.Put(dec)
+)
 
-	charToCode = make(map[byte]uint8)
-	codeToChar = make(map[uint8]byte)
-	for i := 0; i < len(allowedAlphabet); i++ {
-		b := allowedAlphabet[i]
-		charToCode[b] = uint8(i)
-		codeToChar[uint8(i)] = b
+// Alphabet optimisé pour la compression custom (32 caractères = 5 bits)
+const customAlphabet = " abcdefghijklmnopqrstuvwxyz,.!?-"
+
+var (
+	charToCode = make(map[byte]uint8, len(customAlphabet))
+	codeToChar = make(map[uint8]byte, len(customAlphabet))
+)
+
+func init() {
+	// Initialisation des tables de conversion
+	for i, char := range customAlphabet {
+		charToCode[byte(char)] = uint8(i)
+		codeToChar[uint8(i)] = byte(char)
 	}
 }
 
-func isEligibleForSpecial(data []byte) bool {
+// CompressData compresse les données en choisissant automatiquement la meilleure méthode
+func CompressData(data []byte) ([]byte, error) {
+	if len(data) == 0 {
+		return []byte{CompressionNone}, nil
+	}
+
+	if len(data) > maxCompressionSize {
+		return nil, ErrDataTooLarge
+	}
+
+	// Pour les petites données, pas de compression
+	if len(data) < minCompressionSize {
+		return wrapWithFlag(data, CompressionNone), nil
+	}
+
+	// Tentative de compression custom pour l'alphabet restreint
+	if isCustomAlphabet(data) {
+		compressed, err := compressCustom(data)
+		if err == nil && len(compressed) < len(data) {
+			return compressed, nil
+		}
+	}
+
+	// Compression Zstandard
+	compressed, err := compressZstd(data)
+	if err != nil {
+		return wrapWithFlag(data, CompressionNone), nil
+	}
+
+	// Si la compression n'améliore pas, renvoyer les données originales
+	if len(compressed) >= len(data) {
+		return wrapWithFlag(data, CompressionNone), nil
+	}
+
+	return compressed, nil
+}
+
+// DecompressData décompresse les données selon le flag
+func DecompressData(data []byte) ([]byte, error) {
+	if len(data) == 0 {
+		return nil, ErrInvalidFormat
+	}
+
+	flag := data[0]
+	payload := data[1:]
+
+	switch flag {
+	case CompressionNone:
+		return payload, nil
+
+	case CompressionZstd:
+		return decompressZstd(payload)
+
+	case CompressionCustom:
+		return decompressCustom(data) // Passe tout le data car la longueur est encodée
+
+	default:
+		return nil, ErrUnsupportedFormat
+	}
+}
+
+// isCustomAlphabet vérifie si les données utilisent uniquement l'alphabet custom
+func isCustomAlphabet(data []byte) bool {
 	for _, b := range data {
 		if _, ok := charToCode[b]; !ok {
 			return false
@@ -82,135 +127,141 @@ func isEligibleForSpecial(data []byte) bool {
 	return true
 }
 
-func specializedSmallCompress(data []byte) ([]byte, error) {
-	n := len(data)
-	out := make([]byte, 0, 3+(n*5+7)/8)
-	out = append(out, CompressionSpecialFlag)
-	lenBytes := make([]byte, 2)
-	binary.BigEndian.PutUint16(lenBytes, uint16(n))
-	out = append(out, lenBytes...)
+// compressZstd compresse avec Zstandard et ajoute un CRC
+func compressZstd(data []byte) ([]byte, error) {
+	encoder := encoderPool.Get().(*zstd.Encoder)
+	defer encoderPool.Put(encoder)
+
+	compressed := encoder.EncodeAll(data, nil)
+
+	// Calcul du CRC pour vérifier l'intégrité
+	crc := crc32.ChecksumIEEE(compressed)
+
+	// Format: flag + CRC + données compressées
+	result := make([]byte, 1+4+len(compressed))
+	result[0] = CompressionZstd
+	binary.BigEndian.PutUint32(result[1:5], crc)
+	copy(result[5:], compressed)
+
+	return result, nil
+}
+
+// decompressZstd décompresse Zstandard et vérifie le CRC
+func decompressZstd(data []byte) ([]byte, error) {
+	if len(data) < 4 {
+		return nil, ErrInvalidFormat
+	}
+
+	storedCRC := binary.BigEndian.Uint32(data[:4])
+	compressed := data[4:]
+
+	// Vérification du CRC
+	computedCRC := crc32.ChecksumIEEE(compressed)
+	if storedCRC != computedCRC {
+		return nil, ErrCorruptedData
+	}
+
+	decoder := decoderPool.Get().(*zstd.Decoder)
+	defer decoderPool.Put(decoder)
+
+	decompressed, err := decoder.DecodeAll(compressed, nil)
+	if err != nil {
+		return nil, ErrCorruptedData
+	}
+
+	return decompressed, nil
+}
+
+// compressCustom compresse avec l'encodage 5-bits pour l'alphabet restreint
+func compressCustom(data []byte) ([]byte, error) {
+	if len(data) == 0 {
+		return []byte{CompressionCustom, 0, 0}, nil
+	}
+
+	// Format: flag + longueur (2 bytes) + données encodées
+	result := make([]byte, 3, 3+(len(data)*5+7)/8)
+	result[0] = CompressionCustom
+	binary.BigEndian.PutUint16(result[1:3], uint16(len(data)))
 
 	var bitBuffer uint16
-	var bitsInBuffer uint8
+	var bitsCount uint8
 
 	for _, b := range data {
 		code, ok := charToCode[b]
 		if !ok {
-			return nil, fmt.Errorf("character %q not in allowed alphabet", b)
+			return nil, errors.New("invalid character for custom compression")
 		}
+
 		bitBuffer = (bitBuffer << 5) | uint16(code)
-		bitsInBuffer += 5
-		for bitsInBuffer >= 8 {
-			bitsInBuffer -= 8
-			byteVal := byte(bitBuffer >> bitsInBuffer)
-			out = append(out, byteVal)
-			bitBuffer &= (1 << bitsInBuffer) - 1
-		}
-	}
-	if bitsInBuffer > 0 {
-		byteVal := byte(bitBuffer << (8 - bitsInBuffer))
-		out = append(out, byteVal)
-	}
-	return out, nil
-}
+		bitsCount += 5
 
-func specializedSmallDecompress(data []byte) ([]byte, error) {
-	if len(data) < 3 {
-		return nil, fmt.Errorf("data too short for specialized decompression")
-	}
-	n := binary.BigEndian.Uint16(data[1:3])
-	bitStream := data[3:]
-	out := make([]byte, 0, n)
-	var bitBuffer uint32
-	var bitsInBuffer uint8
-	streamIndex := 0
-
-	for uint(len(out)) < uint(n) {
-		if bitsInBuffer < 5 && streamIndex < len(bitStream) {
-			bitBuffer = (bitBuffer << 8) | uint32(bitStream[streamIndex])
-			bitsInBuffer += 8
-			streamIndex++
-		}
-		if bitsInBuffer < 5 {
-			return nil, fmt.Errorf("not enough bits to decode symbol")
-		}
-		shift := bitsInBuffer - 5
-		code := uint8(bitBuffer >> shift)
-		bitBuffer &= (1 << shift) - 1
-		bitsInBuffer -= 5
-
-		char, ok := codeToChar[code]
-		if !ok {
-			return nil, fmt.Errorf("invalid code %d in specialized decompression", code)
-		}
-		out = append(out, char)
-	}
-	return out, nil
-}
-
-func CompressData(data []byte) ([]byte, error) {
-	if len(data) == 0 {
-		return []byte{CompressionNoneFlag}, nil
-	}
-
-	if len(data) >= SpecializedMinLength && isEligibleForSpecial(data) {
-		special, err := specializedSmallCompress(data)
-		if err == nil && len(special) < len(data) {
-			return special, nil
+		// Écrire les bytes complets
+		for bitsCount >= 8 {
+			result = append(result, byte(bitBuffer>>(bitsCount-8)))
+			bitsCount -= 8
+			bitBuffer &= (1 << bitsCount) - 1
 		}
 	}
 
-	encoder := encoderPool.Get().(*zstd.Encoder)
-	compressed := encoder.EncodeAll(data, nil)
-	encoderPool.Put(encoder)
-
-	if len(compressed) >= len(data) {
-		result := make([]byte, 1+len(data))
-		result[0] = CompressionNoneFlag
-		copy(result[1:], data)
-		return result, nil
+	// Écrire les bits restants
+	if bitsCount > 0 {
+		result = append(result, byte(bitBuffer<<(8-bitsCount)))
 	}
 
-	crc := crc32.ChecksumIEEE(compressed)
-	crcBytes := make([]byte, 4)
-	binary.BigEndian.PutUint32(crcBytes, crc)
-
-	result := make([]byte, 1+4+len(compressed))
-	result[0] = CompressionZstdFlag
-	copy(result[1:5], crcBytes)
-	copy(result[5:], compressed)
 	return result, nil
 }
 
-func DecompressData(data []byte) ([]byte, error) {
-	if len(data) == 0 {
-		return nil, fmt.Errorf("compressed data is empty")
+// decompressCustom décompresse l'encodage 5-bits
+func decompressCustom(data []byte) ([]byte, error) {
+	if len(data) < 3 {
+		return nil, ErrInvalidFormat
 	}
-	flag := data[0]
-	payload := data[1:]
-	switch flag {
-	case CompressionNoneFlag:
-		return payload, nil
-	case CompressionZstdFlag:
-		if len(payload) < 4 {
-			return nil, fmt.Errorf("payload too short for CRC")
+
+	length := binary.BigEndian.Uint16(data[1:3])
+	encoded := data[3:]
+
+	result := make([]byte, 0, length)
+	var bitBuffer uint32
+	var bitsCount uint8
+	byteIndex := 0
+
+	for len(result) < int(length) && byteIndex < len(encoded) {
+		// Charger plus de bits si nécessaire
+		for bitsCount < 5 && byteIndex < len(encoded) {
+			bitBuffer = (bitBuffer << 8) | uint32(encoded[byteIndex])
+			bitsCount += 8
+			byteIndex++
 		}
-		storedCRC := binary.BigEndian.Uint32(payload[:4])
-		actualCompressed := payload[4:]
-		computedCRC := crc32.ChecksumIEEE(actualCompressed)
-		if storedCRC != computedCRC {
-			return nil, fmt.Errorf("checksum mismatch: stored %08x, computed %08x", storedCRC, computedCRC)
+
+		if bitsCount < 5 {
+			break
 		}
-		decoder := decoderPool.Get().(*zstd.Decoder)
-		out, err := decoder.DecodeAll(actualCompressed, nil)
-		decoderPool.Put(decoder)
-		if err != nil {
-			return nil, fmt.Errorf("decompression failed: %w", err)
+
+		// Extraire 5 bits
+		code := uint8(bitBuffer >> (bitsCount - 5))
+		bitsCount -= 5
+		bitBuffer &= (1 << bitsCount) - 1
+
+		// Convertir en caractère
+		char, ok := codeToChar[code]
+		if !ok {
+			return nil, ErrCorruptedData
 		}
-		return out, nil
-	case CompressionSpecialFlag:
-		return specializedSmallDecompress(data)
-	default:
-		return nil, fmt.Errorf("unknown compression flag: %d", flag)
+
+		result = append(result, char)
 	}
+
+	if len(result) != int(length) {
+		return nil, ErrCorruptedData
+	}
+
+	return result, nil
+}
+
+// wrapWithFlag encapsule les données avec un flag de compression
+func wrapWithFlag(data []byte, flag byte) []byte {
+	result := make([]byte, 1+len(data))
+	result[0] = flag
+	copy(result[1:], data)
+	return result
 }
