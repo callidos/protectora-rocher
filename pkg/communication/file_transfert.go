@@ -1,11 +1,8 @@
 package communication
 
 import (
-	"crypto/aes"
-	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -14,14 +11,18 @@ import (
 	"os"
 	"sync"
 	"time"
+
+	"golang.org/x/crypto/hkdf"
+	"golang.org/x/crypto/nacl/secretbox"
 )
 
 const (
 	fileBufferSize = 64 * 1024 // 64KB chunks
-	nonceSize      = 12
+	fileNonceSize  = 24
 	hashSize       = 32
 	maxFileSize    = 100 * 1024 * 1024 // 100MB limite pour éviter les attaques DoS
-	fileTimeout    = 30 * time.Second  // AJOUT: Timeout pour les opérations de fichier
+	fileTimeout    = 30 * time.Second  // Timeout pour les opérations de fichier
+	fileKeySize    = 32
 )
 
 // Erreurs spécifiques au transfert de fichiers
@@ -29,44 +30,39 @@ var (
 	ErrEncryptionFailed = errors.New("encryption failed")
 	ErrDecryptionFailed = errors.New("decryption failed")
 	ErrFileTooLarge     = errors.New("file too large")
-	ErrFileTimeout      = errors.New("file operation timeout") // AJOUT: Erreur de timeout
+	ErrFileTimeout      = errors.New("file operation timeout")
 )
 
-// FileEncryptor gère le chiffrement de fichiers de manière thread-safe
+// FileEncryptor gère le chiffrement de fichiers avec NaCl secretbox
 type FileEncryptor struct {
-	aesGCM cipher.AEAD
+	key    [fileKeySize]byte
 	hasher hash.Hash
 	mu     sync.Mutex // Protection pour l'utilisation du hasher
 }
 
 // NewFileEncryptor crée un nouvel encrypteur de fichiers avec validation renforcée
-func NewFileEncryptor(key []byte) (*FileEncryptor, error) {
-	if len(key) < 32 {
-		return nil, ErrInvalidKey
+func NewFileEncryptor(masterKey []byte) (*FileEncryptor, error) {
+	if len(masterKey) < 32 {
+		return nil, fmt.Errorf("key too short: need 32 bytes, got %d", len(masterKey))
 	}
 
-	// CORRECTION: Validation plus stricte de la clé
-	if len(key) < 32 {
-		return nil, fmt.Errorf("key too short: need 32 bytes, got %d", len(key))
-	}
+	// Dérivation de clé sécurisée pour le chiffrement de fichiers
+	salt := []byte("protectora-rocher-salt-v2")
+	info := []byte("protectora-rocher-file-encryption-v2")
+	h := hkdf.New(sha256.New, masterKey, salt, info)
 
-	block, err := aes.NewCipher(key[:32])
-	if err != nil {
-		return nil, fmt.Errorf("AES cipher creation failed: %w", err)
-	}
-
-	aesGCM, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, fmt.Errorf("GCM mode initialization failed: %w", err)
+	var key [fileKeySize]byte
+	if _, err := io.ReadFull(h, key[:]); err != nil {
+		return nil, fmt.Errorf("key derivation failed: %w", err)
 	}
 
 	return &FileEncryptor{
-		aesGCM: aesGCM,
+		key:    key,
 		hasher: sha256.New(),
 	}, nil
 }
 
-// EncryptFile chiffre un fichier avec AES-GCM et validation d'intégrité
+// EncryptFile chiffre un fichier avec NaCl secretbox et validation d'intégrité
 func (fe *FileEncryptor) EncryptFile(inputPath, outputPath string) error {
 	return fe.encryptFileWithTimeout(inputPath, outputPath, fileTimeout)
 }
@@ -90,7 +86,6 @@ func (fe *FileEncryptor) encryptFileWithTimeout(inputPath, outputPath string, ti
 		return ErrFileTooLarge
 	}
 
-	// CORRECTION: Vérification que le fichier n'est pas vide
 	if stat.Size() == 0 {
 		return fmt.Errorf("cannot encrypt empty file")
 	}
@@ -122,7 +117,7 @@ func (fe *FileEncryptor) encryptFileWithTimeout(inputPath, outputPath string, ti
 	}
 }
 
-// performEncryption effectue le chiffrement réel
+// performEncryption effectue le chiffrement réel avec NaCl secretbox
 func (fe *FileEncryptor) performEncryption(inputFile *os.File, outputFile *os.File) error {
 	// Protection thread-safe pour le hasher
 	fe.mu.Lock()
@@ -146,7 +141,7 @@ func (fe *FileEncryptor) performEncryption(inputFile *os.File, outputFile *os.Fi
 			return ErrFileTooLarge
 		}
 
-		// Chiffrement du chunk
+		// Chiffrement du chunk avec NaCl secretbox
 		encryptedChunk, err := fe.encryptChunk(buffer[:n])
 		if err != nil {
 			return err
@@ -204,8 +199,8 @@ func (fe *FileEncryptor) decryptFileWithTimeout(inputPath, outputPath string, ti
 		return ErrFileTooLarge
 	}
 
-	// CORRECTION: Vérification de la taille minimale
-	if stat.Size() < hashSize+nonceSize+16 { // Hash + nonce + tag GCM minimum
+	// Vérification de la taille minimale (hash + nonce + secretbox overhead minimum)
+	if stat.Size() < hashSize+fileNonceSize+secretbox.Overhead {
 		return ErrCorruptedFile
 	}
 
@@ -259,8 +254,8 @@ func (fe *FileEncryptor) performDecryption(inputFile *os.File, outputFile *os.Fi
 	computedHash := fe.hasher.Sum(nil)
 	fe.mu.Unlock()
 
-	// Utilisation de ConstantTimeCompare pour éviter les attaques de timing
-	if subtle.ConstantTimeCompare(expectedHash, computedHash) != 1 {
+	// Utilisation de CompareConstantTime pour éviter les attaques de timing
+	if !CompareConstantTime(expectedHash, computedHash) {
 		// Nettoyage sécurisé des données sensibles
 		secureZero(fileData)
 		return ErrCorruptedFile
@@ -308,38 +303,40 @@ func (fe *FileEncryptor) performDecryption(inputFile *os.File, outputFile *os.Fi
 	return nil
 }
 
-// encryptChunk chiffre un chunk de données
+// encryptChunk chiffre un chunk de données avec NaCl secretbox
 func (fe *FileEncryptor) encryptChunk(data []byte) ([]byte, error) {
 	if len(data) == 0 {
 		return nil, errors.New("empty chunk")
 	}
 
-	nonce := make([]byte, fe.aesGCM.NonceSize())
-	if _, err := rand.Read(nonce); err != nil {
+	var nonce [fileNonceSize]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
 		return nil, ErrEncryptionFailed
 	}
 
-	ciphertext := fe.aesGCM.Seal(nil, nonce, data, nil)
+	// Chiffrement avec NaCl secretbox
+	encrypted := secretbox.Seal(nil, data, &nonce, &fe.key)
 
 	// Format: nonce + ciphertext
-	result := make([]byte, 0, len(nonce)+len(ciphertext))
-	result = append(result, nonce...)
-	result = append(result, ciphertext...)
+	result := make([]byte, 0, len(nonce)+len(encrypted))
+	result = append(result, nonce[:]...)
+	result = append(result, encrypted...)
 
 	return result, nil
 }
 
-// decryptChunk déchiffre un chunk de données
+// decryptChunk déchiffre un chunk de données avec NaCl secretbox
 func (fe *FileEncryptor) decryptChunk(encryptedData []byte) ([]byte, error) {
-	if len(encryptedData) < fe.aesGCM.NonceSize() {
+	if len(encryptedData) < fileNonceSize {
 		return nil, ErrDecryptionFailed
 	}
 
-	nonce := encryptedData[:fe.aesGCM.NonceSize()]
-	ciphertext := encryptedData[fe.aesGCM.NonceSize():]
+	var nonce [fileNonceSize]byte
+	copy(nonce[:], encryptedData[:fileNonceSize])
+	ciphertext := encryptedData[fileNonceSize:]
 
-	plaintext, err := fe.aesGCM.Open(nil, nonce, ciphertext, nil)
-	if err != nil {
+	plaintext, ok := secretbox.Open(nil, ciphertext, &nonce, &fe.key)
+	if !ok {
 		return nil, ErrDecryptionFailed
 	}
 
@@ -562,8 +559,8 @@ func ValidateEncryptedFile(filePath string) error {
 		return fmt.Errorf("failed to get file stats: %w", err)
 	}
 
-	// Vérification basique de la taille
-	if stat.Size() < hashSize+nonceSize+16 { // hash + nonce minimum + tag GCM
+	// Vérification basique de la taille (hash + nonce minimum + secretbox overhead)
+	if stat.Size() < hashSize+fileNonceSize+secretbox.Overhead {
 		return ErrCorruptedFile
 	}
 
@@ -585,12 +582,12 @@ func ValidateEncryptedFile(filePath string) error {
 // GetFileEncryptionOverhead retourne l'overhead du chiffrement pour un fichier
 func GetFileEncryptionOverhead(fileSize int64) int64 {
 	if fileSize == 0 {
-		return hashSize + nonceSize + 16 // Hash + nonce minimum + tag GCM
+		return hashSize + fileNonceSize + secretbox.Overhead
 	}
 
-	// Calcul approximatif : chunks + nonces + tags + hash final + tailles des chunks
+	// Calcul approximatif : chunks + nonces + overhead secretbox + hash final + tailles des chunks
 	numChunks := (fileSize + fileBufferSize - 1) / fileBufferSize
-	overhead := numChunks*(nonceSize+16+4) + hashSize // nonce + tag + taille par chunk + hash final
+	overhead := numChunks*(fileNonceSize+secretbox.Overhead+4) + hashSize // nonce + overhead + taille par chunk + hash final
 
 	return overhead
 }
@@ -613,7 +610,7 @@ func GetFileStats(filePath string) map[string]interface{} {
 	}
 
 	// Estimation du nombre de chunks
-	estimatedChunks := (stat.Size() - hashSize) / (fileBufferSize + nonceSize + 16 + 4)
+	estimatedChunks := (stat.Size() - hashSize) / (fileBufferSize + fileNonceSize + secretbox.Overhead + 4)
 	if estimatedChunks < 0 {
 		estimatedChunks = 0
 	}

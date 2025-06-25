@@ -1,9 +1,8 @@
 package communication
 
 import (
-	"crypto/aes"
-	"crypto/cipher"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -12,6 +11,8 @@ import (
 	"time"
 
 	"github.com/callidos/protectora-rocher/pkg/utils"
+	"golang.org/x/crypto/hkdf"
+	"golang.org/x/crypto/nacl/secretbox"
 )
 
 const (
@@ -20,7 +21,8 @@ const (
 	END_CALL   = 2
 
 	maxAudioSize   = 32 * 1024 // 32KB max par message
-	audioNonceSize = 12
+	audioNonceSize = 24
+	audioKeySize   = 32
 )
 
 var (
@@ -38,10 +40,10 @@ type AudioMessage struct {
 	Data      []byte
 }
 
-// AudioProtocol gère la communication audio sécurisée
+// AudioProtocol gère la communication audio sécurisée avec NaCl secretbox
 type AudioProtocol struct {
 	conn     io.ReadWriter
-	aesGCM   cipher.AEAD
+	key      [audioKeySize]byte
 	isActive bool
 	mutex    sync.RWMutex
 	stopChan chan struct{}
@@ -56,26 +58,25 @@ func NewAudioProtocol(conn io.ReadWriter, sessionKey []byte) (*AudioProtocol, er
 		return nil, errors.New("session key too short")
 	}
 
-	// Création du cipher AES-GCM pour l'audio
-	block, err := aes.NewCipher(sessionKey[:32])
-	if err != nil {
-		return nil, fmt.Errorf("AES cipher creation failed: %w", err)
-	}
+	// Dérivation de clé spécifique pour l'audio
+	salt := []byte("protectora-rocher-salt-v2")
+	info := []byte("protectora-rocher-audio-encryption-v2")
+	h := hkdf.New(sha256.New, sessionKey, salt, info)
 
-	aesGCM, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, fmt.Errorf("GCM initialization failed: %w", err)
+	var key [audioKeySize]byte
+	if _, err := io.ReadFull(h, key[:]); err != nil {
+		return nil, fmt.Errorf("audio key derivation failed: %w", err)
 	}
 
 	ap := &AudioProtocol{
 		conn:     conn,
-		aesGCM:   aesGCM,
+		key:      key,
 		isActive: false,
 		stopChan: make(chan struct{}),
 	}
 
 	utils.Logger.Info("Protocole audio initialisé", map[string]interface{}{
-		"cipher": "AES-GCM",
+		"cipher": "NaCl-secretbox",
 	})
 
 	return ap, nil
@@ -176,7 +177,7 @@ func (ap *AudioProtocol) IsActive() bool {
 	return ap.isActive
 }
 
-// sendMessage envoie un message audio chiffré
+// sendMessage envoie un message audio chiffré avec NaCl secretbox
 func (ap *AudioProtocol) sendMessage(message *AudioMessage) error {
 	// Sérialisation du message
 	serialized, err := ap.serializeMessage(message)
@@ -185,19 +186,19 @@ func (ap *AudioProtocol) sendMessage(message *AudioMessage) error {
 	}
 
 	// Génération du nonce
-	nonce := make([]byte, ap.aesGCM.NonceSize())
-	if _, err := rand.Read(nonce); err != nil {
+	var nonce [audioNonceSize]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
 		return fmt.Errorf("nonce generation failed: %w", err)
 	}
 
-	// Chiffrement
-	encrypted := ap.aesGCM.Seal(nil, nonce, serialized, nil)
+	// Chiffrement avec NaCl secretbox
+	encrypted := secretbox.Seal(nil, serialized, &nonce, &ap.key)
 
 	// Format final: taille + nonce + données chiffrées
-	finalData := make([]byte, 4+len(nonce)+len(encrypted))
-	binary.BigEndian.PutUint32(finalData[:4], uint32(len(nonce)+len(encrypted)))
-	copy(finalData[4:4+len(nonce)], nonce)
-	copy(finalData[4+len(nonce):], encrypted)
+	finalData := make([]byte, 4+audioNonceSize+len(encrypted))
+	binary.BigEndian.PutUint32(finalData[:4], uint32(audioNonceSize+len(encrypted)))
+	copy(finalData[4:4+audioNonceSize], nonce[:])
+	copy(finalData[4+audioNonceSize:], encrypted)
 
 	// Envoi
 	if _, err := ap.conn.Write(finalData); err != nil {
@@ -227,18 +228,18 @@ func (ap *AudioProtocol) receiveMessage() (*AudioMessage, error) {
 	}
 
 	// Extraction du nonce
-	nonceSize := ap.aesGCM.NonceSize()
-	if len(messageBuf) < nonceSize {
+	if len(messageBuf) < audioNonceSize {
 		return nil, ErrInvalidAudio
 	}
 
-	nonce := messageBuf[:nonceSize]
-	encrypted := messageBuf[nonceSize:]
+	var nonce [audioNonceSize]byte
+	copy(nonce[:], messageBuf[:audioNonceSize])
+	encrypted := messageBuf[audioNonceSize:]
 
-	// Déchiffrement
-	decrypted, err := ap.aesGCM.Open(nil, nonce, encrypted, nil)
-	if err != nil {
-		return nil, fmt.Errorf("decryption failed: %w", err)
+	// Déchiffrement avec NaCl secretbox
+	decrypted, ok := secretbox.Open(nil, encrypted, &nonce, &ap.key)
+	if !ok {
+		return nil, fmt.Errorf("decryption failed")
 	}
 
 	// Désérialisation
@@ -300,8 +301,8 @@ func (ap *AudioProtocol) GetStats() map[string]interface{} {
 
 	return map[string]interface{}{
 		"is_active":  ap.isActive,
-		"cipher":     "AES-GCM",
-		"nonce_size": ap.aesGCM.NonceSize(),
+		"cipher":     "NaCl-secretbox",
+		"nonce_size": audioNonceSize,
 		"max_size":   maxAudioSize,
 	}
 }

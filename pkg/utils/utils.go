@@ -2,8 +2,6 @@ package utils
 
 import (
 	"encoding/base64"
-	"runtime"
-	"unsafe"
 )
 
 // IsValidBase64 vérifie si une chaîne est du base64 valide
@@ -13,29 +11,6 @@ func IsValidBase64(s string) bool {
 	}
 	_, err := base64.StdEncoding.DecodeString(s)
 	return err == nil
-}
-
-// SecureZero efface de manière sécurisée le contenu d'un slice
-func SecureZero(data []byte) {
-	if len(data) == 0 {
-		return
-	}
-
-	// Écriture de motifs multiples pour rendre la récupération difficile
-	patterns := []byte{0xFF, 0x00, 0xAA, 0x55, 0x00}
-
-	for _, pattern := range patterns {
-		for i := range data {
-			data[i] = pattern
-		}
-		runtime.KeepAlive(data) // Empêche l'optimisation
-	}
-
-	// Barrière mémoire finale
-	if len(data) > 0 {
-		ptr := unsafe.Pointer(&data[0])
-		runtime.KeepAlive(ptr)
-	}
 }
 
 // ValidateStringLength valide qu'une chaîne respecte les limites de taille

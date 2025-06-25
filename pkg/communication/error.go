@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-// Erreurs de base - normalisées pour éviter les oracles d'information
+// Erreurs de base - normalisées
 var (
 	ErrEmptyInput     = errors.New("invalid input")
 	ErrInvalidKey     = errors.New("invalid key")
@@ -36,14 +36,13 @@ const (
 	SeverityCritical
 )
 
-// CommunicationError structure d'erreur sécurisée avec contexte minimal
+// CommunicationError structure d'erreur avec contexte minimal
 type CommunicationError struct {
 	Code      string
 	Message   string
 	Cause     error
 	Severity  ErrorSeverity
 	Timestamp time.Time
-	Context   map[string]interface{}
 	mu        sync.RWMutex
 }
 
@@ -63,45 +62,10 @@ func (e *CommunicationError) Unwrap() error {
 	return e.Cause
 }
 
-// GetSeverity retourne la sévérité de l'erreur de manière thread-safe
 func (e *CommunicationError) GetSeverity() ErrorSeverity {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	return e.Severity
-}
-
-// GetContext retourne une copie du contexte pour éviter les modifications concurrentes
-func (e *CommunicationError) GetContext() map[string]interface{} {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-
-	if e.Context == nil {
-		return make(map[string]interface{})
-	}
-
-	// Copie pour éviter les modifications concurrentes
-	result := make(map[string]interface{}, len(e.Context))
-	for k, v := range e.Context {
-		result[k] = v
-	}
-	return result
-}
-
-// WithContext ajoute du contexte de manière thread-safe
-func (e *CommunicationError) WithContext(key string, value interface{}) *CommunicationError {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	if e.Context == nil {
-		e.Context = make(map[string]interface{})
-	}
-
-	// Filtrer les valeurs sensibles
-	if !isSensitiveKey(key) && !containsSensitiveValue(value) {
-		e.Context[key] = value
-	}
-
-	return e
 }
 
 // Codes d'erreur standardisés
@@ -118,22 +82,19 @@ const (
 	ErrorCodeInternal          = "INTERNAL_ERROR"
 )
 
-// NewCommunicationError crée une nouvelle erreur avec validation
+// NewCommunicationError crée une nouvelle erreur
 func NewCommunicationError(code, message string, cause error) *CommunicationError {
-	severity := determineSeverity(code, cause)
-
+	severity := determineSeverity(code)
 	return &CommunicationError{
 		Code:      code,
 		Message:   sanitizeMessage(message),
 		Cause:     cause,
 		Severity:  severity,
 		Timestamp: time.Now(),
-		Context:   make(map[string]interface{}),
 	}
 }
 
-// determineSeverity détermine automatiquement la sévérité
-func determineSeverity(code string, cause error) ErrorSeverity {
+func determineSeverity(code string) ErrorSeverity {
 	switch code {
 	case ErrorCodeCryptographicFail, ErrorCodeAuthError:
 		return SeverityCritical
@@ -146,7 +107,6 @@ func determineSeverity(code string, cause error) ErrorSeverity {
 	}
 }
 
-// sanitizeMessage nettoie un message d'erreur
 func sanitizeMessage(message string) string {
 	if len(message) > 200 {
 		message = message[:200] + "..."
@@ -154,60 +114,7 @@ func sanitizeMessage(message string) string {
 	return message
 }
 
-// isSensitiveKey vérifie si une clé de contexte est sensible
-func isSensitiveKey(key string) bool {
-	sensitiveKeys := []string{
-		"key", "password", "token", "secret", "auth", "credential",
-		"private", "hash", "nonce", "salt", "seed", "entropy",
-	}
-
-	keyLower := strings.ToLower(key)
-	for _, sensitive := range sensitiveKeys {
-		if strings.Contains(keyLower, sensitive) {
-			return true
-		}
-	}
-	return false
-}
-
-// containsSensitiveValue vérifie si une valeur contient des données sensibles
-func containsSensitiveValue(value interface{}) bool {
-	if str, ok := value.(string); ok {
-		return len(str) > 32 && (isHexString(str) || isBase64String(str))
-	}
-	return false
-}
-
-// isHexString vérifie si une chaîne ressemble à de l'hexadécimal
-func isHexString(s string) bool {
-	if len(s) < 16 {
-		return false
-	}
-	for _, r := range s {
-		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')) {
-			return false
-		}
-	}
-	return true
-}
-
-// isBase64String vérifie si une chaîne ressemble à du base64
-func isBase64String(s string) bool {
-	if len(s) < 16 {
-		return false
-	}
-	validChars := 0
-	for _, r := range s {
-		if (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') ||
-			(r >= '0' && r <= '9') || r == '+' || r == '/' || r == '=' {
-			validChars++
-		}
-	}
-	return float64(validChars)/float64(len(s)) > 0.8
-}
-
 // Fonctions helper pour créer des erreurs typées
-
 func NewInvalidInputError(message string, cause error) *CommunicationError {
 	return NewCommunicationError(ErrorCodeInvalidInput, message, cause)
 }
@@ -245,7 +152,6 @@ func NewProtocolError(message string, cause error) *CommunicationError {
 }
 
 // Fonctions utilitaires pour l'analyse d'erreurs
-
 func IsErrorCode(err error, code string) bool {
 	if commErr, ok := err.(*CommunicationError); ok {
 		return commErr.Code == code
@@ -286,7 +192,6 @@ func IsTemporaryError(err error) bool {
 		}
 	}
 
-	// Vérification des erreurs standard
 	switch err {
 	case ErrConnection, ErrTimeout:
 		return true
@@ -363,81 +268,6 @@ func FormatUserError(err error) string {
 	}
 }
 
-// ErrorHandler interface pour gérer les erreurs
-type ErrorHandler interface {
-	HandleError(err error, context map[string]interface{})
-}
-
-// SecureErrorHandler gestionnaire sécurisé qui filtre les informations sensibles
-type SecureErrorHandler struct {
-	mu sync.RWMutex
-}
-
-func (h *SecureErrorHandler) HandleError(err error, context map[string]interface{}) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	// Filtrer le contexte avant logging
-	filteredContext := h.filterContext(context)
-
-	// Log sécurisé (implémentation basique)
-	severity := GetErrorSeverity(err)
-	message := FormatUserError(err)
-
-	logLevel := "INFO"
-	switch severity {
-	case SeverityCritical:
-		logLevel = "CRITICAL"
-	case SeverityHigh:
-		logLevel = "ERROR"
-	case SeverityMedium:
-		logLevel = "WARNING"
-	}
-
-	fmt.Printf("[%s] %s - Context: %v\n", logLevel, message, filteredContext)
-}
-
-func (h *SecureErrorHandler) filterContext(context map[string]interface{}) map[string]interface{} {
-	if context == nil {
-		return nil
-	}
-
-	filtered := make(map[string]interface{})
-	for k, v := range context {
-		if !isSensitiveKey(k) && !containsSensitiveValue(v) {
-			filtered[k] = v
-		} else {
-			filtered[k] = "[REDACTED]"
-		}
-	}
-	return filtered
-}
-
-// Instance globale du gestionnaire d'erreur
-var (
-	globalErrorHandler ErrorHandler = &SecureErrorHandler{}
-	handlerMu          sync.RWMutex
-)
-
-func SetGlobalErrorHandler(handler ErrorHandler) {
-	handlerMu.Lock()
-	defer handlerMu.Unlock()
-	globalErrorHandler = handler
-}
-
-func GetGlobalErrorHandler() ErrorHandler {
-	handlerMu.RLock()
-	defer handlerMu.RUnlock()
-	return globalErrorHandler
-}
-
-func HandleError(err error, context map[string]interface{}) {
-	handler := GetGlobalErrorHandler()
-	if handler != nil {
-		handler.HandleError(err, context)
-	}
-}
-
 // ErrorMetrics pour collecter des statistiques d'erreurs
 type ErrorMetrics struct {
 	mu         sync.RWMutex
@@ -483,4 +313,20 @@ func ResetErrorMetrics() {
 
 	globalMetrics.counts = make(map[string]int64)
 	globalMetrics.lastErrors = make(map[string]time.Time)
+}
+
+// isSensitiveKey vérifie si une clé contient des informations sensibles
+func isSensitiveKey(key string) bool {
+	sensitiveKeys := []string{
+		"key", "password", "token", "secret", "auth", "credential",
+		"private", "hash", "nonce", "salt", "seed", "entropy",
+	}
+
+	keyLower := strings.ToLower(key)
+	for _, sensitive := range sensitiveKeys {
+		if strings.Contains(keyLower, sensitive) {
+			return true
+		}
+	}
+	return false
 }

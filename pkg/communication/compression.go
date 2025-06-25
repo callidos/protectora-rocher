@@ -10,9 +10,8 @@ import (
 )
 
 const (
-	CompressionNone   byte = 0 // Pas de compression
-	CompressionZstd   byte = 1 // Compression Zstandard avec CRC
-	CompressionCustom byte = 2 // Compression optimisée pour l'alphabet restreint
+	CompressionNone byte = 0 // Pas de compression
+	CompressionZstd byte = 1 // Compression Zstandard avec CRC
 
 	minCompressionSize = 64          // Taille minimale pour tenter la compression
 	maxCompressionSize = 1024 * 1024 // 1MB max
@@ -40,23 +39,7 @@ var (
 	}
 )
 
-// Alphabet optimisé pour la compression custom (32 caractères = 5 bits)
-const customAlphabet = " abcdefghijklmnopqrstuvwxyz,.!?-"
-
-var (
-	charToCode = make(map[byte]uint8, len(customAlphabet))
-	codeToChar = make(map[uint8]byte, len(customAlphabet))
-)
-
-func init() {
-	// Initialisation des tables de conversion
-	for i, char := range customAlphabet {
-		charToCode[byte(char)] = uint8(i)
-		codeToChar[uint8(i)] = byte(char)
-	}
-}
-
-// CompressData compresse les données en choisissant automatiquement la meilleure méthode
+// CompressData compresse les données avec zstd uniquement
 func CompressData(data []byte) ([]byte, error) {
 	if len(data) == 0 {
 		return []byte{CompressionNone}, nil
@@ -69,14 +52,6 @@ func CompressData(data []byte) ([]byte, error) {
 	// Pour les petites données, pas de compression
 	if len(data) < minCompressionSize {
 		return wrapWithFlag(data, CompressionNone), nil
-	}
-
-	// Tentative de compression custom pour l'alphabet restreint
-	if isCustomAlphabet(data) {
-		compressed, err := compressCustom(data)
-		if err == nil && len(compressed) < len(data) {
-			return compressed, nil
-		}
 	}
 
 	// Compression Zstandard
@@ -109,22 +84,9 @@ func DecompressData(data []byte) ([]byte, error) {
 	case CompressionZstd:
 		return decompressZstd(payload)
 
-	case CompressionCustom:
-		return decompressCustom(data) // Passe tout le data car la longueur est encodée
-
 	default:
 		return nil, ErrUnsupportedFormat
 	}
-}
-
-// isCustomAlphabet vérifie si les données utilisent uniquement l'alphabet custom
-func isCustomAlphabet(data []byte) bool {
-	for _, b := range data {
-		if _, ok := charToCode[b]; !ok {
-			return false
-		}
-	}
-	return true
 }
 
 // compressZstd compresse avec Zstandard et ajoute un CRC
@@ -170,92 +132,6 @@ func decompressZstd(data []byte) ([]byte, error) {
 	}
 
 	return decompressed, nil
-}
-
-// compressCustom compresse avec l'encodage 5-bits pour l'alphabet restreint
-func compressCustom(data []byte) ([]byte, error) {
-	if len(data) == 0 {
-		return []byte{CompressionCustom, 0, 0}, nil
-	}
-
-	// Format: flag + longueur (2 bytes) + données encodées
-	result := make([]byte, 3, 3+(len(data)*5+7)/8)
-	result[0] = CompressionCustom
-	binary.BigEndian.PutUint16(result[1:3], uint16(len(data)))
-
-	var bitBuffer uint16
-	var bitsCount uint8
-
-	for _, b := range data {
-		code, ok := charToCode[b]
-		if !ok {
-			return nil, errors.New("invalid character for custom compression")
-		}
-
-		bitBuffer = (bitBuffer << 5) | uint16(code)
-		bitsCount += 5
-
-		// Écrire les bytes complets
-		for bitsCount >= 8 {
-			result = append(result, byte(bitBuffer>>(bitsCount-8)))
-			bitsCount -= 8
-			bitBuffer &= (1 << bitsCount) - 1
-		}
-	}
-
-	// Écrire les bits restants
-	if bitsCount > 0 {
-		result = append(result, byte(bitBuffer<<(8-bitsCount)))
-	}
-
-	return result, nil
-}
-
-// decompressCustom décompresse l'encodage 5-bits
-func decompressCustom(data []byte) ([]byte, error) {
-	if len(data) < 3 {
-		return nil, ErrInvalidFormat
-	}
-
-	length := binary.BigEndian.Uint16(data[1:3])
-	encoded := data[3:]
-
-	result := make([]byte, 0, length)
-	var bitBuffer uint32
-	var bitsCount uint8
-	byteIndex := 0
-
-	for len(result) < int(length) && byteIndex < len(encoded) {
-		// Charger plus de bits si nécessaire
-		for bitsCount < 5 && byteIndex < len(encoded) {
-			bitBuffer = (bitBuffer << 8) | uint32(encoded[byteIndex])
-			bitsCount += 8
-			byteIndex++
-		}
-
-		if bitsCount < 5 {
-			break
-		}
-
-		// Extraire 5 bits
-		code := uint8(bitBuffer >> (bitsCount - 5))
-		bitsCount -= 5
-		bitBuffer &= (1 << bitsCount) - 1
-
-		// Convertir en caractère
-		char, ok := codeToChar[code]
-		if !ok {
-			return nil, ErrCorruptedData
-		}
-
-		result = append(result, char)
-	}
-
-	if len(result) != int(length) {
-		return nil, ErrCorruptedData
-	}
-
-	return result, nil
 }
 
 // wrapWithFlag encapsule les données avec un flag de compression

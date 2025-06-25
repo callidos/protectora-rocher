@@ -11,6 +11,8 @@ import (
 	mathrand "math/rand"
 	"sync"
 	"time"
+
+	"golang.org/x/crypto/nacl/secretbox"
 )
 
 const (
@@ -21,6 +23,8 @@ const (
 	cleanupInterval   = 5 * time.Minute
 	maxTTL            = 86400 // 24 heures maximum
 	protocolVersion   = 2
+	protocolNonceSize = 24
+	protocolKeySize   = 32
 )
 
 // Erreur unifiée pour éviter les oracles d'information
@@ -246,7 +250,7 @@ func generateSecureNonce() []byte {
 	return nonce
 }
 
-// SendMessage envoie un message chiffré avec protection renforcée
+// SendMessage envoie un message chiffré avec NaCl secretbox
 func SendMessage(w io.Writer, message string, key []byte, seq uint64, ttl int) error {
 	if w == nil {
 		return errors.New("writer cannot be nil")
@@ -281,24 +285,48 @@ func SendMessage(w io.Writer, message string, key []byte, seq uint64, ttl int) e
 		return ErrInvalidMessage
 	}
 
-	// Chiffrement avec authentification intégrée
-	encrypted, err := EncryptAESGCM(envJSON, key)
+	// Dérivation de clé pour le protocole
+	protocolKey, err := deriveKeyWithContext(key, "protocol", protocolKeySize)
 	if err != nil {
-		return fmt.Errorf("encryption failed: %w", err)
+		return fmt.Errorf("key derivation failed: %w", err)
+	}
+	defer secureZero(protocolKey)
+
+	var secretKey [protocolKeySize]byte
+	copy(secretKey[:], protocolKey)
+
+	// Génération du nonce pour NaCl
+	var nonce [protocolNonceSize]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return fmt.Errorf("nonce generation failed: %w", err)
 	}
 
+	// Chiffrement avec NaCl secretbox
+	encrypted := secretbox.Seal(nil, envJSON, &nonce, &secretKey)
+
+	// Format final: nonce + ciphertext + newline
+	finalMessage := make([]byte, protocolNonceSize+len(encrypted)+1)
+	copy(finalMessage[:protocolNonceSize], nonce[:])
+	copy(finalMessage[protocolNonceSize:protocolNonceSize+len(encrypted)], encrypted)
+	finalMessage[len(finalMessage)-1] = '\n'
+
 	// Vérification finale de la taille
-	finalMessage := append([]byte(encrypted), '\n')
 	if len(finalMessage) > messageSizeLimit {
 		return ErrInvalidMessage
 	}
 
 	// Envoi atomique du message
 	_, err = w.Write(finalMessage)
+
+	// Nettoyage sécurisé
+	secureZero(secretKey[:])
+	secureZero(nonce[:])
+	secureZero(finalMessage)
+
 	return err
 }
 
-// ReceiveMessage reçoit et déchiffre un message avec validation unifiée
+// ReceiveMessage reçoit et déchiffre un message avec NaCl secretbox
 func ReceiveMessage(r io.Reader, key []byte) (string, error) {
 	if r == nil {
 		return "", errors.New("reader cannot be nil")
@@ -323,11 +351,36 @@ func ReceiveMessage(r io.Reader, key []byte) (string, error) {
 		return "", ErrInvalidMessage
 	}
 
-	// Déchiffrement avec gestion d'erreur unifiée
-	decrypted, err := DecryptAESGCM(line, key)
+	// Conversion en bytes
+	data := []byte(line)
+	defer secureZero(data)
+
+	// Validation de la taille minimale
+	if len(data) < protocolNonceSize+secretbox.Overhead {
+		return "", ErrInvalidMessage
+	}
+
+	// Dérivation de clé pour le protocole
+	protocolKey, err := deriveKeyWithContext(key, "protocol", protocolKeySize)
 	if err != nil {
 		return "", ErrInvalidMessage // Normalisation des erreurs
 	}
+	defer secureZero(protocolKey)
+
+	var secretKey [protocolKeySize]byte
+	copy(secretKey[:], protocolKey)
+
+	// Extraction des composants
+	var nonce [protocolNonceSize]byte
+	copy(nonce[:], data[:protocolNonceSize])
+	ciphertext := data[protocolNonceSize:]
+
+	// Déchiffrement avec NaCl secretbox
+	decrypted, ok := secretbox.Open(nil, ciphertext, &nonce, &secretKey)
+	if !ok {
+		return "", ErrInvalidMessage // Normalisation des erreurs
+	}
+	defer secureZero(decrypted)
 
 	// Désérialisation de l'enveloppe
 	var envelope Envelope
@@ -339,6 +392,10 @@ func ReceiveMessage(r io.Reader, key []byte) (string, error) {
 	if err := validateMessage(envelope); err != nil {
 		return "", ErrInvalidMessage // Toujours la même erreur
 	}
+
+	// Nettoyage sécurisé
+	secureZero(secretKey[:])
+	secureZero(nonce[:])
 
 	return envelope.Data, nil
 }
@@ -460,15 +517,25 @@ func GetMessageHistoryStats() map[string]interface{} {
 
 // ValidateMessageIntegrity valide l'intégrité d'un message sans le déchiffrer
 func ValidateMessageIntegrity(encryptedMessage string) error {
-	return ValidateEncryptedData(encryptedMessage)
+	if encryptedMessage == "" {
+		return ErrInvalidMessage
+	}
+
+	data := []byte(encryptedMessage)
+	// Validation basique de la taille
+	if len(data) < protocolNonceSize+secretbox.Overhead {
+		return ErrInvalidMessage
+	}
+
+	return nil
 }
 
 // EstimateMessageOverhead estime l'overhead d'un message
 func EstimateMessageOverhead(messageSize int) int {
-	// Estimation: JSON envelope + chiffrement + base64
-	jsonOverhead := 100           // Métadonnées JSON approximatives
-	encryptionOverhead := 32 + 16 // Nonce + tag GCM
-	base64Overhead := (messageSize + jsonOverhead + encryptionOverhead) / 3
+	// Estimation: JSON envelope + chiffrement NaCl + newline
+	jsonOverhead := 100                                          // Métadonnées JSON approximatives
+	encryptionOverhead := protocolNonceSize + secretbox.Overhead // Nonce + overhead NaCl
+	newlineOverhead := 1
 
-	return jsonOverhead + encryptionOverhead + base64Overhead
+	return jsonOverhead + encryptionOverhead + newlineOverhead
 }
