@@ -9,7 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/callidos/protectora-rocher/pkg/utils"
+	"golang.org/x/time/rate"
 )
 
 const (
@@ -22,84 +22,63 @@ const (
 	maxConnections       = 100
 )
 
-// RateLimiter gère la limitation de débit pour éviter le spam avec thread-safety
+// RateLimiter simplifié avec golang.org/x/time/rate
 type RateLimiter struct {
-	mu           sync.Mutex
-	messages     []time.Time
-	maxMessages  int
-	windowPeriod time.Duration
-	lastCleanup  int64 // Timestamp atomique pour optimiser le nettoyage
+	limiter   *rate.Limiter
+	mu        sync.RWMutex
+	startTime time.Time
 }
 
 func NewRateLimiter(maxMessages int, windowPeriod time.Duration) *RateLimiter {
+	// Calcul du taux : maxMessages par windowPeriod
+	r := rate.Every(windowPeriod / time.Duration(maxMessages))
+
 	return &RateLimiter{
-		messages:     make([]time.Time, 0),
-		maxMessages:  maxMessages,
-		windowPeriod: windowPeriod,
-		lastCleanup:  time.Now().Unix(),
+		limiter:   rate.NewLimiter(r, maxMessages), // burst = maxMessages
+		startTime: time.Now(),
 	}
 }
 
-// Allow vérifie et consomme atomiquement un token de rate limiting
+// Allow vérifie si une requête peut passer (thread-safe automatiquement)
 func (rl *RateLimiter) Allow() bool {
-	now := time.Now()
-
-	// Optimisation : nettoyage conditionnel pour éviter les locks fréquents
-	if atomic.LoadInt64(&rl.lastCleanup) < now.Add(-rl.windowPeriod/2).Unix() {
-		rl.cleanupOldMessages(now)
-	}
-
-	rl.mu.Lock()
-	defer rl.mu.Unlock()
-
-	// Double vérification après acquisition du lock
-	cutoff := now.Add(-rl.windowPeriod)
-	validMessages := make([]time.Time, 0, len(rl.messages))
-	for _, msgTime := range rl.messages {
-		if msgTime.After(cutoff) {
-			validMessages = append(validMessages, msgTime)
-		}
-	}
-	rl.messages = validMessages
-
-	// Vérifier si on peut ajouter un nouveau message
-	if len(rl.messages) >= rl.maxMessages {
-		return false
-	}
-
-	// Ajouter le nouveau message atomiquement
-	rl.messages = append(rl.messages, now)
-	return true
+	return rl.limiter.Allow()
 }
 
-// cleanupOldMessages nettoie les anciens messages de manière optimisée
-func (rl *RateLimiter) cleanupOldMessages(now time.Time) {
+// AllowN vérifie si N requêtes peuvent passer
+func (rl *RateLimiter) AllowN(n int) bool {
+	return rl.limiter.AllowN(time.Now(), n)
+}
+
+// Reserve réserve une requête et retourne une réservation
+func (rl *RateLimiter) Reserve() *rate.Reservation {
+	return rl.limiter.Reserve()
+}
+
+// SetLimit change le taux de limitation
+func (rl *RateLimiter) SetLimit(newRate rate.Limit) {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
+	rl.limiter.SetLimit(newRate)
+}
 
-	cutoff := now.Add(-rl.windowPeriod)
-	validMessages := make([]time.Time, 0, len(rl.messages))
-
-	for _, msgTime := range rl.messages {
-		if msgTime.After(cutoff) {
-			validMessages = append(validMessages, msgTime)
-		}
-	}
-
-	rl.messages = validMessages
-	atomic.StoreInt64(&rl.lastCleanup, now.Unix())
+// SetBurst change la taille du burst
+func (rl *RateLimiter) SetBurst(newBurst int) {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	rl.limiter.SetBurst(newBurst)
 }
 
 // GetStats retourne les statistiques du rate limiter
 func (rl *RateLimiter) GetStats() map[string]interface{} {
-	rl.mu.Lock()
-	defer rl.mu.Unlock()
+	rl.mu.RLock()
+	defer rl.mu.RUnlock()
 
 	return map[string]interface{}{
-		"current_messages": len(rl.messages),
-		"max_messages":     rl.maxMessages,
-		"window_period":    rl.windowPeriod,
-		"last_cleanup":     time.Unix(atomic.LoadInt64(&rl.lastCleanup), 0),
+		"limit":      float64(rl.limiter.Limit()),
+		"burst":      rl.limiter.Burst(),
+		"tokens":     rl.limiter.Tokens(), // Tokens disponibles actuellement
+		"start_time": rl.startTime,
+		"uptime":     time.Since(rl.startTime),
 	}
 }
 
@@ -108,8 +87,11 @@ func (rl *RateLimiter) Reset() {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 
-	rl.messages = rl.messages[:0] // Réutiliser le slice sous-jacent
-	atomic.StoreInt64(&rl.lastCleanup, time.Now().Unix())
+	// Recréer un nouveau limiter avec les mêmes paramètres
+	oldLimit := rl.limiter.Limit()
+	oldBurst := rl.limiter.Burst()
+	rl.limiter = rate.NewLimiter(oldLimit, oldBurst)
+	rl.startTime = time.Now()
 }
 
 // ConnectionHandler gère une connexion sécurisée avec rate limiting thread-safe
@@ -144,7 +126,6 @@ func NewConnectionHandler(r io.Reader, w io.Writer, sharedKey []byte) *Connectio
 
 // generateSessionID génère un identifiant de session unique
 func generateSessionID() string {
-	// Utiliser un timestamp nano + compteur pour l'unicité
 	return fmt.Sprintf("sess_%d_%d", time.Now().UnixNano(), atomic.AddInt64(&sessionCounter, 1))
 }
 
@@ -154,36 +135,28 @@ func init() {
 	atomic.StoreInt64(&sessionCounter, 0)
 }
 
-// HandleConnection gère le cycle de vie d'une connexion avec timeout configurable
+// HandleConnection manages the connection lifecycle with configurable timeout
 func (ch *ConnectionHandler) HandleConnection() error {
 	ch.mu.Lock()
-	utils.Logger.Info("Nouvelle connexion établie", map[string]interface{}{
-		"start_time": ch.startTime,
-		"session_id": ch.sessionID,
-	})
+	fmt.Printf("[INFO] New connection established - session_id: %s\n", ch.sessionID)
 	ch.mu.Unlock()
 
-	// Authentification utilisateur avec timeout
+	// User authentication with timeout
 	if err := ch.authenticateUser(); err != nil {
-		utils.Logger.Warning("Échec d'authentification", map[string]interface{}{
-			"error":      "auth_failed",
-			"duration":   time.Since(ch.startTime),
-			"session_id": ch.sessionID,
-		})
+		fmt.Printf("[WARNING] Authentication failed - session_id: %s, duration: %v\n",
+			ch.sessionID, time.Since(ch.startTime))
 		ch.sendError(ErrAuthentication)
 		return err
 	}
 
-	// Envoi du message de bienvenue
+	// Send welcome message
 	if err := ch.sendWelcome(); err != nil {
-		utils.Logger.Error("Échec envoi bienvenue", map[string]interface{}{
-			"user":       ch.getUsername(),
-			"session_id": ch.sessionID,
-		})
+		fmt.Printf("[ERROR] Failed to send welcome message - user: %s, session_id: %s, error: %v\n",
+			ch.getUsername(), ch.sessionID, err)
 		return err
 	}
 
-	// Boucle de traitement des messages
+	// Message processing loop
 	return ch.messageLoop()
 }
 
@@ -277,10 +250,10 @@ func (ch *ConnectionHandler) updateActivity() {
 	atomic.StoreInt64(&ch.lastActivity, time.Now().Unix())
 }
 
-// sendWelcome envoie le message de bienvenue avec session isolée
+// sendWelcome sends the welcome message with session isolation
 func (ch *ConnectionHandler) sendWelcome() error {
 	username := ch.getUsername()
-	message := fmt.Sprintf("Bienvenue %s sur le serveur sécurisé.", username)
+	message := fmt.Sprintf("Welcome %s to the secure server.", username)
 	return SendMessageWithSession(ch.writer, message, ch.key, 0, 0, ch.sessionID)
 }
 
@@ -301,42 +274,30 @@ func (ch *ConnectionHandler) messageLoop() error {
 		// Mise à jour de l'activité
 		ch.updateActivity()
 
-		// Vérification du rate limiting avec protection thread-safe
+		// Rate limiting check with automatic thread-safety
 		if !ch.rateLimiter.Allow() {
-			utils.Logger.Warning("Rate limit exceeded", map[string]interface{}{
-				"user":       ch.getUsername(),
-				"session_id": ch.sessionID,
-			})
-			ch.sendError(fmt.Errorf("rate limit exceeded"))
+			fmt.Printf("[WARNING] Rate limit exceeded - user: %s, session_id: %s\n",
+				ch.getUsername(), ch.sessionID)
+			ch.sendError(NewRateLimitError("rate limit exceeded", nil))
 			continue
 		}
 
-		if line == "FIN_SESSION" {
-			utils.Logger.Info("Fin de session demandée", map[string]interface{}{
-				"user":       ch.getUsername(),
-				"duration":   time.Since(ch.startTime),
-				"messages":   atomic.LoadUint64(&ch.messageCount),
-				"session_id": ch.sessionID,
-			})
+		if line == "END_SESSION" {
+			fmt.Printf("[INFO] Session end requested - user: %s, duration: %v, messages: %d, session_id: %s\n",
+				ch.getUsername(), time.Since(ch.startTime), atomic.LoadUint64(&ch.messageCount), ch.sessionID)
 			return ch.closeConnection()
 		}
 
 		if err := ch.processMessage(line); err != nil {
-			utils.Logger.Error("Erreur traitement message", map[string]interface{}{
-				"user":       ch.getUsername(),
-				"type":       "processing_error",
-				"session_id": ch.sessionID,
-			})
+			fmt.Printf("[ERROR] Message processing error - user: %s, session_id: %s, error: %v\n",
+				ch.getUsername(), ch.sessionID, err)
 			ch.sendError(ErrProcessing)
 		}
 	}
 
 	if err := scanner.Err(); err != nil {
-		utils.Logger.Error("Erreur lecture scanner", map[string]interface{}{
-			"user":       ch.getUsername(),
-			"error":      err.Error(),
-			"session_id": ch.sessionID,
-		})
+		fmt.Printf("[ERROR] Scanner read error - user: %s, session_id: %s, error: %v\n",
+			ch.getUsername(), ch.sessionID, err)
 		return ErrConnection
 	}
 
@@ -368,12 +329,8 @@ func (ch *ConnectionHandler) processMessage(rawMessage string) error {
 
 	ch.incrementMessageCount()
 
-	utils.Logger.Info("Message traité avec succès", map[string]interface{}{
-		"user":           ch.getUsername(),
-		"size":           len(message),
-		"total_messages": atomic.LoadUint64(&ch.messageCount),
-		"session_id":     ch.sessionID,
-	})
+	fmt.Printf("[INFO] Message processed successfully - user: %s, size: %d, total_messages: %d, session_id: %s\n",
+		ch.getUsername(), len(message), atomic.LoadUint64(&ch.messageCount), ch.sessionID)
 
 	// Envoi de l'accusé de réception
 	return ch.sendAcknowledgment()
@@ -390,51 +347,65 @@ func (ch *ConnectionHandler) isValidMessageContent(message string) bool {
 	return true
 }
 
-// sendAcknowledgment envoie un accusé de réception avec session isolée
+// sendAcknowledgment sends an acknowledgment with session isolation
 func (ch *ConnectionHandler) sendAcknowledgment() error {
-	return SendMessageWithSession(ch.writer, "Message reçu avec succès.", ch.key, 0, 0, ch.sessionID)
+	return SendMessageWithSession(ch.writer, "Message received successfully.", ch.key, 0, 0, ch.sessionID)
 }
 
-// sendError envoie une réponse d'erreur générique sans révéler d'informations sensibles
+// sendError sends a generic error response without revealing sensitive information
 func (ch *ConnectionHandler) sendError(err error) {
-	// Normaliser les messages d'erreur pour éviter la fuite d'information
+	// Normalize error messages to avoid information leakage
 	var errorMsg string
-	switch err {
-	case ErrAuthentication:
-		errorMsg = "Erreur d'authentification"
-	case ErrProcessing:
-		errorMsg = "Erreur de traitement"
-	case ErrInvalidInput:
-		errorMsg = "Entrée invalide"
+	switch {
+	case IsErrorCode(err, ErrorCodeAuthError):
+		errorMsg = "Authentication error"
+	case IsErrorCode(err, ErrorCodeInternal):
+		errorMsg = "Processing error"
+	case IsErrorCode(err, ErrorCodeInvalidInput):
+		errorMsg = "Invalid input"
+	case IsErrorCode(err, ErrorCodeRateLimit):
+		errorMsg = "Too many requests, please wait"
+	case IsErrorCode(err, ErrorCodeNetworkError):
+		errorMsg = "Network error"
+	case IsErrorCode(err, ErrorCodeTimeout):
+		errorMsg = "Operation timeout"
 	default:
-		errorMsg = "Erreur interne"
+		// Check standard errors
+		switch err {
+		case ErrAuthentication:
+			errorMsg = "Authentication error"
+		case ErrProcessing:
+			errorMsg = "Processing error"
+		case ErrInvalidInput:
+			errorMsg = "Invalid input"
+		case ErrConnection:
+			errorMsg = "Connection error"
+		case ErrTimeout:
+			errorMsg = "Operation timeout"
+		default:
+			errorMsg = "Internal error"
+		}
 	}
 
-	response := fmt.Sprintf("Erreur: %s\n", errorMsg)
+	response := fmt.Sprintf("Error: %s\n", errorMsg)
 	if _, writeErr := ch.writer.Write([]byte(response)); writeErr != nil {
-		utils.Logger.Error("Échec envoi erreur", map[string]interface{}{
-			"user":       ch.getUsername(),
-			"session_id": ch.sessionID,
-		})
+		fmt.Printf("[ERROR] Failed to send error response - user: %s, session_id: %s, error: %v\n",
+			ch.getUsername(), ch.sessionID, writeErr)
 	}
 }
 
-// closeConnection ferme proprement la connexion avec nettoyage de session
+// closeConnection properly closes the connection with session cleanup
 func (ch *ConnectionHandler) closeConnection() error {
 	ch.mu.Lock()
 	defer ch.mu.Unlock()
 
 	ch.connected = false
 
-	// Nettoyer l'historique de session isolé
+	// Clean up isolated session history
 	ResetSessionHistory(ch.sessionID)
 
-	utils.Logger.Info("Connexion fermée", map[string]interface{}{
-		"user":       ch.username,
-		"duration":   time.Since(ch.startTime),
-		"messages":   atomic.LoadUint64(&ch.messageCount),
-		"session_id": ch.sessionID,
-	})
+	fmt.Printf("[INFO] Connection closed - user: %s, duration: %v, messages: %d, session_id: %s\n",
+		ch.username, time.Since(ch.startTime), atomic.LoadUint64(&ch.messageCount), ch.sessionID)
 
 	if closer, ok := ch.writer.(io.Closer); ok {
 		return closer.Close()
@@ -487,21 +458,34 @@ func (ch *ConnectionHandler) GetStats() map[string]interface{} {
 		"idle_duration": time.Since(time.Unix(lastActivity, 0)),
 	}
 
-	// Ajouter les stats du rate limiter
+	// Ajouter les stats du rate limiter (maintenant plus détaillées)
 	rateLimiterStats := ch.rateLimiter.GetStats()
 	stats["rate_limiter"] = rateLimiterStats
 
 	return stats
 }
 
-// SetTimeout configure le timeout de connexion (pour extensions futures)
+// ConfigureRateLimiting permet de reconfigurer le rate limiting à chaud
+func (ch *ConnectionHandler) ConfigureRateLimiting(messagesPerMinute int, burstSize int) {
+	if messagesPerMinute <= 0 || burstSize <= 0 {
+		return
+	}
+
+	// Calculer le nouveau taux
+	newRate := rate.Every(time.Minute / time.Duration(messagesPerMinute))
+
+	// Apply new parameters
+	ch.rateLimiter.SetLimit(newRate)
+	ch.rateLimiter.SetBurst(burstSize)
+
+	fmt.Printf("[INFO] Rate limiting reconfigured - session_id: %s, messages_per_minute: %d, burst_size: %d, user: %s\n",
+		ch.sessionID, messagesPerMinute, burstSize, ch.getUsername())
+}
+
+// SetTimeout configures connection timeout (for future extensions)
 func (ch *ConnectionHandler) SetTimeout(timeout time.Duration) {
 	if timeout > 0 && timeout < 5*time.Minute {
-		// Implémentation future pour timeout dynamique
-		utils.Logger.Info("Timeout configuré", map[string]interface{}{
-			"timeout":    timeout,
-			"session_id": ch.sessionID,
-		})
+		fmt.Printf("[INFO] Timeout configured - timeout: %v, session_id: %s\n", timeout, ch.sessionID)
 	}
 }
 
@@ -514,4 +498,29 @@ func (ch *ConnectionHandler) IsIdle(maxIdleTime time.Duration) bool {
 // GetSessionID retourne l'identifiant de session
 func (ch *ConnectionHandler) GetSessionID() string {
 	return ch.sessionID
+}
+
+// WaitForRateLimit attend qu'une requête puisse passer selon le rate limit
+func (ch *ConnectionHandler) WaitForRateLimit() error {
+	reservation := ch.rateLimiter.Reserve()
+	if !reservation.OK() {
+		return NewRateLimitError("rate limit reservation failed", nil)
+	}
+
+	delay := reservation.Delay()
+	if delay > 0 {
+		fmt.Printf("[DEBUG] Rate limit delay - delay: %v, session_id: %s, user: %s\n",
+			delay, ch.sessionID, ch.getUsername())
+		time.Sleep(delay)
+	}
+
+	return nil
+}
+
+// GetRateLimitStats retourne les statistiques détaillées du rate limiting
+func (ch *ConnectionHandler) GetRateLimitStats() map[string]interface{} {
+	stats := ch.rateLimiter.GetStats()
+	stats["session_id"] = ch.sessionID
+	stats["user"] = ch.getUsername()
+	return stats
 }

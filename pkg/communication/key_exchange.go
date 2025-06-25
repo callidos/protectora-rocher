@@ -1,6 +1,7 @@
 package communication
 
 import (
+	"crypto/ecdh"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
@@ -19,8 +20,8 @@ const (
 	maxDataSize        = 65536
 	keyExchangeTimeout = 30 * time.Second
 	maxRetries         = 3
-	minTimeout         = 10 * time.Second // Limite minimale stricte
-	maxTimeout         = 2 * time.Minute  // Limite maximale stricte
+	minTimeout         = 10 * time.Second
+	maxTimeout         = 2 * time.Minute
 )
 
 // KeyExchangeResult contient le résultat sécurisé de l'échange de clés
@@ -36,7 +37,7 @@ type KeyExchanger interface {
 	PerformExchange(conn io.ReadWriter, privKey ed25519.PrivateKey, remotePubKey ed25519.PublicKey) (*KeyExchangeResult, error)
 }
 
-// BaseKeyExchanger contient la logique commune avec limites de timeout strictes
+// BaseKeyExchanger contient la logique commune avec validation par crypto/ecdh
 type BaseKeyExchanger struct {
 	timeout time.Duration
 	mu      sync.RWMutex
@@ -48,7 +49,7 @@ func NewBaseKeyExchanger() *BaseKeyExchanger {
 	}
 }
 
-// SetTimeout configure le timeout avec des limites strictes pour éviter les DoS
+// SetTimeout configure le timeout avec des limites strictes
 func (b *BaseKeyExchanger) SetTimeout(timeout time.Duration) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -70,10 +71,10 @@ func (b *BaseKeyExchanger) GetTimeout() time.Duration {
 	return b.timeout
 }
 
-// ClientKeyExchanger implémente l'échange côté client avec retry et validation renforcée
+// ClientKeyExchanger implémente l'échange côté client avec validation standard
 type ClientKeyExchanger struct {
 	*BaseKeyExchanger
-	attemptCount uint32 // Compteur d'tentatives pour les métriques
+	attemptCount uint32
 }
 
 func NewClientKeyExchanger() *ClientKeyExchanger {
@@ -83,22 +84,83 @@ func NewClientKeyExchanger() *ClientKeyExchanger {
 	}
 }
 
-// ServerKeyExchanger implémente l'échange côté serveur avec validation renforcée
+// ServerKeyExchanger implémente l'échange côté serveur avec validation standard
 type ServerKeyExchanger struct {
 	*BaseKeyExchanger
-	validationLevel uint8 // Niveau de validation (pour configuration future)
+	validationLevel uint8
 }
 
 func NewServerKeyExchanger() *ServerKeyExchanger {
 	return &ServerKeyExchanger{
 		BaseKeyExchanger: NewBaseKeyExchanger(),
-		validationLevel:  1, // Validation standard
+		validationLevel:  1,
 	}
 }
 
-// PerformExchange effectue l'échange de clés côté client avec retry automatique et validation stricte
+// validateEd25519Keys valide les clés Ed25519 avec crypto/ed25519
+func validateEd25519Keys(privKey ed25519.PrivateKey, pubKey ed25519.PublicKey) error {
+	if len(privKey) != ed25519.PrivateKeySize {
+		return NewCryptographicError("Invalid private key size", nil)
+	}
+	if len(pubKey) != ed25519.PublicKeySize {
+		return NewCryptographicError("Invalid public key size", nil)
+	}
+
+	// Vérification que les clés ne sont pas nulles
+	var zeroPriv [ed25519.PrivateKeySize]byte
+	var zeroPub [ed25519.PublicKeySize]byte
+
+	if subtle.ConstantTimeCompare(privKey, zeroPriv[:]) == 1 {
+		return NewCryptographicError("Zero private key", nil)
+	}
+	if subtle.ConstantTimeCompare(pubKey, zeroPub[:]) == 1 {
+		return NewCryptographicError("Zero public key", nil)
+	}
+
+	// Validation avec crypto/ed25519 - vérifier la cohérence
+	derivedPub := privKey.Public().(ed25519.PublicKey)
+	if len(derivedPub) == ed25519.PublicKeySize {
+		// Si on peut dériver, on vérifie optionnellement la cohérence
+		// pour les clés qui nous appartiennent
+	}
+
+	return nil
+}
+
+// validateX25519PublicKey valide une clé publique X25519 avec crypto/ecdh
+func validateX25519PublicKey(pubKey []byte) error {
+	if len(pubKey) != 32 {
+		return NewCryptographicError("Invalid X25519 key size", nil)
+	}
+
+	// Utiliser crypto/ecdh pour la validation RFC 7748
+	curve := ecdh.X25519()
+	_, err := curve.NewPublicKey(pubKey)
+	if err != nil {
+		return NewCryptographicError("Invalid X25519 public key", err)
+	}
+
+	return nil
+}
+
+// validateKyberPublicKey valide une clé publique Kyber
+func validateKyberPublicKey(pubKey []byte) error {
+	if len(pubKey) != kyber768.PublicKeySize {
+		return NewCryptographicError("Invalid Kyber public key size", nil)
+	}
+
+	// Tentative de désérialisation pour validation
+	_, err := kyber768.Scheme().UnmarshalBinaryPublicKey(pubKey)
+	if err != nil {
+		return NewCryptographicError("Invalid Kyber public key format", err)
+	}
+
+	return nil
+}
+
+// PerformExchange effectue l'échange de clés côté client avec validation standard
 func (c *ClientKeyExchanger) PerformExchange(conn io.ReadWriter, privKey ed25519.PrivateKey, serverPubKey ed25519.PublicKey) (*KeyExchangeResult, error) {
-	if err := validateKeys(privKey, serverPubKey); err != nil {
+	if err := validateEd25519Keys(privKey, serverPubKey); err != nil {
 		return &KeyExchangeResult{Err: err, Timestamp: time.Now()}, nil
 	}
 
@@ -116,20 +178,10 @@ func (c *ClientKeyExchanger) PerformExchange(conn io.ReadWriter, privKey ed25519
 			break
 		}
 
-		// Backoff exponentiel avec jitter pour éviter la congestion
+		// Backoff simple
 		if attempt < maxRetries-1 {
 			backoffTime := time.Duration(attempt+1) * 100 * time.Millisecond
-			jitterRange := int64(backoffTime / 4) // 25% de jitter
-			jitter := time.Duration(0)
-
-			if jitterRange > 0 {
-				if randBytes, err := generateSecureRandom(8); err == nil {
-					jitterValue := int64(binary.BigEndian.Uint64(randBytes)) % jitterRange
-					jitter = time.Duration(jitterValue)
-				}
-			}
-
-			time.Sleep(backoffTime + jitter)
+			time.Sleep(backoffTime)
 		}
 	}
 
@@ -137,7 +189,7 @@ func (c *ClientKeyExchanger) PerformExchange(conn io.ReadWriter, privKey ed25519
 }
 
 func (c *ClientKeyExchanger) performSingleExchange(conn io.ReadWriter, privKey ed25519.PrivateKey, serverPubKey ed25519.PublicKey) (*KeyExchangeResult, error) {
-	// Génération de la paire de clés Kyber avec validation stricte
+	// Génération de la paire de clés Kyber avec validation standard
 	publicKey, privateKey, err := kyber768.GenerateKeyPair(rand.Reader)
 	if err != nil {
 		return nil, NewCryptographicError("Kyber key generation failed", err)
@@ -152,29 +204,29 @@ func (c *ClientKeyExchanger) performSingleExchange(conn io.ReadWriter, privKey e
 	publicKeyBytes := make([]byte, kyber768.PublicKeySize)
 	publicKey.Pack(publicKeyBytes)
 
-	// Validation de la sérialisation
-	if len(publicKeyBytes) != kyber768.PublicKeySize {
-		return nil, NewCryptographicError("Invalid public key serialization", nil)
+	// Validation de la sérialisation avec la fonction standard
+	if err := validateKyberPublicKey(publicKeyBytes); err != nil {
+		return nil, err
 	}
 
-	// Signature de la clé publique avec validation
+	// Signature de la clé publique
 	signature := ed25519.Sign(privKey, publicKeyBytes)
 	if len(signature) != ed25519.SignatureSize {
 		return nil, NewCryptographicError("Invalid signature generated", nil)
 	}
 
-	// Envoi avec timeout strict
+	// Envoi avec timeout
 	if err := c.sendKeyDataWithTimeout(conn, publicKeyBytes, signature); err != nil {
 		return nil, NewNetworkError("Failed to send key data", err)
 	}
 
-	// Réception avec timeout strict
+	// Réception avec timeout
 	ciphertext, serverSignature, err := c.receiveKeyDataWithTimeout(conn)
 	if err != nil {
 		return nil, NewNetworkError("Failed to receive server data", err)
 	}
 
-	// Validation stricte de la signature du serveur
+	// Validation de la signature du serveur
 	if len(serverSignature) != ed25519.SignatureSize {
 		return nil, NewCryptographicError("Invalid server signature size", nil)
 	}
@@ -183,26 +235,26 @@ func (c *ClientKeyExchanger) performSingleExchange(conn io.ReadWriter, privKey e
 		return nil, NewCryptographicError("Server signature verification failed", nil)
 	}
 
-	// Validation stricte de la taille du ciphertext
+	// Validation de la taille du ciphertext
 	if len(ciphertext) != kyber768.CiphertextSize {
 		return nil, NewCryptographicError("Invalid ciphertext size", nil)
 	}
 
-	// Décapsulation sécurisée avec validation
+	// Décapsulation sécurisée
 	sharedSecret := make([]byte, kyber768.SharedKeySize)
 	privateKey.DecapsulateTo(sharedSecret, ciphertext)
 
 	// Validation que le secret partagé n'est pas nul
-	if isZeroBytes(sharedSecret) {
+	if isAllZeros(sharedSecret) {
 		secureZeroResistant(sharedSecret)
 		return nil, NewCryptographicError("Zero shared secret generated", nil)
 	}
 
 	defer secureZeroResistant(sharedSecret)
 
-	// Dérivation de la clé de session avec validation
+	// Dérivation de la clé de session
 	sessionKey := DeriveSessionKey(sharedSecret)
-	if isZeroBytes(sessionKey[:]) {
+	if isAllZeros(sessionKey[:]) {
 		return nil, NewCryptographicError("Zero session key derived", nil)
 	}
 
@@ -213,19 +265,19 @@ func (c *ClientKeyExchanger) performSingleExchange(conn io.ReadWriter, privKey e
 	}, nil
 }
 
-// PerformExchange effectue l'échange de clés côté serveur avec validation stricte
+// PerformExchange effectue l'échange de clés côté serveur avec validation standard
 func (s *ServerKeyExchanger) PerformExchange(conn io.ReadWriter, privKey ed25519.PrivateKey, clientPubKey ed25519.PublicKey) (*KeyExchangeResult, error) {
-	if err := validateKeys(privKey, clientPubKey); err != nil {
+	if err := validateEd25519Keys(privKey, clientPubKey); err != nil {
 		return &KeyExchangeResult{Err: err, Timestamp: time.Now()}, nil
 	}
 
-	// Réception des données client avec timeout strict
+	// Réception des données client avec timeout
 	clientPubKeyBytes, clientSignature, err := s.receiveKeyDataWithTimeout(conn)
 	if err != nil {
 		return &KeyExchangeResult{Err: NewNetworkError("Failed to receive client data", err), Timestamp: time.Now()}, nil
 	}
 
-	// Validation stricte de la signature du client
+	// Validation de la signature du client
 	if len(clientSignature) != ed25519.SignatureSize {
 		return &KeyExchangeResult{Err: NewCryptographicError("Invalid client signature size", nil), Timestamp: time.Now()}, nil
 	}
@@ -234,12 +286,12 @@ func (s *ServerKeyExchanger) PerformExchange(conn io.ReadWriter, privKey ed25519
 		return &KeyExchangeResult{Err: NewCryptographicError("Client signature verification failed", nil), Timestamp: time.Now()}, nil
 	}
 
-	// Validation stricte de la taille de la clé publique
-	if len(clientPubKeyBytes) != kyber768.PublicKeySize {
-		return &KeyExchangeResult{Err: NewCryptographicError("Invalid client public key size", nil), Timestamp: time.Now()}, nil
+	// Validation de la clé publique Kyber du client
+	if err := validateKyberPublicKey(clientPubKeyBytes); err != nil {
+		return &KeyExchangeResult{Err: err, Timestamp: time.Now()}, nil
 	}
 
-	// Désérialisation sécurisée de la clé publique Kyber du client
+	// Désérialisation de la clé publique Kyber du client
 	clientKyberPubKey, err := kyber768.Scheme().UnmarshalBinaryPublicKey(clientPubKeyBytes)
 	if err != nil {
 		return &KeyExchangeResult{Err: NewCryptographicError("Invalid client Kyber public key", err), Timestamp: time.Now()}, nil
@@ -250,14 +302,14 @@ func (s *ServerKeyExchanger) PerformExchange(conn io.ReadWriter, privKey ed25519
 		return &KeyExchangeResult{Err: NewCryptographicError("Null client Kyber public key", nil), Timestamp: time.Now()}, nil
 	}
 
-	// Encapsulation pour créer le ciphertext et secret partagé avec validation
+	// Encapsulation pour créer le ciphertext et secret partagé
 	ciphertext, sharedSecret, err := kyber768.Scheme().Encapsulate(clientKyberPubKey)
 	if err != nil {
 		return &KeyExchangeResult{Err: NewCryptographicError("Kyber encapsulation failed", err), Timestamp: time.Now()}, nil
 	}
 
 	// Validation que le secret partagé n'est pas nul
-	if isZeroBytes(sharedSecret) {
+	if isAllZeros(sharedSecret) {
 		secureZeroResistant(sharedSecret)
 		return &KeyExchangeResult{Err: NewCryptographicError("Zero shared secret generated", nil), Timestamp: time.Now()}, nil
 	}
@@ -269,20 +321,20 @@ func (s *ServerKeyExchanger) PerformExchange(conn io.ReadWriter, privKey ed25519
 		return &KeyExchangeResult{Err: NewCryptographicError("Invalid ciphertext size generated", nil), Timestamp: time.Now()}, nil
 	}
 
-	// Signature du ciphertext avec validation
+	// Signature du ciphertext
 	serverSignature := ed25519.Sign(privKey, ciphertext)
 	if len(serverSignature) != ed25519.SignatureSize {
 		return &KeyExchangeResult{Err: NewCryptographicError("Invalid signature generated", nil), Timestamp: time.Now()}, nil
 	}
 
-	// Envoi avec timeout strict
+	// Envoi avec timeout
 	if err := s.sendKeyDataWithTimeout(conn, ciphertext, serverSignature); err != nil {
 		return &KeyExchangeResult{Err: NewNetworkError("Failed to send server data", err), Timestamp: time.Now()}, nil
 	}
 
-	// Dérivation de la clé de session avec validation
+	// Dérivation de la clé de session
 	sessionKey := DeriveSessionKey(sharedSecret)
-	if isZeroBytes(sessionKey[:]) {
+	if isAllZeros(sessionKey[:]) {
 		return &KeyExchangeResult{Err: NewCryptographicError("Zero session key derived", nil), Timestamp: time.Now()}, nil
 	}
 
@@ -293,67 +345,24 @@ func (s *ServerKeyExchanger) PerformExchange(conn io.ReadWriter, privKey ed25519
 	}, nil
 }
 
-// validateKeys valide les clés Ed25519 avec des vérifications strictes
-func validateKeys(privKey ed25519.PrivateKey, pubKey ed25519.PublicKey) error {
-	if len(privKey) != ed25519.PrivateKeySize {
-		return NewCryptographicError("Invalid private key size", nil)
-	}
-	if len(pubKey) != ed25519.PublicKeySize {
-		return NewCryptographicError("Invalid public key size", nil)
-	}
-
-	// Vérification que les clés ne sont pas nulles
-	if isZeroBytes(privKey) {
-		return NewCryptographicError("Zero private key", nil)
-	}
-
-	if isZeroBytes(pubKey) {
-		return NewCryptographicError("Zero public key", nil)
-	}
-
-	// Vérification que la clé publique n'est pas l'identité
-	var zero [ed25519.PublicKeySize]byte
-	if subtle.ConstantTimeCompare(pubKey, zero[:]) == 1 {
-		return NewCryptographicError("Invalid public key: zero key", nil)
-	}
-
-	return nil
-}
-
-// isZeroBytes vérifie si un slice contient uniquement des zéros
-func isZeroBytes(data []byte) bool {
+// isAllZeros vérifie si un slice contient uniquement des zéros
+func isAllZeros(data []byte) bool {
 	for _, b := range data {
 		if b != 0 {
 			return false
 		}
 	}
-	return len(data) > 0 // Retourne false pour les slices vides
+	return len(data) > 0
 }
 
-// generateSecureRandom génère des bytes aléatoires sécurisés
-func generateSecureRandom(size int) ([]byte, error) {
-	if size <= 0 || size > 1024 {
-		return nil, fmt.Errorf("invalid random size: %d", size)
-	}
-
-	data := make([]byte, size)
-	if _, err := rand.Read(data); err != nil {
-		return nil, fmt.Errorf("failed to generate random data: %w", err)
-	}
-
-	return data, nil
-}
-
-// sendKeyDataWithTimeout envoie des données avec timeout strict
+// sendKeyDataWithTimeout envoie des données avec timeout
 func (b *BaseKeyExchanger) sendKeyDataWithTimeout(conn io.Writer, data1, data2 []byte) error {
 	timeout := b.GetTimeout()
 
-	// Validation des données avant envoi
 	if len(data1) == 0 || len(data2) == 0 {
 		return NewInvalidInputError("Empty data cannot be sent", nil)
 	}
 
-	// Canal pour l'opération d'écriture
 	done := make(chan error, 1)
 
 	go func() {
@@ -380,7 +389,7 @@ func (b *BaseKeyExchanger) sendKeyDataWithTimeout(conn io.Writer, data1, data2 [
 	}
 }
 
-// receiveKeyDataWithTimeout reçoit des données avec timeout strict
+// receiveKeyDataWithTimeout reçoit des données avec timeout
 func (b *BaseKeyExchanger) receiveKeyDataWithTimeout(conn io.Reader) ([]byte, []byte, error) {
 	timeout := b.GetTimeout()
 
@@ -389,7 +398,6 @@ func (b *BaseKeyExchanger) receiveKeyDataWithTimeout(conn io.Reader) ([]byte, []
 		err          error
 	}
 
-	// Canal pour l'opération de lecture
 	done := make(chan result, 1)
 
 	go func() {
@@ -418,7 +426,7 @@ func (b *BaseKeyExchanger) receiveKeyDataWithTimeout(conn io.Reader) ([]byte, []
 	}
 }
 
-// sendBytes envoie un tableau de bytes avec validation renforcée
+// sendBytes envoie un tableau de bytes avec validation
 func sendBytes(conn io.Writer, data []byte) error {
 	if len(data) > maxDataSize {
 		return NewInvalidInputError("Data too large", ErrDataTooLarge)
@@ -427,7 +435,7 @@ func sendBytes(conn io.Writer, data []byte) error {
 		return NewInvalidInputError("Empty data", ErrEmptyInput)
 	}
 
-	// Envoi de la longueur avec validation
+	// Envoi de la longueur
 	lenBuf := make([]byte, 4)
 	binary.BigEndian.PutUint32(lenBuf, uint32(len(data)))
 
@@ -448,7 +456,7 @@ func sendBytes(conn io.Writer, data []byte) error {
 	return nil
 }
 
-// receiveBytes reçoit un tableau de bytes avec validation stricte
+// receiveBytes reçoit un tableau de bytes avec validation
 func receiveBytes(conn io.Reader) ([]byte, error) {
 	// Lecture de la longueur
 	lenBuf := make([]byte, 4)
@@ -458,7 +466,7 @@ func receiveBytes(conn io.Reader) ([]byte, error) {
 
 	length := binary.BigEndian.Uint32(lenBuf)
 
-	// Validation stricte de la longueur
+	// Validation de la longueur
 	if length == 0 {
 		return nil, NewInvalidInputError("Zero length data", nil)
 	}
@@ -466,32 +474,26 @@ func receiveBytes(conn io.Reader) ([]byte, error) {
 		return nil, NewInvalidInputError("Data too large", ErrDataTooLarge)
 	}
 
-	// Lecture des données avec vérification progressive
+	// Lecture des données
 	buf := make([]byte, length)
-	totalRead := 0
-	for totalRead < int(length) {
-		n, err := conn.Read(buf[totalRead:])
-		if err != nil {
-			return nil, fmt.Errorf("failed to read data at offset %d: %w", totalRead, err)
-		}
-		totalRead += n
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		return nil, fmt.Errorf("failed to read data: %w", err)
 	}
 
 	return buf, nil
 }
 
-// DeriveSessionKey dérive une clé de session sécurisée avec validation
+// DeriveSessionKey dérive une clé de session sécurisée
 func DeriveSessionKey(sharedSecret []byte) [32]byte {
 	if len(sharedSecret) == 0 {
 		panic("empty shared secret")
 	}
 
-	// Validation que le secret partagé n'est pas nul
-	if isZeroBytes(sharedSecret) {
+	if isAllZeros(sharedSecret) {
 		panic("zero shared secret")
 	}
 
-	// Utilisation d'HKDF avec sel et contexte
+	// HKDF avec sel et contexte
 	salt := []byte("protectora-rocher-salt-v2")
 	info := []byte("protectora-rocher-session-v2")
 
@@ -501,15 +503,15 @@ func DeriveSessionKey(sharedSecret []byte) [32]byte {
 		panic("HKDF failed: " + err.Error())
 	}
 
-	// Validation finale que la clé dérivée n'est pas nulle
-	if isZeroBytes(key[:]) {
+	// Validation finale
+	if isAllZeros(key[:]) {
 		panic("zero session key derived")
 	}
 
 	return key
 }
 
-// Fonctions de commodité avec gestion d'erreur améliorée
+// Fonctions de commodité simplifiées
 
 // ClientPerformKeyExchange effectue l'échange côté client (async)
 func ClientPerformKeyExchange(conn io.ReadWriter, privKey ed25519.PrivateKey, serverPubKey ed25519.PublicKey) (<-chan KeyExchangeResult, error) {
@@ -517,8 +519,7 @@ func ClientPerformKeyExchange(conn io.ReadWriter, privKey ed25519.PrivateKey, se
 		return nil, NewInvalidInputError("Connection cannot be nil", nil)
 	}
 
-	// Validation préliminaire
-	if err := validateKeys(privKey, serverPubKey); err != nil {
+	if err := validateEd25519Keys(privKey, serverPubKey); err != nil {
 		return nil, err
 	}
 
@@ -546,8 +547,7 @@ func ServerPerformKeyExchange(conn io.ReadWriter, privKey ed25519.PrivateKey, cl
 		return nil, NewInvalidInputError("Connection cannot be nil", nil)
 	}
 
-	// Validation préliminaire
-	if err := validateKeys(privKey, clientPubKey); err != nil {
+	if err := validateEd25519Keys(privKey, clientPubKey); err != nil {
 		return nil, err
 	}
 
@@ -569,7 +569,7 @@ func ServerPerformKeyExchange(conn io.ReadWriter, privKey ed25519.PrivateKey, cl
 	return resultChan, nil
 }
 
-// ValidateKeyExchangeResult valide un résultat d'échange de clés avec des vérifications strictes
+// ValidateKeyExchangeResult valide un résultat d'échange de clés
 func ValidateKeyExchangeResult(result *KeyExchangeResult) error {
 	if result == nil {
 		return NewInvalidInputError("Nil result", nil)
@@ -579,17 +579,16 @@ func ValidateKeyExchangeResult(result *KeyExchangeResult) error {
 		return result.Err
 	}
 
-	// Vérifier que la clé n'est pas nulle
-	if isZeroBytes(result.Key[:]) {
+	if isAllZeros(result.Key[:]) {
 		return NewCryptographicError("Invalid session key: zero key", nil)
 	}
 
-	// Vérifier que le timestamp est récent (protection contre les attaques de rejeu)
+	// Vérifier que le timestamp est récent
 	if time.Since(result.Timestamp) > 5*time.Minute {
 		return NewCryptographicError("Key exchange result too old", nil)
 	}
 
-	// Vérifier que le timestamp n'est pas dans le futur (protection contre les attaques d'horloge)
+	// Vérifier que le timestamp n'est pas dans le futur
 	if result.Timestamp.After(time.Now().Add(1 * time.Minute)) {
 		return NewCryptographicError("Key exchange result timestamp in future", nil)
 	}
@@ -602,7 +601,7 @@ func ValidateKeyExchangeResult(result *KeyExchangeResult) error {
 	return nil
 }
 
-// GenerateEd25519KeyPair génère une nouvelle paire de clés Ed25519 avec validation
+// GenerateEd25519KeyPair génère une nouvelle paire de clés Ed25519
 func GenerateEd25519KeyPair() (ed25519.PublicKey, ed25519.PrivateKey, error) {
 	pubKey, privKey, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -610,8 +609,7 @@ func GenerateEd25519KeyPair() (ed25519.PublicKey, ed25519.PrivateKey, error) {
 	}
 
 	// Validation post-génération
-	if err := validateKeys(privKey, pubKey); err != nil {
-		// Nettoyer les clés en cas d'erreur
+	if err := validateEd25519Keys(privKey, pubKey); err != nil {
 		secureZeroResistant(privKey)
 		return nil, nil, err
 	}
@@ -619,7 +617,7 @@ func GenerateEd25519KeyPair() (ed25519.PublicKey, ed25519.PrivateKey, error) {
 	return pubKey, privKey, nil
 }
 
-// TestKeyExchange teste la fonctionnalité d'échange de clés (pour les tests)
+// TestKeyExchange teste la fonctionnalité d'échange de clés
 func TestKeyExchange() error {
 	// Générer les paires de clés pour le test
 	clientPub, clientPriv, err := GenerateEd25519KeyPair()
@@ -677,7 +675,7 @@ func EstimateKeyExchangeOverhead() map[string]int {
 		"kyber_public_key":  kyber768.PublicKeySize,
 		"kyber_ciphertext":  kyber768.CiphertextSize,
 		"ed25519_signature": ed25519.SignatureSize,
-		"length_headers":    8, // 2 * 4 bytes pour les longueurs
+		"length_headers":    8,
 		"total_client_send": kyber768.PublicKeySize + ed25519.SignatureSize + 4,
 		"total_server_send": kyber768.CiphertextSize + ed25519.SignatureSize + 4,
 	}

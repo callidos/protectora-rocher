@@ -10,7 +10,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/callidos/protectora-rocher/pkg/utils"
 	"golang.org/x/crypto/hkdf"
 	"golang.org/x/crypto/nacl/secretbox"
 )
@@ -20,7 +19,7 @@ const (
 	CONTROL    = 1
 	END_CALL   = 2
 
-	maxAudioSize   = 32 * 1024 // 32KB max par message
+	maxAudioSize   = 32 * 1024 // 32KB max per message
 	audioNonceSize = 24
 	audioKeySize   = 32
 )
@@ -33,14 +32,14 @@ var (
 	ErrConnectionLost = errors.New("connection lost")
 )
 
-// AudioMessage représente un message audio
+// AudioMessage represents an audio message
 type AudioMessage struct {
 	Type      uint8
 	Timestamp int64
 	Data      []byte
 }
 
-// AudioProtocol gère la communication audio sécurisée avec NaCl secretbox
+// AudioProtocol manages secure audio communication with NaCl secretbox
 type AudioProtocol struct {
 	conn     io.ReadWriter
 	key      [audioKeySize]byte
@@ -49,7 +48,7 @@ type AudioProtocol struct {
 	stopChan chan struct{}
 }
 
-// NewAudioProtocol crée un nouveau protocole audio avec la clé de session partagée
+// NewAudioProtocol creates a new audio protocol with shared session key
 func NewAudioProtocol(conn io.ReadWriter, sessionKey []byte) (*AudioProtocol, error) {
 	if conn == nil {
 		return nil, errors.New("connection required")
@@ -58,7 +57,7 @@ func NewAudioProtocol(conn io.ReadWriter, sessionKey []byte) (*AudioProtocol, er
 		return nil, errors.New("session key too short")
 	}
 
-	// Dérivation de clé spécifique pour l'audio
+	// Key derivation specific for audio
 	salt := []byte("protectora-rocher-salt-v2")
 	info := []byte("protectora-rocher-audio-encryption-v2")
 	h := hkdf.New(sha256.New, sessionKey, salt, info)
@@ -75,14 +74,12 @@ func NewAudioProtocol(conn io.ReadWriter, sessionKey []byte) (*AudioProtocol, er
 		stopChan: make(chan struct{}),
 	}
 
-	utils.Logger.Info("Protocole audio initialisé", map[string]interface{}{
-		"cipher": "NaCl-secretbox",
-	})
+	fmt.Printf("[INFO] Audio protocol initialized - cipher: NaCl-secretbox\n")
 
 	return ap, nil
 }
 
-// StartCall démarre un appel audio sécurisé
+// StartCall starts a secure audio call
 func (ap *AudioProtocol) StartCall() error {
 	ap.mutex.Lock()
 	defer ap.mutex.Unlock()
@@ -94,17 +91,17 @@ func (ap *AudioProtocol) StartCall() error {
 	ap.isActive = true
 	ap.stopChan = make(chan struct{})
 
-	// Envoi du signal de début d'appel
+	// Send call start signal
 	if err := ap.sendControlMessage("START_CALL"); err != nil {
 		ap.isActive = false
 		return fmt.Errorf("failed to start call: %w", err)
 	}
 
-	utils.Logger.Info("Appel audio démarré", nil)
+	fmt.Printf("[INFO] Audio call started - cipher: NaCl-secretbox\n")
 	return nil
 }
 
-// SendAudio envoie des données audio chiffrées
+// SendAudio sends encrypted audio data
 func (ap *AudioProtocol) SendAudio(audioData []byte) error {
 	ap.mutex.RLock()
 	defer ap.mutex.RUnlock()
@@ -114,6 +111,8 @@ func (ap *AudioProtocol) SendAudio(audioData []byte) error {
 	}
 
 	if len(audioData) > maxAudioSize {
+		fmt.Printf("[WARNING] Audio data too large - size: %d, max_size: %d\n",
+			len(audioData), maxAudioSize)
 		return ErrAudioTooLarge
 	}
 
@@ -123,10 +122,17 @@ func (ap *AudioProtocol) SendAudio(audioData []byte) error {
 		Data:      audioData,
 	}
 
-	return ap.sendMessage(message)
+	if err := ap.sendMessage(message); err != nil {
+		fmt.Printf("[ERROR] Failed to send audio data - data_size: %d, error: %v\n",
+			len(audioData), err)
+		return err
+	}
+
+	fmt.Printf("[DEBUG] Audio data sent - size: %d\n", len(audioData))
+	return nil
 }
 
-// ReceiveAudio reçoit et déchiffre des données audio
+// ReceiveAudio receives and decrypts audio data
 func (ap *AudioProtocol) ReceiveAudio() ([]byte, error) {
 	ap.mutex.RLock()
 	defer ap.mutex.RUnlock()
@@ -137,17 +143,21 @@ func (ap *AudioProtocol) ReceiveAudio() ([]byte, error) {
 
 	message, err := ap.receiveMessage()
 	if err != nil {
+		fmt.Printf("[ERROR] Failed to receive audio message - error: %v\n", err)
 		return nil, err
 	}
 
 	if message.Type != AUDIO_DATA {
+		fmt.Printf("[WARNING] Unexpected message type received - expected: %d, received: %d\n",
+			AUDIO_DATA, message.Type)
 		return nil, fmt.Errorf("unexpected message type: %d", message.Type)
 	}
 
+	fmt.Printf("[DEBUG] Audio data received - size: %d\n", len(message.Data))
 	return message.Data, nil
 }
 
-// StopCall arrête l'appel audio
+// StopCall stops the audio call
 func (ap *AudioProtocol) StopCall() error {
 	ap.mutex.Lock()
 	defer ap.mutex.Unlock()
@@ -156,51 +166,49 @@ func (ap *AudioProtocol) StopCall() error {
 		return ErrNoActiveCall
 	}
 
-	// Envoi du signal de fin d'appel
+	// Send end call signal
 	if err := ap.sendControlMessage("END_CALL"); err != nil {
-		utils.Logger.Error("Échec envoi fin d'appel", map[string]interface{}{
-			"error": err.Error(),
-		})
+		fmt.Printf("[WARNING] Failed to send end call signal - error: %v\n", err)
 	}
 
 	ap.isActive = false
 	close(ap.stopChan)
 
-	utils.Logger.Info("Appel audio terminé", nil)
+	fmt.Printf("[INFO] Audio call stopped\n")
 	return nil
 }
 
-// IsActive retourne l'état de l'appel
+// IsActive returns the call state
 func (ap *AudioProtocol) IsActive() bool {
 	ap.mutex.RLock()
 	defer ap.mutex.RUnlock()
 	return ap.isActive
 }
 
-// sendMessage envoie un message audio chiffré avec NaCl secretbox
+// sendMessage sends an encrypted audio message with NaCl secretbox
 func (ap *AudioProtocol) sendMessage(message *AudioMessage) error {
-	// Sérialisation du message
+	// Serialize message
 	serialized, err := ap.serializeMessage(message)
 	if err != nil {
 		return fmt.Errorf("serialization failed: %w", err)
 	}
 
-	// Génération du nonce
+	// Generate nonce
 	var nonce [audioNonceSize]byte
 	if _, err := rand.Read(nonce[:]); err != nil {
 		return fmt.Errorf("nonce generation failed: %w", err)
 	}
 
-	// Chiffrement avec NaCl secretbox
+	// Encrypt with NaCl secretbox
 	encrypted := secretbox.Seal(nil, serialized, &nonce, &ap.key)
 
-	// Format final: taille + nonce + données chiffrées
+	// Final format: size + nonce + encrypted data
 	finalData := make([]byte, 4+audioNonceSize+len(encrypted))
 	binary.BigEndian.PutUint32(finalData[:4], uint32(audioNonceSize+len(encrypted)))
 	copy(finalData[4:4+audioNonceSize], nonce[:])
 	copy(finalData[4+audioNonceSize:], encrypted)
 
-	// Envoi
+	// Send
 	if _, err := ap.conn.Write(finalData); err != nil {
 		return ErrConnectionLost
 	}
@@ -208,26 +216,28 @@ func (ap *AudioProtocol) sendMessage(message *AudioMessage) error {
 	return nil
 }
 
-// receiveMessage reçoit et déchiffre un message audio
+// receiveMessage receives and decrypts an audio message
 func (ap *AudioProtocol) receiveMessage() (*AudioMessage, error) {
-	// Lecture de la taille du message
+	// Read message size
 	sizeBuf := make([]byte, 4)
 	if _, err := io.ReadFull(ap.conn, sizeBuf); err != nil {
 		return nil, ErrConnectionLost
 	}
 
 	size := binary.BigEndian.Uint32(sizeBuf)
-	if size > maxAudioSize*2 { // Marge pour les métadonnées
+	if size > maxAudioSize*2 { // Margin for encryption metadata
+		fmt.Printf("[WARNING] Received message too large - size: %d, max_size: %d\n",
+			size, maxAudioSize*2)
 		return nil, ErrInvalidAudio
 	}
 
-	// Lecture du message complet
+	// Read complete message
 	messageBuf := make([]byte, size)
 	if _, err := io.ReadFull(ap.conn, messageBuf); err != nil {
 		return nil, ErrConnectionLost
 	}
 
-	// Extraction du nonce
+	// Extract nonce
 	if len(messageBuf) < audioNonceSize {
 		return nil, ErrInvalidAudio
 	}
@@ -236,13 +246,14 @@ func (ap *AudioProtocol) receiveMessage() (*AudioMessage, error) {
 	copy(nonce[:], messageBuf[:audioNonceSize])
 	encrypted := messageBuf[audioNonceSize:]
 
-	// Déchiffrement avec NaCl secretbox
+	// Decrypt with NaCl secretbox
 	decrypted, ok := secretbox.Open(nil, encrypted, &nonce, &ap.key)
 	if !ok {
+		fmt.Printf("[ERROR] Audio message decryption failed\n")
 		return nil, fmt.Errorf("decryption failed")
 	}
 
-	// Désérialisation
+	// Deserialize
 	message, err := ap.deserializeMessage(decrypted)
 	if err != nil {
 		return nil, fmt.Errorf("deserialization failed: %w", err)
@@ -251,19 +262,21 @@ func (ap *AudioProtocol) receiveMessage() (*AudioMessage, error) {
 	return message, nil
 }
 
-// sendControlMessage envoie un message de contrôle
+// sendControlMessage sends a control message
 func (ap *AudioProtocol) sendControlMessage(control string) error {
 	message := &AudioMessage{
 		Type:      CONTROL,
 		Timestamp: time.Now().UnixNano(),
 		Data:      []byte(control),
 	}
+
+	fmt.Printf("[DEBUG] Sending control message - control: %s\n", control)
 	return ap.sendMessage(message)
 }
 
-// serializeMessage sérialise un message
+// serializeMessage serializes a message
 func (ap *AudioProtocol) serializeMessage(message *AudioMessage) ([]byte, error) {
-	// Format simple: Type(1) + Timestamp(8) + DataLength(4) + Data
+	// Simple format: Type(1) + Timestamp(8) + DataLength(4) + Data
 	buf := make([]byte, 1+8+4+len(message.Data))
 
 	buf[0] = message.Type
@@ -274,7 +287,7 @@ func (ap *AudioProtocol) serializeMessage(message *AudioMessage) ([]byte, error)
 	return buf, nil
 }
 
-// deserializeMessage désérialise un message
+// deserializeMessage deserializes a message
 func (ap *AudioProtocol) deserializeMessage(data []byte) (*AudioMessage, error) {
 	if len(data) < 13 { // Type(1) + Timestamp(8) + DataLength(4)
 		return nil, ErrInvalidAudio
@@ -294,7 +307,7 @@ func (ap *AudioProtocol) deserializeMessage(data []byte) (*AudioMessage, error) 
 	return message, nil
 }
 
-// GetStats retourne les statistiques de la session audio
+// GetStats returns audio session statistics
 func (ap *AudioProtocol) GetStats() map[string]interface{} {
 	ap.mutex.RLock()
 	defer ap.mutex.RUnlock()
@@ -305,4 +318,158 @@ func (ap *AudioProtocol) GetStats() map[string]interface{} {
 		"nonce_size": audioNonceSize,
 		"max_size":   maxAudioSize,
 	}
+}
+
+// Enhanced audio protocol with metrics and monitoring
+
+// AudioMetrics tracks audio session metrics
+type AudioMetrics struct {
+	StartTime        time.Time
+	BytesSent        uint64
+	BytesReceived    uint64
+	MessagesSent     uint64
+	MessagesReceived uint64
+	Errors           uint64
+	mu               sync.RWMutex
+}
+
+// NewAudioMetrics creates new audio metrics
+func NewAudioMetrics() *AudioMetrics {
+	return &AudioMetrics{
+		StartTime: time.Now(),
+	}
+}
+
+// RecordSent records sent data
+func (am *AudioMetrics) RecordSent(bytes int) {
+	am.mu.Lock()
+	defer am.mu.Unlock()
+	am.BytesSent += uint64(bytes)
+	am.MessagesSent++
+}
+
+// RecordReceived records received data
+func (am *AudioMetrics) RecordReceived(bytes int) {
+	am.mu.Lock()
+	defer am.mu.Unlock()
+	am.BytesReceived += uint64(bytes)
+	am.MessagesReceived++
+}
+
+// RecordError records an error
+func (am *AudioMetrics) RecordError() {
+	am.mu.Lock()
+	defer am.mu.Unlock()
+	am.Errors++
+}
+
+// GetStats returns metrics statistics
+func (am *AudioMetrics) GetStats() map[string]interface{} {
+	am.mu.RLock()
+	defer am.mu.RUnlock()
+
+	duration := time.Since(am.StartTime)
+	return map[string]interface{}{
+		"start_time":        am.StartTime,
+		"duration":          duration,
+		"bytes_sent":        am.BytesSent,
+		"bytes_received":    am.BytesReceived,
+		"messages_sent":     am.MessagesSent,
+		"messages_received": am.MessagesReceived,
+		"errors":            am.Errors,
+		"throughput_sent":   float64(am.BytesSent) / duration.Seconds(),
+		"throughput_recv":   float64(am.BytesReceived) / duration.Seconds(),
+	}
+}
+
+// Enhanced AudioProtocol with metrics
+type EnhancedAudioProtocol struct {
+	*AudioProtocol
+	metrics *AudioMetrics
+}
+
+// NewEnhancedAudioProtocol creates enhanced audio protocol with metrics
+func NewEnhancedAudioProtocol(conn io.ReadWriter, sessionKey []byte) (*EnhancedAudioProtocol, error) {
+	base, err := NewAudioProtocol(conn, sessionKey)
+	if err != nil {
+		return nil, err
+	}
+
+	return &EnhancedAudioProtocol{
+		AudioProtocol: base,
+		metrics:       NewAudioMetrics(),
+	}, nil
+}
+
+// SendAudio sends audio with metrics tracking
+func (eap *EnhancedAudioProtocol) SendAudio(audioData []byte) error {
+	err := eap.AudioProtocol.SendAudio(audioData)
+	if err != nil {
+		eap.metrics.RecordError()
+		fmt.Printf("[ERROR] Enhanced audio send failed - data_size: %d, error: %v\n",
+			len(audioData), err)
+	} else {
+		eap.metrics.RecordSent(len(audioData))
+	}
+	return err
+}
+
+// ReceiveAudio receives audio with metrics tracking
+func (eap *EnhancedAudioProtocol) ReceiveAudio() ([]byte, error) {
+	data, err := eap.AudioProtocol.ReceiveAudio()
+	if err != nil {
+		eap.metrics.RecordError()
+		fmt.Printf("[ERROR] Enhanced audio receive failed - error: %v\n", err)
+	} else {
+		eap.metrics.RecordReceived(len(data))
+	}
+	return data, err
+}
+
+// GetEnhancedStats returns enhanced statistics
+func (eap *EnhancedAudioProtocol) GetEnhancedStats() map[string]interface{} {
+	baseStats := eap.AudioProtocol.GetStats()
+	metricsStats := eap.metrics.GetStats()
+
+	// Merge stats
+	for k, v := range metricsStats {
+		baseStats[k] = v
+	}
+
+	return baseStats
+}
+
+// Utility functions for audio protocol management
+
+// ValidateAudioData validates audio data before sending
+func ValidateAudioData(data []byte) error {
+	if len(data) == 0 {
+		return errors.New("empty audio data")
+	}
+	if len(data) > maxAudioSize {
+		return ErrAudioTooLarge
+	}
+	return nil
+}
+
+// CreateAudioSession creates a new audio session with logging
+func CreateAudioSession(conn io.ReadWriter, sessionKey []byte, enhanced bool) (interface{}, error) {
+	fmt.Printf("[INFO] Creating audio session - enhanced: %t\n", enhanced)
+
+	var protocol interface{}
+	var err error
+
+	if enhanced {
+		protocol, err = NewEnhancedAudioProtocol(conn, sessionKey)
+	} else {
+		protocol, err = NewAudioProtocol(conn, sessionKey)
+	}
+
+	if err != nil {
+		fmt.Printf("[ERROR] Failed to create audio session - error: %v\n", err)
+	} else {
+		fmt.Printf("[INFO] Audio session created successfully\n")
+	}
+
+	return protocol, err
 }
