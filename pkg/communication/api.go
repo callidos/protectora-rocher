@@ -24,6 +24,7 @@ type Session struct {
 	isClient   bool
 	isActive   bool
 	mutex      sync.RWMutex
+	sessionID  string
 
 	// Compteurs de messages
 	sendSeq uint64
@@ -42,10 +43,14 @@ func NewSession(conn io.ReadWriter, privKey ed25519.PrivateKey, remotePubKey ed2
 		config.Timeout = 30 * time.Second
 	}
 
+	// Générer un ID de session unique
+	sessionID := fmt.Sprintf("session_%d", time.Now().UnixNano())
+
 	session := &Session{
-		conn:     conn,
-		isClient: config.IsClient,
-		isActive: false,
+		conn:      conn,
+		isClient:  config.IsClient,
+		isActive:  false,
+		sessionID: sessionID,
 	}
 
 	// Effectuer le handshake
@@ -172,15 +177,15 @@ func (s *Session) SendMessage(message string) error {
 		return fmt.Errorf("ratchet encrypt failed: %w", err)
 	}
 
-	// Chiffrer le message
-	encrypted, err := EncryptAESGCM([]byte(message), messageKey)
+	// Chiffrer le message avec NaCl
+	encrypted, err := EncryptNaClBox([]byte(message), messageKey)
 	if err != nil {
 		return fmt.Errorf("encryption failed: %w", err)
 	}
 
-	// Envoyer le message chiffré avec séquence
+	// Envoyer le message chiffré avec séquence et session
 	s.sendSeq++
-	return SendMessage(s.conn, encrypted, s.sessionKey[:], s.sendSeq, 0)
+	return SendMessageWithSession(s.conn, encrypted, s.sessionKey[:], s.sendSeq, 0, s.sessionID)
 }
 
 // ReceiveMessage reçoit et déchiffre un message
@@ -192,8 +197,8 @@ func (s *Session) ReceiveMessage() (string, error) {
 		return "", ErrSessionNotInitialized
 	}
 
-	// Recevoir le message chiffré
-	encryptedMessage, err := ReceiveMessage(s.conn, s.sessionKey[:])
+	// Recevoir le message chiffré avec session isolée
+	encryptedMessage, err := ReceiveMessageWithSession(s.conn, s.sessionKey[:], s.sessionID)
 	if err != nil {
 		return "", fmt.Errorf("receive failed: %w", err)
 	}
@@ -204,8 +209,8 @@ func (s *Session) ReceiveMessage() (string, error) {
 		return "", fmt.Errorf("ratchet decrypt failed: %w", err)
 	}
 
-	// Déchiffrer le message
-	decrypted, err := DecryptAESGCM(encryptedMessage, messageKey)
+	// Déchiffrer le message avec NaCl
+	decrypted, err := DecryptNaClBox(encryptedMessage, messageKey)
 	if err != nil {
 		return "", fmt.Errorf("decryption failed: %w", err)
 	}
@@ -229,7 +234,10 @@ func (s *Session) Close() error {
 	if s.ratchet != nil {
 		s.ratchet.Reset()
 	}
-	secureZero(s.sessionKey[:])
+	secureZeroResistant(s.sessionKey[:])
+
+	// Nettoyer l'historique de session
+	ResetSessionHistory(s.sessionID)
 
 	// Fermer la connexion si possible
 	if closer, ok := s.conn.(io.Closer); ok {
@@ -246,6 +254,13 @@ func (s *Session) IsActive() bool {
 	return s.isActive
 }
 
+// GetSessionID retourne l'identifiant de session
+func (s *Session) GetSessionID() string {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+	return s.sessionID
+}
+
 // GetStats retourne les statistiques de la session
 func (s *Session) GetStats() map[string]interface{} {
 	s.mutex.RLock()
@@ -256,20 +271,20 @@ func (s *Session) GetStats() map[string]interface{} {
 		"is_client":  s.isClient,
 		"send_count": s.sendSeq,
 		"recv_count": s.recvSeq,
+		"session_id": s.sessionID,
 	}
 
 	if s.ratchet != nil {
-		stats["ratchet_send_num"] = s.ratchet.sendMsgNum
-		stats["ratchet_recv_num"] = s.ratchet.recvMsgNum
+		ratchetStats := s.ratchet.GetStats()
+		stats["ratchet_send_num"] = ratchetStats["send_msg_num"]
+		stats["ratchet_recv_num"] = ratchetStats["recv_msg_num"]
 	}
 
 	return stats
 }
 
-// Fonctions de convenance pour la rétrocompatibilité
-
-// NewClientSessionWithHandshake crée une session client
-func NewClientSessionWithHandshake(conn io.ReadWriter, privKey ed25519.PrivateKey, serverPubKey ed25519.PublicKey) (*Session, error) {
+// NewClientSession crée une session client
+func NewClientSession(conn io.ReadWriter, privKey ed25519.PrivateKey, serverPubKey ed25519.PublicKey) (*Session, error) {
 	config := SessionConfig{
 		IsClient: true,
 		Timeout:  30 * time.Second,
@@ -277,23 +292,13 @@ func NewClientSessionWithHandshake(conn io.ReadWriter, privKey ed25519.PrivateKe
 	return NewSession(conn, privKey, serverPubKey, config)
 }
 
-// NewServerSessionWithHandshake crée une session serveur
-func NewServerSessionWithHandshake(conn io.ReadWriter, privKey ed25519.PrivateKey, clientPubKey ed25519.PublicKey) (*Session, error) {
+// NewServerSession crée une session serveur
+func NewServerSession(conn io.ReadWriter, privKey ed25519.PrivateKey, clientPubKey ed25519.PublicKey) (*Session, error) {
 	config := SessionConfig{
 		IsClient: false,
 		Timeout:  30 * time.Second,
 	}
 	return NewSession(conn, privKey, clientPubKey, config)
-}
-
-// SendSecureMessage méthode de compatibilité
-func (s *Session) SendSecureMessage(message string, seq uint64, duration int) error {
-	return s.SendMessage(message)
-}
-
-// ReceiveSecureMessage méthode de compatibilité
-func (s *Session) ReceiveSecureMessage() (string, error) {
-	return s.ReceiveMessage()
 }
 
 // ResetSecurityState réinitialise l'état de sécurité global

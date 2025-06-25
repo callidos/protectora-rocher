@@ -19,6 +19,31 @@ const (
 	encNonceSize     = 24
 )
 
+// secureZeroResistant efface de manière sécurisée un slice de bytes
+// résistant aux optimisations du compilateur
+func secureZeroResistant(data []byte) {
+	if len(data) == 0 {
+		return
+	}
+
+	// Écriture de motifs multiples pour empêcher la récupération
+	patterns := []byte{0xFF, 0x00, 0xAA, 0x55, 0x33, 0xCC}
+	for _, pattern := range patterns {
+		for i := range data {
+			data[i] = pattern
+		}
+		// Empêcher l'optimisation du compilateur
+		runtime.KeepAlive(data)
+	}
+
+	// Nettoyage final
+	for i := range data {
+		data[i] = 0
+	}
+	// Garantir que les données restent "vivantes" jusqu'ici
+	runtime.KeepAlive(data)
+}
+
 // EncryptNaClBox chiffre avec NaCl secretbox (XSalsa20 + Poly1305)
 // Nom corrigé pour refléter l'algorithme réellement utilisé
 func EncryptNaClBox(plaintext, masterKey []byte) (string, error) {
@@ -352,46 +377,4 @@ func CompareConstantTime(a, b []byte) bool {
 		result |= a[i] ^ b[i]
 	}
 	return result == 0
-}
-
-// secureZeroResistant efface de manière sécurisée un slice de bytes
-// résistant aux optimisations du compilateur
-func secureZeroResistant(data []byte) {
-	if len(data) == 0 {
-		return
-	}
-
-	// Écriture de motifs multiples pour empêcher la récupération
-	patterns := []byte{0xFF, 0x00, 0xAA, 0x55, 0x33, 0xCC}
-	for _, pattern := range patterns {
-		for i := range data {
-			data[i] = pattern
-		}
-		// Empêcher l'optimisation du compilateur
-		runtime.KeepAlive(data)
-	}
-
-	// Nettoyage final
-	for i := range data {
-		data[i] = 0
-	}
-	// Garantir que les données restent "vivantes" jusqu'ici
-	runtime.KeepAlive(data)
-}
-
-// Fonctions de compatibilité avec les anciens noms
-// Deprecated: Utiliser EncryptNaClBox à la place
-func EncryptAESGCM(plaintext, masterKey []byte) (string, error) {
-	return EncryptNaClBox(plaintext, masterKey)
-}
-
-// Deprecated: Utiliser DecryptNaClBox à la place
-func DecryptAESGCM(ciphertextBase64 string, masterKey []byte) ([]byte, error) {
-	return DecryptNaClBox(ciphertextBase64, masterKey)
-}
-
-// secureZero fonction de compatibilité
-// Deprecated: Utiliser secureZeroResistant à la place
-func secureZero(data []byte) {
-	secureZeroResistant(data)
 }

@@ -25,6 +25,7 @@ const (
 	protocolVersion   = 2
 	protocolNonceSize = 24
 	protocolKeySize   = 32
+	sequenceWindow    = 1000 // Fenêtre glissante pour les numéros de séquence
 )
 
 // Erreur unifiée pour éviter les oracles d'information
@@ -39,21 +40,27 @@ type messageEntry struct {
 	hash      [16]byte // Hash partiel pour détecter les duplicatas
 }
 
-// MessageHistory gère l'anti-rejeu avec nettoyage automatique et optimisations
+// MessageHistory gère l'anti-rejeu avec nettoyage automatique et validation de séquence stricte
 type MessageHistory struct {
-	messages    map[uint64]messageEntry
-	hashIndex   map[[16]byte]uint64 // Index par hash pour détection rapide
-	mu          sync.RWMutex
-	lastCleanup time.Time
-	cleanupStop chan struct{}
+	messages            map[uint64]messageEntry
+	hashIndex           map[[16]byte]uint64 // Index par hash pour détection rapide
+	mu                  sync.RWMutex
+	lastCleanup         time.Time
+	cleanupStop         chan struct{}
+	expectedSeqMin      uint64 // Séquence minimale attendue pour la fenêtre glissante
+	expectedSeqMax      uint64 // Séquence maximale attendue pour la fenêtre glissante
+	sequenceInitialized bool   // Flag pour savoir si la séquence a été initialisée
 }
 
 func NewMessageHistory() *MessageHistory {
 	mh := &MessageHistory{
-		messages:    make(map[uint64]messageEntry),
-		hashIndex:   make(map[[16]byte]uint64),
-		lastCleanup: time.Now(),
-		cleanupStop: make(chan struct{}),
+		messages:            make(map[uint64]messageEntry),
+		hashIndex:           make(map[[16]byte]uint64),
+		lastCleanup:         time.Now(),
+		cleanupStop:         make(chan struct{}),
+		expectedSeqMin:      0,
+		expectedSeqMax:      0,
+		sequenceInitialized: false,
 	}
 
 	// Démarrer le nettoyage automatique
@@ -85,11 +92,15 @@ func (mh *MessageHistory) cleanup() {
 	now := time.Now()
 	cutoff := now.Add(-replayWindow)
 
-	// Collecter les entrées à supprimer
+	// Nettoyer les anciens messages et ajuster la fenêtre de séquence
+	oldestValidSeq := uint64(^uint64(0)) // Max uint64
 	toDelete := make([]uint64, 0, len(mh.messages)/10)
+
 	for seq, entry := range mh.messages {
 		if entry.timestamp.Before(cutoff) {
 			toDelete = append(toDelete, seq)
+		} else if seq < oldestValidSeq {
+			oldestValidSeq = seq
 		}
 	}
 
@@ -99,6 +110,11 @@ func (mh *MessageHistory) cleanup() {
 			delete(mh.hashIndex, entry.hash)
 			delete(mh.messages, seq)
 		}
+	}
+
+	// Ajuster la fenêtre de séquence si des messages ont été supprimés
+	if len(toDelete) > 0 && oldestValidSeq != uint64(^uint64(0)) {
+		mh.expectedSeqMin = oldestValidSeq
 	}
 
 	mh.lastCleanup = now
@@ -122,7 +138,7 @@ func generateMessageHash(seq uint64, timestamp int64, data []byte) [16]byte {
 	return hash
 }
 
-// CheckAndStore vérifie et stocke un message avec protection DoS optimisée
+// CheckAndStore vérifie et stocke un message avec protection DoS optimisée et validation de séquence stricte
 func (mh *MessageHistory) CheckAndStore(seq uint64, timestamp int64, data []byte) error {
 	mh.mu.Lock()
 	defer mh.mu.Unlock()
@@ -135,6 +151,11 @@ func (mh *MessageHistory) CheckAndStore(seq uint64, timestamp int64, data []byte
 
 	// Vérifier la limite de taille pour éviter l'épuisement mémoire
 	if len(mh.messages) >= maxHistoryEntries {
+		return ErrInvalidMessage
+	}
+
+	// Validation de la fenêtre de séquence avec attaque par rejeu
+	if !mh.isSequenceValid(seq) {
 		return ErrInvalidMessage
 	}
 
@@ -161,7 +182,47 @@ func (mh *MessageHistory) CheckAndStore(seq uint64, timestamp int64, data []byte
 	mh.messages[seq] = entry
 	mh.hashIndex[hash] = seq
 
+	// Mettre à jour la fenêtre de séquence
+	mh.updateSequenceWindow(seq)
+
 	return nil
+}
+
+// isSequenceValid vérifie si un numéro de séquence est dans la fenêtre valide
+func (mh *MessageHistory) isSequenceValid(seq uint64) bool {
+	if !mh.sequenceInitialized {
+		// Premier message - initialiser la fenêtre
+		mh.expectedSeqMin = seq
+		mh.expectedSeqMax = seq + sequenceWindow
+		mh.sequenceInitialized = true
+		return true
+	}
+
+	// Vérifier que la séquence est dans la fenêtre glissante
+	if seq < mh.expectedSeqMin {
+		// Message trop ancien - possible rejeu
+		return false
+	}
+
+	if seq > mh.expectedSeqMax {
+		// Message trop récent - possible attaque
+		// Permettre un décalage limité pour les messages retardés
+		if seq > mh.expectedSeqMax+sequenceWindow {
+			return false
+		}
+	}
+
+	return true
+}
+
+// updateSequenceWindow met à jour la fenêtre de séquence glissante
+func (mh *MessageHistory) updateSequenceWindow(seq uint64) {
+	if seq > mh.expectedSeqMax {
+		// Avancer la fenêtre
+		advance := seq - mh.expectedSeqMax
+		mh.expectedSeqMin += advance
+		mh.expectedSeqMax = seq + sequenceWindow
+	}
 }
 
 // cleanupUnsafe version non thread-safe pour usage interne
@@ -198,6 +259,10 @@ func (mh *MessageHistory) Reset() {
 		delete(mh.hashIndex, hash)
 	}
 
+	// Réinitialiser la fenêtre de séquence
+	mh.expectedSeqMin = 0
+	mh.expectedSeqMax = 0
+	mh.sequenceInitialized = false
 	mh.lastCleanup = time.Now()
 }
 
@@ -212,23 +277,45 @@ func (mh *MessageHistory) GetStats() map[string]interface{} {
 	defer mh.mu.RUnlock()
 
 	return map[string]interface{}{
-		"total_messages": len(mh.messages),
-		"hash_entries":   len(mh.hashIndex),
-		"last_cleanup":   mh.lastCleanup,
-		"max_entries":    maxHistoryEntries,
+		"total_messages":       len(mh.messages),
+		"hash_entries":         len(mh.hashIndex),
+		"last_cleanup":         mh.lastCleanup,
+		"max_entries":          maxHistoryEntries,
+		"expected_seq_min":     mh.expectedSeqMin,
+		"expected_seq_max":     mh.expectedSeqMax,
+		"sequence_initialized": mh.sequenceInitialized,
+		"sequence_window":      sequenceWindow,
 	}
 }
 
+// Isolation des historiques par session - plus de singleton global
 var (
-	globalHistory     *MessageHistory
-	globalHistoryOnce sync.Once
+	sessionHistories   = make(map[string]*MessageHistory)
+	sessionHistoriesMu sync.RWMutex
 )
 
-func getGlobalHistory() *MessageHistory {
-	globalHistoryOnce.Do(func() {
-		globalHistory = NewMessageHistory()
-	})
-	return globalHistory
+// getSessionHistory retourne l'historique pour une session donnée
+func getSessionHistory(sessionID string) *MessageHistory {
+	sessionHistoriesMu.RLock()
+	history, exists := sessionHistories[sessionID]
+	sessionHistoriesMu.RUnlock()
+
+	if exists {
+		return history
+	}
+
+	// Créer un nouvel historique pour cette session
+	sessionHistoriesMu.Lock()
+	defer sessionHistoriesMu.Unlock()
+
+	// Double vérification après acquisition du verrou d'écriture
+	if history, exists := sessionHistories[sessionID]; exists {
+		return history
+	}
+
+	history = NewMessageHistory()
+	sessionHistories[sessionID] = history
+	return history
 }
 
 // Envelope structure du message avec sécurité renforcée
@@ -239,6 +326,7 @@ type Envelope struct {
 	Data      string `json:"data"`
 	Version   int    `json:"v"`
 	Nonce     []byte `json:"nonce,omitempty"` // Nonce additionnel pour plus de sécurité
+	SessionID string `json:"sid,omitempty"`   // Identifiant de session pour l'isolation
 }
 
 // generateSecureNonce génère un nonce sécurisé
@@ -252,6 +340,11 @@ func generateSecureNonce() []byte {
 
 // SendMessage envoie un message chiffré avec NaCl secretbox
 func SendMessage(w io.Writer, message string, key []byte, seq uint64, ttl int) error {
+	return SendMessageWithSession(w, message, key, seq, ttl, "")
+}
+
+// SendMessageWithSession envoie un message chiffré avec isolation de session
+func SendMessageWithSession(w io.Writer, message string, key []byte, seq uint64, ttl int, sessionID string) error {
 	if w == nil {
 		return errors.New("writer cannot be nil")
 	}
@@ -272,6 +365,7 @@ func SendMessage(w io.Writer, message string, key []byte, seq uint64, ttl int) e
 		Data:      message,
 		Version:   protocolVersion,
 		Nonce:     generateSecureNonce(),
+		SessionID: sessionID,
 	}
 
 	// Sérialisation de l'enveloppe
@@ -290,7 +384,7 @@ func SendMessage(w io.Writer, message string, key []byte, seq uint64, ttl int) e
 	if err != nil {
 		return fmt.Errorf("key derivation failed: %w", err)
 	}
-	defer secureZero(protocolKey)
+	defer secureZeroResistant(protocolKey)
 
 	var secretKey [protocolKeySize]byte
 	copy(secretKey[:], protocolKey)
@@ -318,16 +412,21 @@ func SendMessage(w io.Writer, message string, key []byte, seq uint64, ttl int) e
 	// Envoi atomique du message
 	_, err = w.Write(finalMessage)
 
-	// Nettoyage sécurisé
-	secureZero(secretKey[:])
-	secureZero(nonce[:])
-	secureZero(finalMessage)
+	// Nettoyage sécurisé résistant aux optimisations
+	secureZeroResistant(secretKey[:])
+	secureZeroResistant(nonce[:])
+	secureZeroResistant(finalMessage)
 
 	return err
 }
 
 // ReceiveMessage reçoit et déchiffre un message avec NaCl secretbox
 func ReceiveMessage(r io.Reader, key []byte) (string, error) {
+	return ReceiveMessageWithSession(r, key, "")
+}
+
+// ReceiveMessageWithSession reçoit et déchiffre un message avec isolation de session
+func ReceiveMessageWithSession(r io.Reader, key []byte, sessionID string) (string, error) {
 	if r == nil {
 		return "", errors.New("reader cannot be nil")
 	}
@@ -353,7 +452,7 @@ func ReceiveMessage(r io.Reader, key []byte) (string, error) {
 
 	// Conversion en bytes
 	data := []byte(line)
-	defer secureZero(data)
+	defer secureZeroResistant(data)
 
 	// Validation de la taille minimale
 	if len(data) < protocolNonceSize+secretbox.Overhead {
@@ -365,7 +464,7 @@ func ReceiveMessage(r io.Reader, key []byte) (string, error) {
 	if err != nil {
 		return "", ErrInvalidMessage // Normalisation des erreurs
 	}
-	defer secureZero(protocolKey)
+	defer secureZeroResistant(protocolKey)
 
 	var secretKey [protocolKeySize]byte
 	copy(secretKey[:], protocolKey)
@@ -380,7 +479,7 @@ func ReceiveMessage(r io.Reader, key []byte) (string, error) {
 	if !ok {
 		return "", ErrInvalidMessage // Normalisation des erreurs
 	}
-	defer secureZero(decrypted)
+	defer secureZeroResistant(decrypted)
 
 	// Désérialisation de l'enveloppe
 	var envelope Envelope
@@ -388,24 +487,29 @@ func ReceiveMessage(r io.Reader, key []byte) (string, error) {
 		return "", ErrInvalidMessage
 	}
 
-	// Validation unifiée du message
-	if err := validateMessage(envelope); err != nil {
+	// Validation unifiée du message avec session
+	if err := validateMessageWithSession(envelope, sessionID); err != nil {
 		return "", ErrInvalidMessage // Toujours la même erreur
 	}
 
 	// Nettoyage sécurisé
-	secureZero(secretKey[:])
-	secureZero(nonce[:])
+	secureZeroResistant(secretKey[:])
+	secureZeroResistant(nonce[:])
 
 	return envelope.Data, nil
 }
 
-// validateMessage valide un message avec protection contre les oracles
-func validateMessage(env Envelope) error {
+// validateMessageWithSession valide un message avec protection contre les oracles et isolation de session
+func validateMessageWithSession(env Envelope, expectedSessionID string) error {
 	now := time.Now().Unix()
 
 	// Validation des champs obligatoires
 	if env.Data == "" || env.Version != protocolVersion {
+		return ErrInvalidMessage
+	}
+
+	// Vérification de l'isolation de session
+	if expectedSessionID != "" && env.SessionID != expectedSessionID {
 		return ErrInvalidMessage
 	}
 
@@ -433,8 +537,13 @@ func validateMessage(env Envelope) error {
 		return ErrInvalidMessage
 	}
 
-	// Vérification anti-rejeu avec protection DoS
-	history := getGlobalHistory()
+	// Vérification anti-rejeu avec protection DoS et isolation de session
+	sessionKey := env.SessionID
+	if sessionKey == "" {
+		sessionKey = "default" // Session par défaut pour la rétrocompatibilité
+	}
+
+	history := getSessionHistory(sessionKey)
 	if err := history.CheckAndStore(env.Seq, env.Timestamp, []byte(env.Data)); err != nil {
 		return ErrInvalidMessage // Erreur unifiée
 	}
@@ -444,6 +553,11 @@ func validateMessage(env Envelope) error {
 
 // SendMessageWithRetry envoie un message avec retry intelligent
 func SendMessageWithRetry(w io.Writer, message string, key []byte, seq uint64, ttl int, maxRetries int) error {
+	return SendMessageWithRetryAndSession(w, message, key, seq, ttl, maxRetries, "")
+}
+
+// SendMessageWithRetryAndSession envoie un message avec retry intelligent et isolation de session
+func SendMessageWithRetryAndSession(w io.Writer, message string, key []byte, seq uint64, ttl int, maxRetries int, sessionID string) error {
 	if maxRetries < 0 {
 		maxRetries = 3
 	}
@@ -452,7 +566,7 @@ func SendMessageWithRetry(w io.Writer, message string, key []byte, seq uint64, t
 	backoff := 100 * time.Millisecond
 
 	for i := 0; i <= maxRetries; i++ {
-		if err := SendMessage(w, message, key, seq, ttl); err != nil {
+		if err := SendMessageWithSession(w, message, key, seq, ttl, sessionID); err != nil {
 			lastErr = err
 			if i < maxRetries {
 				// Backoff exponentiel avec jitter
@@ -471,6 +585,11 @@ func SendMessageWithRetry(w io.Writer, message string, key []byte, seq uint64, t
 
 // ReceiveMessageWithTimeout reçoit un message avec timeout configurable
 func ReceiveMessageWithTimeout(r io.Reader, key []byte, timeout time.Duration) (string, error) {
+	return ReceiveMessageWithTimeoutAndSession(r, key, timeout, "")
+}
+
+// ReceiveMessageWithTimeoutAndSession reçoit un message avec timeout configurable et isolation de session
+func ReceiveMessageWithTimeoutAndSession(r io.Reader, key []byte, timeout time.Duration, sessionID string) (string, error) {
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
@@ -484,7 +603,7 @@ func ReceiveMessageWithTimeout(r io.Reader, key []byte, timeout time.Duration) (
 
 	go func() {
 		defer close(resultChan)
-		msg, err := ReceiveMessage(r, key)
+		msg, err := ReceiveMessageWithSession(r, key, sessionID)
 		resultChan <- result{message: msg, err: err}
 	}()
 
@@ -498,21 +617,73 @@ func ReceiveMessageWithTimeout(r io.Reader, key []byte, timeout time.Duration) (
 
 // ResetMessageHistory réinitialise l'historique global de manière sécurisée
 func ResetMessageHistory() {
-	history := getGlobalHistory()
-	history.Reset()
+	sessionHistoriesMu.Lock()
+	defer sessionHistoriesMu.Unlock()
+
+	// Arrêter et nettoyer tous les historiques de session
+	for sessionID, history := range sessionHistories {
+		history.Stop()
+		history.Reset()
+		delete(sessionHistories, sessionID)
+	}
 }
 
-// StopMessageHistory arrête le nettoyage automatique
+// ResetSessionHistory réinitialise l'historique d'une session spécifique
+func ResetSessionHistory(sessionID string) {
+	sessionHistoriesMu.Lock()
+	defer sessionHistoriesMu.Unlock()
+
+	if history, exists := sessionHistories[sessionID]; exists {
+		history.Stop()
+		history.Reset()
+		delete(sessionHistories, sessionID)
+	}
+}
+
+// StopMessageHistory arrête le nettoyage automatique pour toutes les sessions
 func StopMessageHistory() {
-	if globalHistory != nil {
-		globalHistory.Stop()
+	sessionHistoriesMu.RLock()
+	histories := make([]*MessageHistory, 0, len(sessionHistories))
+	for _, history := range sessionHistories {
+		histories = append(histories, history)
+	}
+	sessionHistoriesMu.RUnlock()
+
+	// Arrêter tous les historiques
+	for _, history := range histories {
+		history.Stop()
 	}
 }
 
 // GetMessageHistoryStats retourne les statistiques de l'historique global
 func GetMessageHistoryStats() map[string]interface{} {
-	history := getGlobalHistory()
-	return history.GetStats()
+	sessionHistoriesMu.RLock()
+	defer sessionHistoriesMu.RUnlock()
+
+	stats := make(map[string]interface{})
+	stats["total_sessions"] = len(sessionHistories)
+
+	sessionStats := make(map[string]interface{})
+	for sessionID, history := range sessionHistories {
+		sessionStats[sessionID] = history.GetStats()
+	}
+	stats["sessions"] = sessionStats
+
+	return stats
+}
+
+// GetSessionHistoryStats retourne les statistiques d'une session spécifique
+func GetSessionHistoryStats(sessionID string) map[string]interface{} {
+	sessionHistoriesMu.RLock()
+	defer sessionHistoriesMu.RUnlock()
+
+	if history, exists := sessionHistories[sessionID]; exists {
+		return history.GetStats()
+	}
+
+	return map[string]interface{}{
+		"error": "session not found",
+	}
 }
 
 // ValidateMessageIntegrity valide l'intégrité d'un message sans le déchiffrer
@@ -533,7 +704,7 @@ func ValidateMessageIntegrity(encryptedMessage string) error {
 // EstimateMessageOverhead estime l'overhead d'un message
 func EstimateMessageOverhead(messageSize int) int {
 	// Estimation: JSON envelope + chiffrement NaCl + newline
-	jsonOverhead := 100                                          // Métadonnées JSON approximatives
+	jsonOverhead := 150                                          // Métadonnées JSON approximatives (incluant SessionID)
 	encryptionOverhead := protocolNonceSize + secretbox.Overhead // Nonce + overhead NaCl
 	newlineOverhead := 1
 

@@ -27,14 +27,20 @@ var (
 	ErrInvalidIdentifier      = errors.New("invalid identifier")
 )
 
-// Points interdits pour Curve25519 selon RFC 7748
+// Points interdits pour Curve25519 selon RFC 7748 - CORRIGÉS
 var forbiddenPoints = [][32]byte{
-	{},  // Point zéro
-	{1}, // Point 1
+	{}, // Point zéro (tous les octets à 0)
+	// Point d'ordre 2 - CORRIGÉ
+	{1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+	// Point d'ordre 4 - CORRIGÉ selon RFC 7748
 	{0xe0, 0xeb, 0x7a, 0x7c, 0x3b, 0x41, 0xb8, 0xae, 0x16, 0x56, 0xe3, 0xfa, 0xf1, 0x9f, 0xc4, 0x6a,
-		0xda, 0x09, 0x8d, 0xeb, 0x9c, 0x32, 0xb1, 0xfd, 0x86, 0x62, 0x05, 0x16, 0x5f, 0x49, 0xb8, 0x00}, // Order 8
+		0xda, 0x09, 0x8d, 0xeb, 0x9c, 0x32, 0xb1, 0xfd, 0x86, 0x62, 0x05, 0x16, 0x5f, 0x49, 0xb8, 0x00},
+	// Point d'ordre 8 - CORRIGÉ selon RFC 7748
 	{0x5f, 0x9c, 0x95, 0xbc, 0xa3, 0x50, 0x8c, 0x24, 0xb1, 0xd0, 0xb1, 0x55, 0x9c, 0x83, 0xef, 0x5b,
-		0x04, 0x44, 0x5c, 0xc4, 0x58, 0x1c, 0x8e, 0x86, 0xd8, 0x22, 0x4e, 0xdd, 0xd0, 0x9f, 0x11, 0x57}, // Order 4
+		0x04, 0x44, 0x5c, 0xc4, 0x58, 0x1c, 0x8e, 0x86, 0xd8, 0x22, 0x4e, 0xdd, 0xd0, 0x9f, 0x11, 0x57},
+	// Point avec le bit de signe le plus élevé défini - peut causer des problèmes
+	{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80},
 }
 
 // DHKeyPair représente une paire de clés Curve25519
@@ -43,22 +49,35 @@ type DHKeyPair struct {
 	Public  [32]byte
 }
 
-// GenerateDHKeyPair génère une nouvelle paire de clés Curve25519
+// GenerateDHKeyPair génère une nouvelle paire de clés Curve25519 avec validation stricte
 func GenerateDHKeyPair() (*DHKeyPair, error) {
 	var priv [32]byte
-	if _, err := rand.Read(priv[:]); err != nil {
-		return nil, err
+	var pub [32]byte
+
+	// Boucle pour s'assurer que nous générons une clé publique valide
+	maxAttempts := 10
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if _, err := rand.Read(priv[:]); err != nil {
+			return nil, err
+		}
+
+		// Forcer les bits selon RFC 7748
+		priv[0] &= 248
+		priv[31] &= 127
+		priv[31] |= 64
+
+		curve25519.ScalarBaseMult(&pub, &priv)
+
+		// Valider que la clé publique générée n'est pas interdite
+		if validateDHPublicKey(pub) {
+			return &DHKeyPair{Private: priv, Public: pub}, nil
+		}
+
+		// Nettoyer et essayer à nouveau
+		secureZeroResistant(priv[:])
 	}
 
-	// Forcer les bits selon RFC 7748
-	priv[0] &= 248
-	priv[31] &= 127
-	priv[31] |= 64
-
-	var pub [32]byte
-	curve25519.ScalarBaseMult(&pub, &priv)
-
-	return &DHKeyPair{Private: priv, Public: pub}, nil
+	return nil, errors.New("failed to generate valid DH keypair after maximum attempts")
 }
 
 // validateDHPublicKey valide qu'une clé publique DH est sécurisée selon RFC 7748
@@ -70,27 +89,29 @@ func validateDHPublicKey(pubKey [32]byte) bool {
 		}
 	}
 
-	// Vérification que le point produit un secret DH non-zéro
-	var testPriv [32]byte
-	if _, err := rand.Read(testPriv[:]); err != nil {
-		return false
+	// Vérification supplémentaire : s'assurer que le point produit un secret DH non-zéro
+	// avec plusieurs clés de test pour éviter les cas pathologiques
+	testKeys := [][32]byte{
+		{9}, // Point générateur de base
+		{1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
 	}
 
-	// Forcer les bits selon RFC 7748
-	testPriv[0] &= 248
-	testPriv[31] &= 127
-	testPriv[31] |= 64
+	for _, testKey := range testKeys {
+		result, err := curve25519.X25519(testKey[:], pubKey[:])
+		if err != nil {
+			return false
+		}
 
-	result, err := curve25519.X25519(testPriv[:], pubKey[:])
-	if err != nil {
-		return false
+		var zero [32]byte
+		if subtle.ConstantTimeCompare(result, zero[:]) == 1 {
+			return false
+		}
 	}
 
-	var zero [32]byte
-	return subtle.ConstantTimeCompare(result, zero[:]) != 1
+	return true
 }
 
-// validateIdentifier valide un identifiant de message sauté
+// validateIdentifier valide un identifiant de message sauté avec règles strictes
 func validateIdentifier(id string) bool {
 	if len(id) == 0 || len(id) > maxIdentifierLen {
 		return false
@@ -99,10 +120,19 @@ func validateIdentifier(id string) bool {
 	// Vérifier que l'identifiant ne contient que des caractères sûrs
 	for _, r := range id {
 		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
-			(r >= '0' && r <= '9') || r == '-' || r == '_' || r == ':') {
+			(r >= '0' && r <= '9') || r == '-' || r == '_' || r == ':' || r == '.') {
 			return false
 		}
 	}
+
+	// Vérifier que l'identifiant ne commence pas par un caractère spécial
+	if len(id) > 0 {
+		first := rune(id[0])
+		if !((first >= 'a' && first <= 'z') || (first >= 'A' && first <= 'Z') || (first >= '0' && first <= '9')) {
+			return false
+		}
+	}
+
 	return true
 }
 
@@ -135,6 +165,9 @@ type DoubleRatchet struct {
 	receivingChainInitialized bool
 	isServer                  bool
 	isLocked                  bool
+
+	// Protection contre les attaques par épuisement
+	maxChainAdvance uint32
 }
 
 // InitializeDoubleRatchet initialise le ratchet avec validation renforcée
@@ -157,10 +190,11 @@ func InitializeDoubleRatchet(sessionKey []byte, ourDH *DHKeyPair, remoteDHPublic
 	}
 
 	dr := &DoubleRatchet{
-		dhSelf:         ourDH,
-		dhRemote:       remoteDHPublic,
-		skippedKeys:    make(map[string][32]byte),
-		skippedKeysLen: 0,
+		dhSelf:          ourDH,
+		dhRemote:        remoteDHPublic,
+		skippedKeys:     make(map[string][32]byte),
+		skippedKeysLen:  0,
+		maxChainAdvance: 1000, // Limite pour éviter l'épuisement DoS
 	}
 
 	// Initialiser la clé racine avec dérivation sécurisée
@@ -182,6 +216,11 @@ func (dr *DoubleRatchet) RatchetEncrypt() ([]byte, error) {
 		if err := dr.initializeSendingChainUnsafe(); err != nil {
 			return nil, err
 		}
+	}
+
+	// Protection contre l'avancement excessif
+	if dr.sendMsgNum > dr.maxChainAdvance {
+		return nil, errors.New("chain advance limit exceeded")
 	}
 
 	// Dériver la clé de message
@@ -212,6 +251,11 @@ func (dr *DoubleRatchet) RatchetDecrypt() ([]byte, error) {
 		}
 	}
 
+	// Protection contre l'avancement excessif
+	if dr.recvMsgNum > dr.maxChainAdvance {
+		return nil, errors.New("chain advance limit exceeded")
+	}
+
 	// Dériver la clé de message
 	messageKey, err := dr.deriveMessageKeyUnsafe(dr.receivingChainKey[:], dr.recvMsgNum)
 	if err != nil {
@@ -231,7 +275,7 @@ func (dr *DoubleRatchet) initializeSendingChainUnsafe() error {
 	if err != nil {
 		return err
 	}
-	defer secureZero(dhSecret)
+	defer secureZeroResistant(dhSecret)
 
 	// Vérifier que le secret DH n'est pas zéro
 	var zero [32]byte
@@ -258,7 +302,7 @@ func (dr *DoubleRatchet) initializeReceivingChainUnsafe() error {
 	if err != nil {
 		return err
 	}
-	defer secureZero(dhSecret)
+	defer secureZeroResistant(dhSecret)
 
 	// Vérifier que le secret DH n'est pas zéro
 	var zero [32]byte
@@ -329,6 +373,11 @@ func (dr *DoubleRatchet) PerformDHRatchet(newRemotePub [32]byte) error {
 		return ErrInvalidDHKey
 	}
 
+	// Vérifier que la nouvelle clé est différente de l'ancienne
+	if subtle.ConstantTimeCompare(newRemotePub[:], dr.dhRemote[:]) == 1 {
+		return errors.New("new DH key must be different from current")
+	}
+
 	// Sauvegarder l'état précédent
 	dr.prevMsgNum = dr.sendMsgNum
 	dr.sendMsgNum = 0
@@ -348,7 +397,7 @@ func (dr *DoubleRatchet) PerformDHRatchet(newRemotePub [32]byte) error {
 	if err != nil {
 		return err
 	}
-	defer secureZero(dhSecret)
+	defer secureZeroResistant(dhSecret)
 
 	// Vérifier que le secret DH n'est pas zéro
 	var zero [32]byte
@@ -369,8 +418,8 @@ func (dr *DoubleRatchet) PerformDHRatchet(newRemotePub [32]byte) error {
 
 	// Nettoyage sécurisé de l'ancienne clé DH
 	if dr.dhSelf != nil {
-		secureZero(dr.dhSelf.Private[:])
-		secureZero(dr.dhSelf.Public[:])
+		secureZeroResistant(dr.dhSelf.Private[:])
+		secureZeroResistant(dr.dhSelf.Public[:])
 	}
 
 	// Mettre à jour l'état
@@ -449,24 +498,24 @@ func (dr *DoubleRatchet) Reset() {
 	dr.isLocked = true
 
 	// Nettoyage sécurisé de toutes les clés
-	secureZero(dr.rootKey[:])
-	secureZero(dr.sendingChainKey[:])
-	secureZero(dr.receivingChainKey[:])
+	secureZeroResistant(dr.rootKey[:])
+	secureZeroResistant(dr.sendingChainKey[:])
+	secureZeroResistant(dr.receivingChainKey[:])
 
 	// Nettoyage sécurisé des clés sautées
 	for id, key := range dr.skippedKeys {
-		secureZero(key[:])
+		secureZeroResistant(key[:])
 		delete(dr.skippedKeys, id)
 	}
 	dr.skippedKeysLen = 0
 
 	// Nettoyage des clés DH
 	if dr.dhSelf != nil {
-		secureZero(dr.dhSelf.Private[:])
-		secureZero(dr.dhSelf.Public[:])
+		secureZeroResistant(dr.dhSelf.Private[:])
+		secureZeroResistant(dr.dhSelf.Public[:])
 		dr.dhSelf = nil
 	}
-	secureZero(dr.dhRemote[:])
+	secureZeroResistant(dr.dhRemote[:])
 
 	// Réinitialisation des compteurs
 	dr.sendMsgNum = 0
@@ -503,5 +552,205 @@ func (dr *DoubleRatchet) GetStats() map[string]interface{} {
 		"sending_chain_initialized":   dr.sendingChainInitialized,
 		"receiving_chain_initialized": dr.receivingChainInitialized,
 		"is_locked":                   dr.isLocked,
+		"max_chain_advance":           dr.maxChainAdvance,
+	}
+}
+
+// SetMaxChainAdvance configure la limite d'avancement de chaîne
+func (dr *DoubleRatchet) SetMaxChainAdvance(limit uint32) {
+	dr.mu.Lock()
+	defer dr.mu.Unlock()
+
+	if limit > 0 && limit <= 10000 { // Limite raisonnable
+		dr.maxChainAdvance = limit
+	}
+}
+
+// CleanupOldSkippedKeys nettoie les anciennes clés sautées
+func (dr *DoubleRatchet) CleanupOldSkippedKeys(maxAge int) {
+	dr.mu.Lock()
+	defer dr.mu.Unlock()
+
+	if dr.isLocked {
+		return
+	}
+
+	// Simple nettoyage basé sur la taille
+	// Dans une implémentation réelle, on pourrait utiliser des timestamps
+	if dr.skippedKeysLen > maxAge {
+		// Nettoyer quelques anciennes entrées
+		count := 0
+		for id, key := range dr.skippedKeys {
+			if count >= 10 { // Nettoyer max 10 entrées par fois
+				break
+			}
+			secureZeroResistant(key[:])
+			delete(dr.skippedKeys, id)
+			dr.skippedKeysLen--
+			count++
+		}
+	}
+}
+
+// ValidateDHKeyPair valide une paire de clés DH
+func ValidateDHKeyPair(keyPair *DHKeyPair) error {
+	if keyPair == nil {
+		return errors.New("keypair cannot be nil")
+	}
+
+	// Vérifier que la clé privée n'est pas nulle
+	var zero [32]byte
+	if subtle.ConstantTimeCompare(keyPair.Private[:], zero[:]) == 1 {
+		return errors.New("private key cannot be zero")
+	}
+
+	// Vérifier que la clé publique est valide
+	if !validateDHPublicKey(keyPair.Public) {
+		return ErrInvalidDHKey
+	}
+
+	// Vérifier la cohérence : que la clé publique correspond à la clé privée
+	var expectedPub [32]byte
+	curve25519.ScalarBaseMult(&expectedPub, &keyPair.Private)
+
+	if subtle.ConstantTimeCompare(keyPair.Public[:], expectedPub[:]) != 1 {
+		return errors.New("public key does not match private key")
+	}
+
+	return nil
+}
+
+// GenerateKeyPairWithValidation génère et valide une paire de clés
+func GenerateKeyPairWithValidation() (*DHKeyPair, error) {
+	keyPair, err := GenerateDHKeyPair()
+	if err != nil {
+		return nil, err
+	}
+
+	if err := ValidateDHKeyPair(keyPair); err != nil {
+		// Nettoyer en cas d'erreur
+		secureZeroResistant(keyPair.Private[:])
+		secureZeroResistant(keyPair.Public[:])
+		return nil, err
+	}
+
+	return keyPair, nil
+}
+
+// TestDHOperation teste une opération DH pour détecter les points faibles
+func TestDHOperation(ourPrivate, theirPublic [32]byte) error {
+	// Validation des entrées
+	var zero [32]byte
+	if subtle.ConstantTimeCompare(ourPrivate[:], zero[:]) == 1 {
+		return errors.New("private key cannot be zero")
+	}
+
+	if !validateDHPublicKey(theirPublic) {
+		return ErrInvalidDHKey
+	}
+
+	// Test de l'opération DH
+	result, err := curve25519.X25519(ourPrivate[:], theirPublic[:])
+	if err != nil {
+		return err
+	}
+
+	// Vérifier que le résultat n'est pas zéro
+	if subtle.ConstantTimeCompare(result, zero[:]) == 1 {
+		return errors.New("DH operation resulted in zero shared secret")
+	}
+
+	// Nettoyer le résultat de test
+	secureZeroResistant(result)
+
+	return nil
+}
+
+// GetForbiddenPoints retourne la liste des points interdits (pour les tests)
+func GetForbiddenPoints() [][32]byte {
+	// Retourner une copie pour éviter les modifications
+	result := make([][32]byte, len(forbiddenPoints))
+	copy(result, forbiddenPoints)
+	return result
+}
+
+// IsForbiddenPoint vérifie si un point est dans la liste des points interdits
+func IsForbiddenPoint(point [32]byte) bool {
+	for _, forbidden := range forbiddenPoints {
+		if subtle.ConstantTimeCompare(point[:], forbidden[:]) == 1 {
+			return true
+		}
+	}
+	return false
+}
+
+// Advanced ratchet operations
+
+// AdvanceChainTo avance une chaîne jusqu'à un numéro de message spécifique
+func (dr *DoubleRatchet) AdvanceChainTo(targetMsgNum uint32, isReceiving bool) error {
+	dr.mu.Lock()
+	defer dr.mu.Unlock()
+
+	if dr.isLocked {
+		return ErrRatchetLocked
+	}
+
+	var currentNum uint32
+	var chainKey *[32]byte
+
+	if isReceiving {
+		if !dr.receivingChainInitialized {
+			return ErrChainKeyNotInitialized
+		}
+		currentNum = dr.recvMsgNum
+		chainKey = &dr.receivingChainKey
+	} else {
+		if !dr.sendingChainInitialized {
+			return ErrChainKeyNotInitialized
+		}
+		currentNum = dr.sendMsgNum
+		chainKey = &dr.sendingChainKey
+	}
+
+	// Protection contre l'avancement excessif
+	if targetMsgNum > currentNum+dr.maxChainAdvance {
+		return errors.New("target message number too far ahead")
+	}
+
+	// Avancer la chaîne
+	for currentNum < targetMsgNum {
+		*chainKey = dr.advanceChainKeyUnsafe(*chainKey)
+		currentNum++
+	}
+
+	// Mettre à jour le compteur
+	if isReceiving {
+		dr.recvMsgNum = currentNum
+	} else {
+		dr.sendMsgNum = currentNum
+	}
+
+	return nil
+}
+
+// GetChainKey retourne une copie de la clé de chaîne (pour debug/test uniquement)
+func (dr *DoubleRatchet) GetChainKey(isReceiving bool) ([32]byte, error) {
+	dr.mu.RLock()
+	defer dr.mu.RUnlock()
+
+	if dr.isLocked {
+		return [32]byte{}, ErrRatchetLocked
+	}
+
+	if isReceiving {
+		if !dr.receivingChainInitialized {
+			return [32]byte{}, ErrChainKeyNotInitialized
+		}
+		return dr.receivingChainKey, nil
+	} else {
+		if !dr.sendingChainInitialized {
+			return [32]byte{}, ErrChainKeyNotInitialized
+		}
+		return dr.sendingChainKey, nil
 	}
 }
