@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/crypto/hkdf"
@@ -33,11 +34,13 @@ var (
 	ErrFileTimeout      = errors.New("file operation timeout")
 )
 
-// FileEncryptor gère le chiffrement de fichiers avec NaCl secretbox
+// FileEncryptor gère le chiffrement de fichiers avec NaCl secretbox et nonces déterministes
 type FileEncryptor struct {
-	key    [fileKeySize]byte
-	hasher hash.Hash
-	mu     sync.Mutex // Protection pour l'utilisation du hasher
+	key          [fileKeySize]byte
+	hasher       hash.Hash
+	mu           sync.Mutex          // Protection pour l'utilisation du hasher
+	nonceBase    [fileNonceSize]byte // Base pour générer des nonces déterministes
+	chunkCounter uint64              // Compteur atomique pour éviter les collisions de nonces
 }
 
 // NewFileEncryptor crée un nouvel encrypteur de fichiers avec validation renforcée
@@ -56,10 +59,35 @@ func NewFileEncryptor(masterKey []byte) (*FileEncryptor, error) {
 		return nil, fmt.Errorf("key derivation failed: %w", err)
 	}
 
+	// Générer une base de nonce unique pour ce fichier
+	var nonceBase [fileNonceSize]byte
+	if _, err := rand.Read(nonceBase[:]); err != nil {
+		return nil, fmt.Errorf("nonce base generation failed: %w", err)
+	}
+
 	return &FileEncryptor{
-		key:    key,
-		hasher: sha256.New(),
+		key:          key,
+		hasher:       sha256.New(),
+		nonceBase:    nonceBase,
+		chunkCounter: 0,
 	}, nil
+}
+
+// generateDeterministicNonce génère un nonce déterministe basé sur le compteur
+// Ceci évite les collisions de nonces tout en restant sécurisé
+func (fe *FileEncryptor) generateDeterministicNonce() [fileNonceSize]byte {
+	var nonce [fileNonceSize]byte
+
+	// Copier la base
+	copy(nonce[:], fe.nonceBase[:])
+
+	// Incrémenter le compteur de manière atomique
+	counter := atomic.AddUint64(&fe.chunkCounter, 1)
+
+	// Intégrer le compteur dans le nonce (8 derniers octets)
+	binary.BigEndian.PutUint64(nonce[fileNonceSize-8:], counter)
+
+	return nonce
 }
 
 // EncryptFile chiffre un fichier avec NaCl secretbox et validation d'intégrité
@@ -117,11 +145,21 @@ func (fe *FileEncryptor) encryptFileWithTimeout(inputPath, outputPath string, ti
 	}
 }
 
-// performEncryption effectue le chiffrement réel avec NaCl secretbox
+// performEncryption effectue le chiffrement réel avec NaCl secretbox et nonces déterministes
 func (fe *FileEncryptor) performEncryption(inputFile *os.File, outputFile *os.File) error {
 	// Protection thread-safe pour le hasher
 	fe.mu.Lock()
 	fe.hasher.Reset()
+	fe.mu.Unlock()
+
+	// Écrire la base de nonce au début du fichier pour la décryption
+	if _, err := outputFile.Write(fe.nonceBase[:]); err != nil {
+		return fmt.Errorf("write nonce base error: %w", err)
+	}
+
+	// Mettre à jour le hash avec la base de nonce
+	fe.mu.Lock()
+	fe.hasher.Write(fe.nonceBase[:])
 	fe.mu.Unlock()
 
 	buffer := make([]byte, fileBufferSize)
@@ -141,8 +179,8 @@ func (fe *FileEncryptor) performEncryption(inputFile *os.File, outputFile *os.Fi
 			return ErrFileTooLarge
 		}
 
-		// Chiffrement du chunk avec NaCl secretbox
-		encryptedChunk, err := fe.encryptChunk(buffer[:n])
+		// Chiffrement du chunk avec nonce déterministe
+		encryptedChunk, err := fe.encryptChunkDeterministic(buffer[:n])
 		if err != nil {
 			return err
 		}
@@ -199,8 +237,8 @@ func (fe *FileEncryptor) decryptFileWithTimeout(inputPath, outputPath string, ti
 		return ErrFileTooLarge
 	}
 
-	// Vérification de la taille minimale (hash + nonce + secretbox overhead minimum)
-	if stat.Size() < hashSize+fileNonceSize+secretbox.Overhead {
+	// Vérification de la taille minimale (nonce base + hash + nonce + secretbox overhead minimum)
+	if stat.Size() < fileNonceSize+hashSize+fileNonceSize+secretbox.Overhead {
 		return ErrCorruptedFile
 	}
 
@@ -233,7 +271,13 @@ func (fe *FileEncryptor) decryptFileWithTimeout(inputPath, outputPath string, ti
 
 // performDecryption effectue le déchiffrement réel
 func (fe *FileEncryptor) performDecryption(inputFile *os.File, outputFile *os.File) error {
-	// Lecture de tout le contenu pour vérifier le hash
+	// Lire la base de nonce du fichier
+	var fileNonceBase [fileNonceSize]byte
+	if _, err := io.ReadFull(inputFile, fileNonceBase[:]); err != nil {
+		return fmt.Errorf("read nonce base error: %w", err)
+	}
+
+	// Lecture de tout le contenu restant pour vérifier le hash
 	fileData, err := io.ReadAll(inputFile)
 	if err != nil {
 		return fmt.Errorf("read file error: %w", err)
@@ -250,6 +294,7 @@ func (fe *FileEncryptor) performDecryption(inputFile *os.File, outputFile *os.Fi
 	// Vérification de l'intégrité globale de manière thread-safe
 	fe.mu.Lock()
 	fe.hasher.Reset()
+	fe.hasher.Write(fileNonceBase[:]) // Inclure la base de nonce dans le hash
 	fe.hasher.Write(encryptedData)
 	computedHash := fe.hasher.Sum(nil)
 	fe.mu.Unlock()
@@ -257,9 +302,13 @@ func (fe *FileEncryptor) performDecryption(inputFile *os.File, outputFile *os.Fi
 	// Utilisation de CompareConstantTime pour éviter les attaques de timing
 	if !CompareConstantTime(expectedHash, computedHash) {
 		// Nettoyage sécurisé des données sensibles
-		secureZero(fileData)
+		secureZeroResistant(fileData)
 		return ErrCorruptedFile
 	}
+
+	// Réinitialiser le compteur pour la décryption
+	atomic.StoreUint64(&fe.chunkCounter, 0)
+	fe.nonceBase = fileNonceBase
 
 	// Déchiffrement chunk par chunk
 	offset := 0
@@ -274,45 +323,43 @@ func (fe *FileEncryptor) performDecryption(inputFile *os.File, outputFile *os.Fi
 
 		// Validation de la taille du chunk pour éviter les attaques
 		if chunkSize > fileBufferSize*2 || offset+int(chunkSize) > len(encryptedData) {
-			secureZero(fileData)
+			secureZeroResistant(fileData)
 			return ErrCorruptedFile
 		}
 
 		// Déchiffrement du chunk
 		encryptedChunk := encryptedData[offset : offset+int(chunkSize)]
-		decryptedChunk, err := fe.decryptChunk(encryptedChunk)
+		decryptedChunk, err := fe.decryptChunkDeterministic(encryptedChunk)
 		if err != nil {
-			secureZero(fileData)
+			secureZeroResistant(fileData)
 			return err
 		}
 
 		// Écriture du chunk déchiffré
 		if _, err := outputFile.Write(decryptedChunk); err != nil {
-			secureZero(fileData)
-			secureZero(decryptedChunk)
+			secureZeroResistant(fileData)
+			secureZeroResistant(decryptedChunk)
 			return fmt.Errorf("write decrypted error: %w", err)
 		}
 
 		// Nettoyage sécurisé du chunk déchiffré
-		secureZero(decryptedChunk)
+		secureZeroResistant(decryptedChunk)
 		offset += int(chunkSize)
 	}
 
 	// Nettoyage sécurisé des données
-	secureZero(fileData)
+	secureZeroResistant(fileData)
 	return nil
 }
 
-// encryptChunk chiffre un chunk de données avec NaCl secretbox
-func (fe *FileEncryptor) encryptChunk(data []byte) ([]byte, error) {
+// encryptChunkDeterministic chiffre un chunk de données avec NaCl secretbox et nonce déterministe
+func (fe *FileEncryptor) encryptChunkDeterministic(data []byte) ([]byte, error) {
 	if len(data) == 0 {
 		return nil, errors.New("empty chunk")
 	}
 
-	var nonce [fileNonceSize]byte
-	if _, err := rand.Read(nonce[:]); err != nil {
-		return nil, ErrEncryptionFailed
-	}
+	// Génération du nonce déterministe
+	nonce := fe.generateDeterministicNonce()
 
 	// Chiffrement avec NaCl secretbox
 	encrypted := secretbox.Seal(nil, data, &nonce, &fe.key)
@@ -325,8 +372,8 @@ func (fe *FileEncryptor) encryptChunk(data []byte) ([]byte, error) {
 	return result, nil
 }
 
-// decryptChunk déchiffre un chunk de données avec NaCl secretbox
-func (fe *FileEncryptor) decryptChunk(encryptedData []byte) ([]byte, error) {
+// decryptChunkDeterministic déchiffre un chunk de données avec NaCl secretbox
+func (fe *FileEncryptor) decryptChunkDeterministic(encryptedData []byte) ([]byte, error) {
 	if len(encryptedData) < fileNonceSize {
 		return nil, ErrDecryptionFailed
 	}
@@ -409,8 +456,13 @@ func SecureFileTransferWithTimeout(writer io.Writer, filePath string, key []byte
 	}
 }
 
-// performFileTransfer effectue le transfert réel
+// performFileTransfer effectue le transfert réel avec nonces déterministes
 func (fe *FileEncryptor) performFileTransfer(file *os.File, writer io.Writer) error {
+	// Envoyer la base de nonce d'abord
+	if _, err := writer.Write(fe.nonceBase[:]); err != nil {
+		return fmt.Errorf("write nonce base error: %w", err)
+	}
+
 	buffer := make([]byte, fileBufferSize)
 	var totalProcessed int64
 
@@ -428,8 +480,8 @@ func (fe *FileEncryptor) performFileTransfer(file *os.File, writer io.Writer) er
 			return ErrFileTooLarge
 		}
 
-		// Chiffrement du chunk
-		encryptedChunk, err := fe.encryptChunk(buffer[:n])
+		// Chiffrement du chunk avec nonce déterministe
+		encryptedChunk, err := fe.encryptChunkDeterministic(buffer[:n])
 		if err != nil {
 			return err
 		}
@@ -445,7 +497,7 @@ func (fe *FileEncryptor) performFileTransfer(file *os.File, writer io.Writer) er
 		}
 
 		// Nettoyage sécurisé du chunk chiffré
-		secureZero(encryptedChunk)
+		secureZeroResistant(encryptedChunk)
 	}
 
 	return nil
@@ -493,8 +545,18 @@ func ReceiveSecureFileWithTimeout(reader io.Reader, outputPath string, key []byt
 	}
 }
 
-// performFileReception effectue la réception réelle
+// performFileReception effectue la réception réelle avec gestion des nonces déterministes
 func (fe *FileEncryptor) performFileReception(reader io.Reader, file *os.File) error {
+	// Lire la base de nonce d'abord
+	var fileNonceBase [fileNonceSize]byte
+	if _, err := io.ReadFull(reader, fileNonceBase[:]); err != nil {
+		return fmt.Errorf("read nonce base error: %w", err)
+	}
+
+	// Configurer l'encrypteur avec la base de nonce reçue
+	fe.nonceBase = fileNonceBase
+	atomic.StoreUint64(&fe.chunkCounter, 0)
+
 	var totalReceived int64
 
 	for {
@@ -524,23 +586,23 @@ func (fe *FileEncryptor) performFileReception(reader io.Reader, file *os.File) e
 			return fmt.Errorf("read chunk error: %w", err)
 		}
 
-		// Déchiffrement du chunk
-		decryptedChunk, err := fe.decryptChunk(encryptedChunk)
+		// Déchiffrement du chunk avec nonce déterministe
+		decryptedChunk, err := fe.decryptChunkDeterministic(encryptedChunk)
 		if err != nil {
-			secureZero(encryptedChunk)
+			secureZeroResistant(encryptedChunk)
 			return err
 		}
 
 		// Écriture du chunk déchiffré
 		if _, err := file.Write(decryptedChunk); err != nil {
-			secureZero(encryptedChunk)
-			secureZero(decryptedChunk)
+			secureZeroResistant(encryptedChunk)
+			secureZeroResistant(decryptedChunk)
 			return fmt.Errorf("write decrypted error: %w", err)
 		}
 
 		// Nettoyage sécurisé des chunks
-		secureZero(encryptedChunk)
-		secureZero(decryptedChunk)
+		secureZeroResistant(encryptedChunk)
+		secureZeroResistant(decryptedChunk)
 	}
 
 	return nil
@@ -559,19 +621,19 @@ func ValidateEncryptedFile(filePath string) error {
 		return fmt.Errorf("failed to get file stats: %w", err)
 	}
 
-	// Vérification basique de la taille (hash + nonce minimum + secretbox overhead)
-	if stat.Size() < hashSize+fileNonceSize+secretbox.Overhead {
+	// Vérification basique de la taille (nonce base + hash + nonce minimum + secretbox overhead)
+	if stat.Size() < fileNonceSize+hashSize+fileNonceSize+secretbox.Overhead {
 		return ErrCorruptedFile
 	}
 
 	// Lecture du début pour vérifier la structure
-	header := make([]byte, 8) // Taille d'un premier chunk
+	header := make([]byte, fileNonceSize+8) // Nonce base + taille d'un premier chunk
 	if _, err := file.Read(header); err != nil {
 		return fmt.Errorf("failed to read header: %w", err)
 	}
 
-	// Vérification que la première valeur ressemble à une taille de chunk valide
-	chunkSize := binary.BigEndian.Uint32(header[:4])
+	// Vérification que la première valeur après la base de nonce ressemble à une taille de chunk valide
+	chunkSize := binary.BigEndian.Uint32(header[fileNonceSize : fileNonceSize+4])
 	if chunkSize == 0 || chunkSize > fileBufferSize*2 {
 		return ErrCorruptedFile
 	}
@@ -582,12 +644,12 @@ func ValidateEncryptedFile(filePath string) error {
 // GetFileEncryptionOverhead retourne l'overhead du chiffrement pour un fichier
 func GetFileEncryptionOverhead(fileSize int64) int64 {
 	if fileSize == 0 {
-		return hashSize + fileNonceSize + secretbox.Overhead
+		return fileNonceSize + hashSize + fileNonceSize + secretbox.Overhead
 	}
 
-	// Calcul approximatif : chunks + nonces + overhead secretbox + hash final + tailles des chunks
+	// Calcul approximatif : nonce base + chunks + nonces + overhead secretbox + hash final + tailles des chunks
 	numChunks := (fileSize + fileBufferSize - 1) / fileBufferSize
-	overhead := numChunks*(fileNonceSize+secretbox.Overhead+4) + hashSize // nonce + overhead + taille par chunk + hash final
+	overhead := fileNonceSize + numChunks*(fileNonceSize+secretbox.Overhead+4) + hashSize // nonce base + nonce + overhead + taille par chunk + hash final
 
 	return overhead
 }
@@ -610,7 +672,7 @@ func GetFileStats(filePath string) map[string]interface{} {
 	}
 
 	// Estimation du nombre de chunks
-	estimatedChunks := (stat.Size() - hashSize) / (fileBufferSize + fileNonceSize + secretbox.Overhead + 4)
+	estimatedChunks := (stat.Size() - fileNonceSize - hashSize) / (fileBufferSize + fileNonceSize + secretbox.Overhead + 4)
 	if estimatedChunks < 0 {
 		estimatedChunks = 0
 	}
@@ -621,5 +683,6 @@ func GetFileStats(filePath string) map[string]interface{} {
 		"overhead":         GetFileEncryptionOverhead(stat.Size()),
 		"is_valid":         ValidateEncryptedFile(filePath) == nil,
 		"last_modified":    stat.ModTime(),
+		"nonce_strategy":   "deterministic",
 	}
 }
