@@ -9,10 +9,12 @@ import (
 	"fmt"
 	"io"
 	mathrand "math/rand"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/go-playground/validator/v10"
+	"github.com/google/uuid"
 	"golang.org/x/crypto/nacl/secretbox"
 )
 
@@ -23,10 +25,10 @@ const (
 	maxHistoryEntries = 10000
 	cleanupInterval   = 5 * time.Minute
 	maxTTL            = 86400 // 24 hours maximum
-	protocolVersion   = 2
+	protocolVersion   = 3     // Version bumped for UUID support
 	protocolNonceSize = 24
 	protocolKeySize   = 32
-	sequenceWindow    = 1000 // Sliding window for sequence numbers
+	maxRecipientLen   = 64 // Maximum recipient identifier length
 )
 
 // Unified error to avoid information oracles
@@ -44,6 +46,8 @@ func init() {
 	validate.RegisterValidation("safe_string", validateSafeString)
 	validate.RegisterValidation("session_id", validateSessionID)
 	validate.RegisterValidation("nonce_size", validateNonceSize)
+	validate.RegisterValidation("uuid_string", validateUUIDString)
+	validate.RegisterValidation("recipient", validateRecipient)
 }
 
 // Custom validation functions
@@ -84,34 +88,62 @@ func validateNonceSize(fl validator.FieldLevel) bool {
 	return len(nonce) == 0 || len(nonce) == 16 // Empty or 16 bytes
 }
 
-// messageEntry structure for storing message metadata
-type messageEntry struct {
-	timestamp time.Time
-	seq       uint64
-	hash      [16]byte // Partial hash for duplicate detection
+func validateUUIDString(fl validator.FieldLevel) bool {
+	uuidStr := fl.Field().String()
+	if uuidStr == "" {
+		return false
+	}
+	_, err := uuid.Parse(uuidStr)
+	return err == nil
 }
 
-// MessageHistory manages anti-replay with automatic cleanup and strict sequence validation
+func validateRecipient(fl validator.FieldLevel) bool {
+	recipient := fl.Field().String()
+
+	// Allow empty recipient for broadcast messages
+	if len(recipient) == 0 {
+		return true
+	}
+
+	if len(recipient) > maxRecipientLen {
+		return false
+	}
+
+	// Check only safe characters for recipient
+	for _, r := range recipient {
+		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
+			(r >= '0' && r <= '9') || r == '_' || r == '-' || r == '@' || r == '.') {
+			return false
+		}
+	}
+	return true
+}
+
+// messageEntry structure for storing message metadata with UUID
+type messageEntry struct {
+	timestamp time.Time
+	msgID     string   // UUID instead of sequence number
+	hash      [16]byte // Partial hash for duplicate detection
+	recipient string   // Message recipient
+}
+
+// MessageHistory manages anti-replay with automatic cleanup and UUID-based validation
 type MessageHistory struct {
-	messages            map[uint64]messageEntry
-	hashIndex           map[[16]byte]uint64 // Hash index for fast duplicate detection
-	mu                  sync.RWMutex
-	lastCleanup         time.Time
-	cleanupStop         chan struct{}
-	expectedSeqMin      uint64 // Minimum expected sequence for sliding window
-	expectedSeqMax      uint64 // Maximum expected sequence for sliding window
-	sequenceInitialized bool   // Flag to know if sequence has been initialized
+	messages       map[string]messageEntry // Key is now UUID string
+	hashIndex      map[[16]byte]string     // Hash index points to UUID
+	mu             sync.RWMutex
+	lastCleanup    time.Time
+	cleanupStop    chan struct{}
+	recipientIndex map[string][]string // Index by recipient -> []messageIDs
 }
 
 func NewMessageHistory() *MessageHistory {
 	mh := &MessageHistory{
-		messages:            make(map[uint64]messageEntry),
-		hashIndex:           make(map[[16]byte]uint64),
-		lastCleanup:         time.Now(),
-		cleanupStop:         make(chan struct{}),
-		expectedSeqMin:      0,
-		expectedSeqMax:      0,
-		sequenceInitialized: false,
+		messages:       make(map[string]messageEntry),
+		hashIndex:      make(map[[16]byte]string),
+		lastCleanup:    time.Now(),
+		cleanupStop:    make(chan struct{}),
+		recipientIndex: make(map[string][]string),
 	}
 
 	// Start automatic cleanup
@@ -143,41 +175,68 @@ func (mh *MessageHistory) cleanup() {
 	now := time.Now()
 	cutoff := now.Add(-replayWindow)
 
-	// Clean old messages and adjust sequence window
-	oldestValidSeq := uint64(^uint64(0)) // Max uint64
-	toDelete := make([]uint64, 0, len(mh.messages)/10)
+	toDelete := make([]string, 0, len(mh.messages)/10)
 
-	for seq, entry := range mh.messages {
+	for msgID, entry := range mh.messages {
 		if entry.timestamp.Before(cutoff) {
-			toDelete = append(toDelete, seq)
-		} else if seq < oldestValidSeq {
-			oldestValidSeq = seq
+			toDelete = append(toDelete, msgID)
 		}
 	}
 
 	// Remove expired entries
-	for _, seq := range toDelete {
-		if entry, exists := mh.messages[seq]; exists {
+	for _, msgID := range toDelete {
+		if entry, exists := mh.messages[msgID]; exists {
 			delete(mh.hashIndex, entry.hash)
-			delete(mh.messages, seq)
-		}
-	}
+			delete(mh.messages, msgID)
 
-	// Adjust sequence window if messages were deleted
-	if len(toDelete) > 0 && oldestValidSeq != uint64(^uint64(0)) {
-		mh.expectedSeqMin = oldestValidSeq
+			// Clean recipient index
+			if entry.recipient != "" {
+				mh.removeFromRecipientIndex(entry.recipient, msgID)
+			}
+		}
 	}
 
 	mh.lastCleanup = now
 }
 
-// generateMessageHash generates a partial hash for a message
-func generateMessageHash(seq uint64, timestamp int64, data []byte) [16]byte {
+// removeFromRecipientIndex removes a message ID from recipient index
+func (mh *MessageHistory) removeFromRecipientIndex(recipient, msgID string) {
+	if msgIDs, exists := mh.recipientIndex[recipient]; exists {
+		// Remove msgID from slice
+		for i, id := range msgIDs {
+			if id == msgID {
+				mh.recipientIndex[recipient] = append(msgIDs[:i], msgIDs[i+1:]...)
+				break
+			}
+		}
+
+		// Remove empty recipient entries
+		if len(mh.recipientIndex[recipient]) == 0 {
+			delete(mh.recipientIndex, recipient)
+		}
+	}
+}
+
+// generateMessageHash generates a partial hash for a message with UUID and recipient
+func generateMessageHash(msgID string, timestamp int64, recipient string, data []byte) [16]byte {
 	var hash [16]byte
 
-	// Combine seq, timestamp and data sample
-	binary.BigEndian.PutUint64(hash[0:8], seq)
+	// Combine msgID, timestamp, recipient and data sample
+	idBytes := []byte(msgID)
+	recipientBytes := []byte(recipient)
+
+	// Mix msgID
+	for i := 0; i < 8 && i < len(idBytes); i++ {
+		hash[i] = idBytes[i]
+	}
+
+	// Mix timestamp
 	binary.BigEndian.PutUint64(hash[8:16], uint64(timestamp))
+
+	// XOR with recipient
+	for i := 0; i < 8 && i < len(recipientBytes); i++ {
+		hash[i] ^= recipientBytes[i]
+	}
 
 	// XOR with data sample for more uniqueness
 	if len(data) > 0 {
@@ -189,8 +248,8 @@ func generateMessageHash(seq uint64, timestamp int64, data []byte) [16]byte {
 	return hash
 }
 
-// CheckAndStore checks and stores a message with optimized DoS protection and strict sequence validation
-func (mh *MessageHistory) CheckAndStore(seq uint64, timestamp int64, data []byte) error {
+// CheckAndStore checks and stores a message with UUID-based validation
+func (mh *MessageHistory) CheckAndStore(msgID string, timestamp int64, recipient string, data []byte) error {
 	mh.mu.Lock()
 	defer mh.mu.Unlock()
 
@@ -205,92 +264,62 @@ func (mh *MessageHistory) CheckAndStore(seq uint64, timestamp int64, data []byte
 		return ErrInvalidMessage
 	}
 
-	// Validate sequence window with replay attack protection
-	if !mh.isSequenceValid(seq) {
+	// Validate UUID format
+	if _, err := uuid.Parse(msgID); err != nil {
 		return ErrInvalidMessage
 	}
 
 	// Generate message hash
-	hash := generateMessageHash(seq, timestamp, data)
+	hash := generateMessageHash(msgID, timestamp, recipient, data)
 
 	// Fast hash check
 	if _, exists := mh.hashIndex[hash]; exists {
 		return ErrInvalidMessage
 	}
 
-	// Sequence check
-	if _, exists := mh.messages[seq]; exists {
+	// UUID check (should be unique)
+	if _, exists := mh.messages[msgID]; exists {
 		return ErrInvalidMessage
 	}
 
 	// Store message
 	entry := messageEntry{
 		timestamp: now,
-		seq:       seq,
+		msgID:     msgID,
 		hash:      hash,
+		recipient: recipient,
 	}
 
-	mh.messages[seq] = entry
-	mh.hashIndex[hash] = seq
+	mh.messages[msgID] = entry
+	mh.hashIndex[hash] = msgID
 
-	// Update sequence window
-	mh.updateSequenceWindow(seq)
+	// Update recipient index
+	if recipient != "" {
+		mh.recipientIndex[recipient] = append(mh.recipientIndex[recipient], msgID)
+	}
 
 	return nil
-}
-
-// isSequenceValid checks if a sequence number is in the valid window
-func (mh *MessageHistory) isSequenceValid(seq uint64) bool {
-	if !mh.sequenceInitialized {
-		// First message - initialize window
-		mh.expectedSeqMin = seq
-		mh.expectedSeqMax = seq + sequenceWindow
-		mh.sequenceInitialized = true
-		return true
-	}
-
-	// Check that sequence is in sliding window
-	if seq < mh.expectedSeqMin {
-		// Message too old - possible replay
-		return false
-	}
-
-	if seq > mh.expectedSeqMax {
-		// Message too recent - possible attack
-		// Allow limited offset for delayed messages
-		if seq > mh.expectedSeqMax+sequenceWindow {
-			return false
-		}
-	}
-
-	return true
-}
-
-// updateSequenceWindow updates the sliding sequence window
-func (mh *MessageHistory) updateSequenceWindow(seq uint64) {
-	if seq > mh.expectedSeqMax {
-		// Advance window
-		advance := seq - mh.expectedSeqMax
-		mh.expectedSeqMin += advance
-		mh.expectedSeqMax = seq + sequenceWindow
-	}
 }
 
 // cleanupUnsafe non-thread-safe version for internal use
 func (mh *MessageHistory) cleanupUnsafe(now time.Time) {
 	cutoff := now.Add(-replayWindow)
 
-	toDelete := make([]uint64, 0, len(mh.messages)/10)
-	for seq, entry := range mh.messages {
+	toDelete := make([]string, 0, len(mh.messages)/10)
+	for msgID, entry := range mh.messages {
 		if entry.timestamp.Before(cutoff) {
-			toDelete = append(toDelete, seq)
+			toDelete = append(toDelete, msgID)
 		}
 	}
 
-	for _, seq := range toDelete {
-		if entry, exists := mh.messages[seq]; exists {
+	for _, msgID := range toDelete {
+		if entry, exists := mh.messages[msgID]; exists {
 			delete(mh.hashIndex, entry.hash)
-			delete(mh.messages, seq)
+			delete(mh.messages, msgID)
+
+			if entry.recipient != "" {
+				mh.removeFromRecipientIndex(entry.recipient, msgID)
+			}
 		}
 	}
 
@@ -303,17 +332,16 @@ func (mh *MessageHistory) Reset() {
 	defer mh.mu.Unlock()
 
 	// Clean maps
-	for seq := range mh.messages {
-		delete(mh.messages, seq)
+	for msgID := range mh.messages {
+		delete(mh.messages, msgID)
 	}
 	for hash := range mh.hashIndex {
 		delete(mh.hashIndex, hash)
 	}
+	for recipient := range mh.recipientIndex {
+		delete(mh.recipientIndex, recipient)
+	}
 
-	// Reset sequence window
-	mh.expectedSeqMin = 0
-	mh.expectedSeqMax = 0
-	mh.sequenceInitialized = false
 	mh.lastCleanup = time.Now()
 }
 
@@ -328,14 +356,33 @@ func (mh *MessageHistory) GetStats() map[string]interface{} {
 	defer mh.mu.RUnlock()
 
 	return map[string]interface{}{
-		"total_messages":       len(mh.messages),
-		"hash_entries":         len(mh.hashIndex),
-		"last_cleanup":         mh.lastCleanup,
-		"max_entries":          maxHistoryEntries,
-		"expected_seq_min":     mh.expectedSeqMin,
-		"expected_seq_max":     mh.expectedSeqMax,
-		"sequence_initialized": mh.sequenceInitialized,
-		"sequence_window":      sequenceWindow,
+		"total_messages":   len(mh.messages),
+		"hash_entries":     len(mh.hashIndex),
+		"last_cleanup":     mh.lastCleanup,
+		"max_entries":      maxHistoryEntries,
+		"recipients_count": len(mh.recipientIndex),
+	}
+}
+
+// GetRecipientStats returns statistics for a specific recipient
+func (mh *MessageHistory) GetRecipientStats(recipient string) map[string]interface{} {
+	mh.mu.RLock()
+	defer mh.mu.RUnlock()
+
+	msgIDs, exists := mh.recipientIndex[recipient]
+	if !exists {
+		return map[string]interface{}{
+			"recipient":     recipient,
+			"message_count": 0,
+			"exists":        false,
+		}
+	}
+
+	return map[string]interface{}{
+		"recipient":     recipient,
+		"message_count": len(msgIDs),
+		"exists":        true,
+		"message_ids":   msgIDs,
 	}
 }
 
@@ -369,15 +416,16 @@ func getSessionHistory(sessionID string) *MessageHistory {
 	return history
 }
 
-// Envelope message structure with enhanced security and validation
+// Envelope message structure with enhanced security, validation, recipient and UUID
 type Envelope struct {
-	Seq       uint64 `json:"seq" validate:"required,min=0"`
+	ID        string `json:"id" validate:"required,uuid_string"` // UUID instead of sequence
 	Timestamp int64  `json:"ts" validate:"required"`
 	TTL       int    `json:"ttl,omitempty" validate:"min=0,max=86400"`
 	Data      string `json:"data" validate:"required,max=1048576,safe_string"`
-	Version   int    `json:"v" validate:"eq=2"`
+	Version   int    `json:"v" validate:"eq=3"` // Version 3 for UUID support
 	Nonce     []byte `json:"nonce,omitempty" validate:"nonce_size"`
 	SessionID string `json:"sid,omitempty" validate:"session_id"`
+	Recipient string `json:"recipient,omitempty" validate:"recipient"` // New recipient field
 }
 
 // ValidateEnvelope validates an envelope using validator tags
@@ -394,13 +442,22 @@ func generateSecureNonce() []byte {
 	return nonce
 }
 
-// SendMessage sends encrypted message with NaCl secretbox
+// SendMessage sends encrypted message with NaCl secretbox (legacy interface)
 func SendMessage(w io.Writer, message string, key []byte, seq uint64, ttl int) error {
-	return SendMessageWithSession(w, message, key, seq, ttl, "")
+	// Generate UUID for legacy interface
+	msgID := uuid.New().String()
+	return SendMessageWithRecipient(w, message, key, msgID, ttl, "", "")
 }
 
-// SendMessageWithSession sends encrypted message with session isolation
+// SendMessageWithSession sends encrypted message with session isolation (legacy interface)
 func SendMessageWithSession(w io.Writer, message string, key []byte, seq uint64, ttl int, sessionID string) error {
+	// Generate UUID for legacy interface
+	msgID := uuid.New().String()
+	return SendMessageWithRecipient(w, message, key, msgID, ttl, sessionID, "")
+}
+
+// SendMessageWithRecipient sends encrypted message with recipient and UUID
+func SendMessageWithRecipient(w io.Writer, message string, key []byte, msgID string, ttl int, sessionID string, recipient string) error {
 	if w == nil {
 		return errors.New("writer cannot be nil")
 	}
@@ -414,14 +471,25 @@ func SendMessageWithSession(w io.Writer, message string, key []byte, seq uint64,
 		ttl = 0 // Unlimited TTL or default value
 	}
 
+	// If no msgID provided, generate one
+	if msgID == "" {
+		msgID = uuid.New().String()
+	}
+
+	// Validate UUID format
+	if _, err := uuid.Parse(msgID); err != nil {
+		return fmt.Errorf("invalid message ID format: %w", err)
+	}
+
 	envelope := Envelope{
-		Seq:       seq,
+		ID:        msgID,
 		Timestamp: time.Now().Unix(),
 		TTL:       ttl,
 		Data:      message,
 		Version:   protocolVersion,
 		Nonce:     generateSecureNonce(),
 		SessionID: sessionID,
+		Recipient: recipient,
 	}
 
 	// Validate envelope with tags
@@ -481,25 +549,32 @@ func SendMessageWithSession(w io.Writer, message string, key []byte, seq uint64,
 	return err
 }
 
-// ReceiveMessage receives and decrypts message with NaCl secretbox
+// ReceiveMessage receives and decrypts message with NaCl secretbox (legacy interface)
 func ReceiveMessage(r io.Reader, key []byte) (string, error) {
-	return ReceiveMessageWithSession(r, key, "")
+	msg, _, _, err := ReceiveMessageWithDetails(r, key, "")
+	return msg, err
 }
 
-// ReceiveMessageWithSession receives and decrypts message with session isolation
+// ReceiveMessageWithSession receives and decrypts message with session isolation (legacy interface)
 func ReceiveMessageWithSession(r io.Reader, key []byte, sessionID string) (string, error) {
+	msg, _, _, err := ReceiveMessageWithDetails(r, key, sessionID)
+	return msg, err
+}
+
+// ReceiveMessageWithDetails receives and decrypts message with full details including recipient and UUID
+func ReceiveMessageWithDetails(r io.Reader, key []byte, sessionID string) (message string, msgID string, recipient string, err error) {
 	if r == nil {
-		return "", errors.New("reader cannot be nil")
+		return "", "", "", errors.New("reader cannot be nil")
 	}
 	if len(key) == 0 {
-		return "", errors.New("empty key")
+		return "", "", "", errors.New("empty key")
 	}
 
 	// Read with strict size limit
 	reader := bufio.NewReader(io.LimitReader(r, messageSizeLimit))
 	line, err := reader.ReadString('\n')
 	if err != nil {
-		return "", ErrInvalidMessage // Unified error
+		return "", "", "", ErrInvalidMessage // Unified error
 	}
 
 	// Remove newline character
@@ -508,7 +583,7 @@ func ReceiveMessageWithSession(r io.Reader, key []byte, sessionID string) (strin
 	}
 
 	if line == "" {
-		return "", ErrInvalidMessage
+		return "", "", "", ErrInvalidMessage
 	}
 
 	// Convert to bytes
@@ -517,13 +592,13 @@ func ReceiveMessageWithSession(r io.Reader, key []byte, sessionID string) (strin
 
 	// Validate minimum size
 	if len(data) < protocolNonceSize+secretbox.Overhead {
-		return "", ErrInvalidMessage
+		return "", "", "", ErrInvalidMessage
 	}
 
 	// Derive key for protocol
 	protocolKey, err := deriveKeyWithContext(key, "protocol", protocolKeySize)
 	if err != nil {
-		return "", ErrInvalidMessage // Error normalization
+		return "", "", "", ErrInvalidMessage // Error normalization
 	}
 	defer secureZeroResistant(protocolKey)
 
@@ -538,39 +613,44 @@ func ReceiveMessageWithSession(r io.Reader, key []byte, sessionID string) (strin
 	// Decrypt with NaCl secretbox
 	decrypted, ok := secretbox.Open(nil, ciphertext, &nonce, &secretKey)
 	if !ok {
-		return "", ErrInvalidMessage // Error normalization
+		return "", "", "", ErrInvalidMessage // Error normalization
 	}
 	defer secureZeroResistant(decrypted)
 
 	// Deserialize envelope
 	var envelope Envelope
 	if err := json.Unmarshal(decrypted, &envelope); err != nil {
-		return "", ErrInvalidMessage
+		return "", "", "", ErrInvalidMessage
 	}
 
 	// Validate envelope with tags
 	if err := ValidateEnvelope(&envelope); err != nil {
-		return "", ErrInvalidMessage
+		return "", "", "", ErrInvalidMessage
 	}
 
-	// Unified message validation with session
-	if err := validateMessageWithSession(envelope, sessionID); err != nil {
-		return "", ErrInvalidMessage // Always same error
+	// Unified message validation with session and UUID
+	if err := validateMessageWithDetailsAndSession(envelope, sessionID); err != nil {
+		return "", "", "", ErrInvalidMessage // Always same error
 	}
 
 	// Secure cleanup
 	secureZeroResistant(secretKey[:])
 	secureZeroResistant(nonce[:])
 
-	return envelope.Data, nil
+	return envelope.Data, envelope.ID, envelope.Recipient, nil
 }
 
-// validateMessageWithSession validates a message with oracle protection and session isolation
-func validateMessageWithSession(env Envelope, expectedSessionID string) error {
+// validateMessageWithDetailsAndSession validates a message with oracle protection, session isolation and UUID validation
+func validateMessageWithDetailsAndSession(env Envelope, expectedSessionID string) error {
 	now := time.Now().Unix()
 
 	// Session isolation check
 	if expectedSessionID != "" && env.SessionID != expectedSessionID {
+		return ErrInvalidMessage
+	}
+
+	// UUID validation
+	if _, err := uuid.Parse(env.ID); err != nil {
 		return ErrInvalidMessage
 	}
 
@@ -595,20 +675,27 @@ func validateMessageWithSession(env Envelope, expectedSessionID string) error {
 	}
 
 	history := getSessionHistory(sessionKey)
-	if err := history.CheckAndStore(env.Seq, env.Timestamp, []byte(env.Data)); err != nil {
+	if err := history.CheckAndStore(env.ID, env.Timestamp, env.Recipient, []byte(env.Data)); err != nil {
 		return ErrInvalidMessage // Unified error
 	}
 
 	return nil
 }
 
-// SendMessageWithRetry sends message with intelligent retry
+// SendMessageWithRetry sends message with intelligent retry (legacy interface)
 func SendMessageWithRetry(w io.Writer, message string, key []byte, seq uint64, ttl int, maxRetries int) error {
-	return SendMessageWithRetryAndSession(w, message, key, seq, ttl, maxRetries, "")
+	msgID := uuid.New().String()
+	return SendMessageWithRetryAndRecipient(w, message, key, msgID, ttl, maxRetries, "", "")
 }
 
-// SendMessageWithRetryAndSession sends message with intelligent retry and session isolation
+// SendMessageWithRetryAndSession sends message with intelligent retry and session isolation (legacy interface)
 func SendMessageWithRetryAndSession(w io.Writer, message string, key []byte, seq uint64, ttl int, maxRetries int, sessionID string) error {
+	msgID := uuid.New().String()
+	return SendMessageWithRetryAndRecipient(w, message, key, msgID, ttl, maxRetries, sessionID, "")
+}
+
+// SendMessageWithRetryAndRecipient sends message with intelligent retry, session isolation, and recipient
+func SendMessageWithRetryAndRecipient(w io.Writer, message string, key []byte, msgID string, ttl int, maxRetries int, sessionID string, recipient string) error {
 	if maxRetries < 0 {
 		maxRetries = 3
 	}
@@ -617,7 +704,7 @@ func SendMessageWithRetryAndSession(w io.Writer, message string, key []byte, seq
 	backoff := 100 * time.Millisecond
 
 	for i := 0; i <= maxRetries; i++ {
-		if err := SendMessageWithSession(w, message, key, seq, ttl, sessionID); err != nil {
+		if err := SendMessageWithRecipient(w, message, key, msgID, ttl, sessionID, recipient); err != nil {
 			lastErr = err
 			if i < maxRetries {
 				// Exponential backoff with jitter
@@ -634,35 +721,44 @@ func SendMessageWithRetryAndSession(w io.Writer, message string, key []byte, seq
 	return fmt.Errorf("failed after %d retries: %w", maxRetries, lastErr)
 }
 
-// ReceiveMessageWithTimeout receives message with configurable timeout
+// ReceiveMessageWithTimeout receives message with configurable timeout (legacy interface)
 func ReceiveMessageWithTimeout(r io.Reader, key []byte, timeout time.Duration) (string, error) {
-	return ReceiveMessageWithTimeoutAndSession(r, key, timeout, "")
+	msg, _, _, err := ReceiveMessageWithTimeoutAndDetails(r, key, timeout, "")
+	return msg, err
 }
 
-// ReceiveMessageWithTimeoutAndSession receives message with configurable timeout and session isolation
+// ReceiveMessageWithTimeoutAndSession receives message with configurable timeout and session isolation (legacy interface)
 func ReceiveMessageWithTimeoutAndSession(r io.Reader, key []byte, timeout time.Duration, sessionID string) (string, error) {
+	msg, _, _, err := ReceiveMessageWithTimeoutAndDetails(r, key, timeout, sessionID)
+	return msg, err
+}
+
+// ReceiveMessageWithTimeoutAndDetails receives message with configurable timeout and full details
+func ReceiveMessageWithTimeoutAndDetails(r io.Reader, key []byte, timeout time.Duration, sessionID string) (message string, msgID string, recipient string, err error) {
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
 
 	type result struct {
-		message string
-		err     error
+		message   string
+		msgID     string
+		recipient string
+		err       error
 	}
 
 	resultChan := make(chan result, 1)
 
 	go func() {
 		defer close(resultChan)
-		msg, err := ReceiveMessageWithSession(r, key, sessionID)
-		resultChan <- result{message: msg, err: err}
+		msg, id, recip, err := ReceiveMessageWithDetails(r, key, sessionID)
+		resultChan <- result{message: msg, msgID: id, recipient: recip, err: err}
 	}()
 
 	select {
 	case res := <-resultChan:
-		return res.message, res.err
+		return res.message, res.msgID, res.recipient, res.err
 	case <-time.After(timeout):
-		return "", fmt.Errorf("receive timeout after %v", timeout)
+		return "", "", "", fmt.Errorf("receive timeout after %v", timeout)
 	}
 }
 
@@ -737,6 +833,20 @@ func GetSessionHistoryStats(sessionID string) map[string]interface{} {
 	}
 }
 
+// GetRecipientHistoryStats returns statistics for a specific recipient in a session
+func GetRecipientHistoryStats(sessionID string, recipient string) map[string]interface{} {
+	sessionHistoriesMu.RLock()
+	defer sessionHistoriesMu.RUnlock()
+
+	if history, exists := sessionHistories[sessionID]; exists {
+		return history.GetRecipientStats(recipient)
+	}
+
+	return map[string]interface{}{
+		"error": "session not found",
+	}
+}
+
 // ValidateMessageIntegrity validates message integrity without decryption
 func ValidateMessageIntegrity(encryptedMessage string) error {
 	if encryptedMessage == "" {
@@ -755,7 +865,7 @@ func ValidateMessageIntegrity(encryptedMessage string) error {
 // EstimateMessageOverhead estimates message overhead
 func EstimateMessageOverhead(messageSize int) int {
 	// Estimation: JSON envelope + NaCl encryption + newline
-	jsonOverhead := 150                                          // Approximate JSON metadata (including SessionID)
+	jsonOverhead := 200                                          // Approximate JSON metadata (including UUID, SessionID, Recipient)
 	encryptionOverhead := protocolNonceSize + secretbox.Overhead // Nonce + NaCl overhead
 	newlineOverhead := 1
 
@@ -791,6 +901,34 @@ func ValidateMessageData(data string) error {
 	return validate.Struct(&DataStruct{Data: data})
 }
 
+// ValidateRecipient validates a recipient identifier
+func ValidateRecipient(recipient string) error {
+	type RecipientStruct struct {
+		Recipient string `validate:"recipient"`
+	}
+
+	return validate.Struct(&RecipientStruct{Recipient: recipient})
+}
+
+// ValidateMessageID validates a message UUID
+func ValidateMessageID(msgID string) error {
+	type MessageIDStruct struct {
+		MessageID string `validate:"required,uuid_string"`
+	}
+
+	return validate.Struct(&MessageIDStruct{MessageID: msgID})
+}
+
+// GenerateMessageID generates a new UUID for messages
+func GenerateMessageID() string {
+	return uuid.New().String()
+}
+
+// ParseMessageID validates and parses a message ID
+func ParseMessageID(msgID string) (uuid.UUID, error) {
+	return uuid.Parse(msgID)
+}
+
 // RegisterCustomValidation allows registering additional custom validations
 func RegisterCustomValidation(tag string, fn validator.Func) error {
 	return validate.RegisterValidation(tag, fn)
@@ -799,4 +937,449 @@ func RegisterCustomValidation(tag string, fn validator.Func) error {
 // GetValidatorInstance returns the global validator instance for advanced usage
 func GetValidatorInstance() *validator.Validate {
 	return validate
+}
+
+// Utility functions for recipient management
+
+// IsRecipientValid checks if a recipient identifier is valid
+func IsRecipientValid(recipient string) bool {
+	return ValidateRecipient(recipient) == nil
+}
+
+// NormalizeRecipient normalizes a recipient identifier (lowercase, trim spaces)
+func NormalizeRecipient(recipient string) string {
+	if recipient == "" {
+		return ""
+	}
+
+	// Simple normalization - can be extended
+	normalized := strings.ToLower(strings.TrimSpace(recipient))
+
+	// Validate normalized result
+	if !IsRecipientValid(normalized) {
+		return ""
+	}
+
+	return normalized
+}
+
+// IsBroadcastMessage checks if a message is a broadcast (no specific recipient)
+func IsBroadcastMessage(recipient string) bool {
+	return recipient == ""
+}
+
+// Message filtering and routing utilities
+
+// MessageFilter represents a filter for messages
+type MessageFilter struct {
+	Recipients []string          `json:"recipients,omitempty"`
+	FromTime   *time.Time        `json:"from_time,omitempty"`
+	ToTime     *time.Time        `json:"to_time,omitempty"`
+	MessageIDs []string          `json:"message_ids,omitempty"`
+	SessionIDs []string          `json:"session_ids,omitempty"`
+	MaxResults int               `json:"max_results,omitempty"`
+	Custom     map[string]string `json:"custom,omitempty"`
+}
+
+// ValidateMessageFilter validates a message filter
+func ValidateMessageFilter(filter *MessageFilter) error {
+	if filter == nil {
+		return errors.New("filter cannot be nil")
+	}
+
+	// Validate recipients
+	for _, recipient := range filter.Recipients {
+		if err := ValidateRecipient(recipient); err != nil {
+			return fmt.Errorf("invalid recipient '%s': %w", recipient, err)
+		}
+	}
+
+	// Validate message IDs
+	for _, msgID := range filter.MessageIDs {
+		if err := ValidateMessageID(msgID); err != nil {
+			return fmt.Errorf("invalid message ID '%s': %w", msgID, err)
+		}
+	}
+
+	// Validate session IDs
+	for _, sessionID := range filter.SessionIDs {
+		if err := ValidateSessionIDString(sessionID); err != nil {
+			return fmt.Errorf("invalid session ID '%s': %w", sessionID, err)
+		}
+	}
+
+	// Validate time range
+	if filter.FromTime != nil && filter.ToTime != nil {
+		if filter.FromTime.After(*filter.ToTime) {
+			return errors.New("from_time cannot be after to_time")
+		}
+	}
+
+	// Validate max results
+	if filter.MaxResults < 0 {
+		return errors.New("max_results cannot be negative")
+	}
+	if filter.MaxResults > 10000 {
+		filter.MaxResults = 10000 // Cap at reasonable limit
+	}
+
+	return nil
+}
+
+// MessageInfo represents information about a message without the content
+type MessageInfo struct {
+	ID        string    `json:"id"`
+	Timestamp time.Time `json:"timestamp"`
+	Recipient string    `json:"recipient"`
+	SessionID string    `json:"session_id"`
+	Size      int       `json:"size"`
+	TTL       int       `json:"ttl"`
+}
+
+// ExtractMessageInfo extracts metadata from an envelope without revealing content
+func ExtractMessageInfo(envelope *Envelope) *MessageInfo {
+	if envelope == nil {
+		return nil
+	}
+
+	return &MessageInfo{
+		ID:        envelope.ID,
+		Timestamp: time.Unix(envelope.Timestamp, 0),
+		Recipient: envelope.Recipient,
+		SessionID: envelope.SessionID,
+		Size:      len(envelope.Data),
+		TTL:       envelope.TTL,
+	}
+}
+
+// Enhanced statistics and monitoring
+
+// GetDetailedMessageStats returns detailed statistics about messages
+func GetDetailedMessageStats() map[string]interface{} {
+	sessionHistoriesMu.RLock()
+	defer sessionHistoriesMu.RUnlock()
+
+	totalMessages := 0
+	totalRecipients := make(map[string]int)
+	sessionCount := len(sessionHistories)
+	oldestMessage := time.Now()
+	newestMessage := time.Time{}
+
+	for _, history := range sessionHistories { // Utilisez _ au lieu de sessionID
+		history.mu.RLock()
+
+		sessionMessages := len(history.messages)
+		totalMessages += sessionMessages
+
+		// Count messages per recipient
+		for recipient, msgIDs := range history.recipientIndex {
+			totalRecipients[recipient] += len(msgIDs)
+		}
+
+		// Find oldest and newest messages
+		for _, entry := range history.messages {
+			if entry.timestamp.Before(oldestMessage) {
+				oldestMessage = entry.timestamp
+			}
+			if entry.timestamp.After(newestMessage) {
+				newestMessage = entry.timestamp
+			}
+		}
+
+		history.mu.RUnlock()
+	}
+
+	stats := map[string]interface{}{
+		"total_messages":    totalMessages,
+		"total_sessions":    sessionCount,
+		"unique_recipients": len(totalRecipients),
+		"recipients_stats":  totalRecipients,
+	}
+
+	if totalMessages > 0 {
+		stats["oldest_message"] = oldestMessage
+		stats["newest_message"] = newestMessage
+		stats["time_span"] = newestMessage.Sub(oldestMessage)
+	}
+
+	return stats
+}
+
+// CleanupExpiredMessages removes expired messages across all sessions
+func CleanupExpiredMessages() int {
+	sessionHistoriesMu.RLock()
+	histories := make([]*MessageHistory, 0, len(sessionHistories))
+	for _, history := range sessionHistories {
+		histories = append(histories, history)
+	}
+	sessionHistoriesMu.RUnlock()
+
+	cleanedCount := 0
+	for _, history := range histories {
+		history.mu.Lock()
+		initialCount := len(history.messages)
+		history.cleanupUnsafe(time.Now())
+		cleanedCount += initialCount - len(history.messages)
+		history.mu.Unlock()
+	}
+
+	return cleanedCount
+}
+
+// Advanced message operations
+
+// FindMessagesByRecipient finds all messages for a specific recipient across sessions
+func FindMessagesByRecipient(recipient string, limit int) []MessageInfo {
+	if limit <= 0 {
+		limit = 100
+	}
+
+	sessionHistoriesMu.RLock()
+	defer sessionHistoriesMu.RUnlock()
+
+	var results []MessageInfo
+
+	for _, history := range sessionHistories {
+		history.mu.RLock()
+
+		if msgIDs, exists := history.recipientIndex[recipient]; exists {
+			for _, msgID := range msgIDs {
+				if len(results) >= limit {
+					history.mu.RUnlock()
+					return results
+				}
+
+				if entry, exists := history.messages[msgID]; exists {
+					info := MessageInfo{
+						ID:        entry.msgID,
+						Timestamp: entry.timestamp,
+						Recipient: entry.recipient,
+						Size:      0, // Size not stored in entry
+					}
+					results = append(results, info)
+				}
+			}
+		}
+
+		history.mu.RUnlock()
+	}
+
+	return results
+}
+
+// MessageExists checks if a message ID exists in any session
+func MessageExists(msgID string) bool {
+	sessionHistoriesMu.RLock()
+	defer sessionHistoriesMu.RUnlock()
+
+	for _, history := range sessionHistories {
+		history.mu.RLock()
+		_, exists := history.messages[msgID]
+		history.mu.RUnlock()
+
+		if exists {
+			return true
+		}
+	}
+
+	return false
+}
+
+// GetMessageInfo retrieves information about a specific message
+func GetMessageInfo(msgID string) *MessageInfo {
+	sessionHistoriesMu.RLock()
+	defer sessionHistoriesMu.RUnlock()
+
+	for _, history := range sessionHistories {
+		history.mu.RLock()
+
+		if entry, exists := history.messages[msgID]; exists {
+			info := &MessageInfo{
+				ID:        entry.msgID,
+				Timestamp: entry.timestamp,
+				Recipient: entry.recipient,
+				Size:      0, // Size not stored in entry
+			}
+			history.mu.RUnlock()
+			return info
+		}
+
+		history.mu.RUnlock()
+	}
+
+	return nil
+}
+
+// Migration utilities for upgrading from sequence-based to UUID-based messages
+
+// MigrationStats represents statistics about migration process
+type MigrationStats struct {
+	ProcessedMessages int       `json:"processed_messages"`
+	MigratedMessages  int       `json:"migrated_messages"`
+	FailedMessages    int       `json:"failed_messages"`
+	StartTime         time.Time `json:"start_time"`
+	EndTime           time.Time `json:"end_time"`
+	Duration          string    `json:"duration"`
+}
+
+// BackwardCompatibilityMode enables handling of old sequence-based messages
+var BackwardCompatibilityMode = false
+
+// EnableBackwardCompatibility enables backward compatibility with sequence-based messages
+func EnableBackwardCompatibility() {
+	BackwardCompatibilityMode = true
+}
+
+// DisableBackwardCompatibility disables backward compatibility
+func DisableBackwardCompatibility() {
+	BackwardCompatibilityMode = false
+}
+
+// IsBackwardCompatibilityEnabled returns the current backward compatibility state
+func IsBackwardCompatibilityEnabled() bool {
+	return BackwardCompatibilityMode
+}
+
+// Protocol version management
+
+// GetProtocolVersion returns the current protocol version
+func GetProtocolVersion() int {
+	return protocolVersion
+}
+
+// IsVersionSupported checks if a protocol version is supported
+func IsVersionSupported(version int) bool {
+	// Support versions 1, 2 (legacy) and 3 (current with UUID)
+	return version >= 1 && version <= 3
+}
+
+// GetVersionFeatures returns features available in a specific version
+func GetVersionFeatures(version int) map[string]bool {
+	features := map[string]bool{
+		"encryption":        false,
+		"session_id":        false,
+		"recipient":         false,
+		"uuid_id":           false,
+		"replay_protection": false,
+	}
+
+	switch version {
+	case 1:
+		features["encryption"] = true
+		features["replay_protection"] = true
+	case 2:
+		features["encryption"] = true
+		features["session_id"] = true
+		features["replay_protection"] = true
+	case 3:
+		features["encryption"] = true
+		features["session_id"] = true
+		features["recipient"] = true
+		features["uuid_id"] = true
+		features["replay_protection"] = true
+	}
+
+	return features
+}
+
+// Configuration and constants for new features
+
+// GetMaxRecipientLength returns the maximum allowed recipient length
+func GetMaxRecipientLength() int {
+	return maxRecipientLen
+}
+
+// GetReplayWindow returns the current replay protection window
+func GetReplayWindow() time.Duration {
+	return replayWindow
+}
+
+// GetMaxHistoryEntries returns the maximum number of history entries per session
+func GetMaxHistoryEntries() int {
+	return maxHistoryEntries
+}
+
+// Performance optimizations and caching
+
+// MessageCache represents a simple LRU cache for recent messages
+type MessageCache struct {
+	entries    map[string]*MessageInfo
+	order      []string
+	maxEntries int
+	mu         sync.RWMutex
+}
+
+// NewMessageCache creates a new message cache
+func NewMessageCache(maxEntries int) *MessageCache {
+	if maxEntries <= 0 {
+		maxEntries = 1000
+	}
+
+	return &MessageCache{
+		entries:    make(map[string]*MessageInfo),
+		order:      make([]string, 0, maxEntries),
+		maxEntries: maxEntries,
+	}
+}
+
+// Get retrieves a message info from cache
+func (mc *MessageCache) Get(msgID string) (*MessageInfo, bool) {
+	mc.mu.RLock()
+	defer mc.mu.RUnlock()
+
+	info, exists := mc.entries[msgID]
+	return info, exists
+}
+
+// Put stores a message info in cache
+func (mc *MessageCache) Put(msgID string, info *MessageInfo) {
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+
+	// If already exists, update and move to front
+	if _, exists := mc.entries[msgID]; exists {
+		mc.entries[msgID] = info
+		mc.moveToFront(msgID)
+		return
+	}
+
+	// Add new entry
+	mc.entries[msgID] = info
+	mc.order = append([]string{msgID}, mc.order...)
+
+	// Evict if necessary
+	if len(mc.order) > mc.maxEntries {
+		oldest := mc.order[len(mc.order)-1]
+		delete(mc.entries, oldest)
+		mc.order = mc.order[:len(mc.order)-1]
+	}
+}
+
+// moveToFront moves an entry to the front of the order slice
+func (mc *MessageCache) moveToFront(msgID string) {
+	for i, id := range mc.order {
+		if id == msgID {
+			// Remove from current position
+			mc.order = append(mc.order[:i], mc.order[i+1:]...)
+			// Add to front
+			mc.order = append([]string{msgID}, mc.order...)
+			break
+		}
+	}
+}
+
+// Clear clears the cache
+func (mc *MessageCache) Clear() {
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+
+	mc.entries = make(map[string]*MessageInfo)
+	mc.order = mc.order[:0]
+}
+
+// Size returns the current cache size
+func (mc *MessageCache) Size() int {
+	mc.mu.RLock()
+	defer mc.mu.RUnlock()
+	return len(mc.entries)
 }
