@@ -1,4 +1,4 @@
-package communication
+package rocher
 
 import (
 	"crypto/ed25519"

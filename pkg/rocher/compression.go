@@ -1,4 +1,4 @@
-package communication
+package rocher
 
 import (
 	"encoding/binary"
