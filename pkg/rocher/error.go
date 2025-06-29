@@ -1,311 +1,132 @@
+// error.go
 package rocher
 
 import (
 	"errors"
 	"fmt"
-	"sync"
-	"time"
 )
 
-// Base errors - normalized to prevent information leakage
+// Erreurs de base pour le système simplifié
 var (
-	ErrEmptyInput     = errors.New("invalid input")
-	ErrInvalidKey     = errors.New("invalid key")
-	ErrInvalidFormat  = errors.New("invalid format")
-	ErrDataTooLarge   = errors.New("data too large")
-	ErrDecryption     = errors.New("decryption failed")
-	ErrEncryption     = errors.New("encryption failed")
-	ErrConnection     = errors.New("connection error")
-	ErrTimeout        = errors.New("timeout")
-	ErrInvalidInput   = errors.New("invalid input")
-	ErrAuthentication = errors.New("authentication failed")
+	// Erreurs de chiffrement
+	ErrEncryption = errors.New("encryption failed")
+	ErrDecryption = errors.New("decryption failed")
+	ErrInvalidKey = errors.New("invalid key")
+
+	// Erreurs de réseau
+	ErrConnection = errors.New("connection error")
+	ErrTimeout    = errors.New("timeout")
+
+	// Erreurs de données
+	ErrInvalidInput  = errors.New("invalid input")
+	ErrInvalidFormat = errors.New("invalid format")
+	ErrDataTooLarge  = errors.New("data too large")
+	ErrEmptyInput    = errors.New("empty input")
+
+	// Erreurs de traitement
 	ErrProcessing     = errors.New("processing failed")
-	ErrRateLimit      = errors.New("rate limit exceeded")
+	ErrAuthentication = errors.New("authentication failed")
 )
 
-// ErrorSeverity defines error severity levels
-type ErrorSeverity int
-
-const (
-	SeverityLow ErrorSeverity = iota
-	SeverityMedium
-	SeverityHigh
-	SeverityCritical
-)
-
-// CommunicationError provides structured error information
-type CommunicationError struct {
-	Code      string
-	Message   string
-	Cause     error
-	Severity  ErrorSeverity
-	Timestamp time.Time
-	mu        sync.RWMutex
+// RocherError structure d'erreur personnalisée
+type RocherError struct {
+	Code    string
+	Message string
+	Cause   error
 }
 
-func (e *CommunicationError) Error() string {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
+func (e *RocherError) Error() string {
 	if e.Cause != nil {
 		return fmt.Sprintf("[%s] %s: %v", e.Code, e.Message, e.Cause)
 	}
 	return fmt.Sprintf("[%s] %s", e.Code, e.Message)
 }
 
-func (e *CommunicationError) Unwrap() error {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
+func (e *RocherError) Unwrap() error {
 	return e.Cause
 }
 
-func (e *CommunicationError) GetSeverity() ErrorSeverity {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-	return e.Severity
-}
-
-// Error codes
+// Codes d'erreur
 const (
-	ErrorCodeInvalidInput      = "INVALID_INPUT"
-	ErrorCodeCryptographicFail = "CRYPTO_FAIL"
-	ErrorCodeNetworkError      = "NETWORK_ERROR"
-	ErrorCodeAuthError         = "AUTH_ERROR"
-	ErrorCodeTimeout           = "TIMEOUT"
-	ErrorCodeRateLimit         = "RATE_LIMIT"
-	ErrorCodeProtocolError     = "PROTOCOL_ERROR"
-	ErrorCodeInternal          = "INTERNAL_ERROR"
+	ErrorCodeCrypto  = "CRYPTO"
+	ErrorCodeNetwork = "NETWORK"
+	ErrorCodeInput   = "INPUT"
+	ErrorCodeProcess = "PROCESS"
 )
 
-// NewCommunicationError creates a new structured error
-func NewCommunicationError(code, message string, cause error) *CommunicationError {
-	severity := determineSeverity(code)
-	return &CommunicationError{
-		Code:      code,
-		Message:   sanitizeMessage(message),
-		Cause:     cause,
-		Severity:  severity,
-		Timestamp: time.Now(),
+// Fonctions de création d'erreurs typées
+func NewCryptoError(message string, cause error) *RocherError {
+	return &RocherError{
+		Code:    ErrorCodeCrypto,
+		Message: message,
+		Cause:   cause,
 	}
 }
 
-func determineSeverity(code string) ErrorSeverity {
-	switch code {
-	case ErrorCodeCryptographicFail, ErrorCodeAuthError:
-		return SeverityCritical
-	case ErrorCodeProtocolError:
-		return SeverityHigh
-	case ErrorCodeNetworkError, ErrorCodeTimeout, ErrorCodeRateLimit:
-		return SeverityMedium
-	default:
-		return SeverityLow
+func NewNetworkError(message string, cause error) *RocherError {
+	return &RocherError{
+		Code:    ErrorCodeNetwork,
+		Message: message,
+		Cause:   cause,
 	}
 }
 
-func sanitizeMessage(message string) string {
-	if len(message) > 200 {
-		message = message[:200] + "..."
+func NewInputError(message string, cause error) *RocherError {
+	return &RocherError{
+		Code:    ErrorCodeInput,
+		Message: message,
+		Cause:   cause,
 	}
-	return message
 }
 
-// Helper functions for creating typed errors
-func NewInvalidInputError(message string, cause error) *CommunicationError {
-	return NewCommunicationError(ErrorCodeInvalidInput, message, cause)
-}
-
-func NewCryptographicError(message string, cause error) *CommunicationError {
-	return NewCommunicationError(ErrorCodeCryptographicFail, message, cause)
-}
-
-func NewNetworkError(message string, cause error) *CommunicationError {
-	return NewCommunicationError(ErrorCodeNetworkError, message, cause)
-}
-
-func NewAuthError(message string, cause error) *CommunicationError {
-	return NewCommunicationError(ErrorCodeAuthError, message, cause)
-}
-
-func NewTimeoutError(message string, cause error) *CommunicationError {
-	return NewCommunicationError(ErrorCodeTimeout, message, cause)
-}
-
-func NewRateLimitError(message string, cause error) *CommunicationError {
-	return NewCommunicationError(ErrorCodeRateLimit, message, cause)
-}
-
-func NewProtocolError(message string, cause error) *CommunicationError {
-	return NewCommunicationError(ErrorCodeProtocolError, message, cause)
-}
-
-// Error analysis utilities
-func IsErrorCode(err error, code string) bool {
-	if commErr, ok := err.(*CommunicationError); ok {
-		return commErr.Code == code
+func NewProcessError(message string, cause error) *RocherError {
+	return &RocherError{
+		Code:    ErrorCodeProcess,
+		Message: message,
+		Cause:   cause,
 	}
-	return false
 }
 
-func GetErrorCode(err error) string {
-	if commErr, ok := err.(*CommunicationError); ok {
-		return commErr.Code
+// Fonctions utilitaires pour vérifier les types d'erreurs
+func IsCryptoError(err error) bool {
+	if rocherErr, ok := err.(*RocherError); ok {
+		return rocherErr.Code == ErrorCodeCrypto
 	}
-	return ""
+	return err == ErrEncryption || err == ErrDecryption || err == ErrInvalidKey
 }
 
-func GetErrorSeverity(err error) ErrorSeverity {
-	if commErr, ok := err.(*CommunicationError); ok {
-		return commErr.GetSeverity()
+func IsNetworkError(err error) bool {
+	if rocherErr, ok := err.(*RocherError); ok {
+		return rocherErr.Code == ErrorCodeNetwork
 	}
+	return err == ErrConnection || err == ErrTimeout
+}
 
-	switch err {
-	case ErrAuthentication, ErrDecryption:
-		return SeverityCritical
-	case ErrConnection, ErrTimeout:
-		return SeverityMedium
-	default:
-		return SeverityLow
+func IsInputError(err error) bool {
+	if rocherErr, ok := err.(*RocherError); ok {
+		return rocherErr.Code == ErrorCodeInput
 	}
+	return err == ErrInvalidInput || err == ErrInvalidFormat || err == ErrDataTooLarge || err == ErrEmptyInput
 }
 
 func IsTemporaryError(err error) bool {
-	if commErr, ok := err.(*CommunicationError); ok {
-		switch commErr.Code {
-		case ErrorCodeNetworkError, ErrorCodeTimeout, ErrorCodeRateLimit:
-			return true
-		default:
-			return false
-		}
-	}
-
-	switch err {
-	case ErrConnection, ErrTimeout:
-		return true
-	default:
-		return false
-	}
+	return IsNetworkError(err) || err == ErrTimeout
 }
 
-func IsCriticalError(err error) bool {
-	severity := GetErrorSeverity(err)
-	return severity == SeverityCritical
-}
-
-// FormatUserError formats an error for user display (sanitized)
+// FormatUserError formate une erreur pour l'affichage utilisateur
 func FormatUserError(err error) string {
-	if commErr, ok := err.(*CommunicationError); ok {
-		switch commErr.Code {
-		case ErrorCodeInvalidInput:
-			return "Invalid data provided"
-		case ErrorCodeCryptographicFail:
-			return "Security error occurred"
-		case ErrorCodeNetworkError:
-			return "Network connection problem"
-		case ErrorCodeAuthError:
-			return "Authentication failed"
-		case ErrorCodeTimeout:
-			return "Operation timed out"
-		case ErrorCodeRateLimit:
-			return "Too many requests, please wait"
-		case ErrorCodeProtocolError:
-			return "Communication error"
-		default:
-			return "An error occurred"
-		}
-	}
-
-	switch err {
-	case ErrEmptyInput, ErrInvalidInput:
-		return "Invalid data"
-	case ErrInvalidKey:
-		return "Invalid security key"
-	case ErrInvalidFormat:
-		return "Incorrect format"
-	case ErrDataTooLarge:
-		return "Data too large"
-	case ErrDecryption, ErrEncryption:
-		return "Security error"
-	case ErrConnection:
-		return "Connection error"
-	case ErrTimeout:
-		return "Timeout exceeded"
-	case ErrAuthentication:
-		return "Authentication failed"
-	case ErrProcessing:
-		return "Processing error"
+	switch {
+	case IsCryptoError(err):
+		return "Erreur de sécurité"
+	case IsNetworkError(err):
+		return "Erreur de connexion"
+	case IsInputError(err):
+		return "Données invalides"
+	case err == ErrTimeout:
+		return "Délai d'attente dépassé"
+	case err == ErrProcessing:
+		return "Erreur de traitement"
 	default:
-		return "Unknown error"
-	}
-}
-
-// ErrorMetrics for collecting error statistics
-type ErrorMetrics struct {
-	mu         sync.RWMutex
-	counts     map[string]int64
-	lastErrors map[string]time.Time
-	totalCount int64
-}
-
-var globalMetrics = &ErrorMetrics{
-	counts:     make(map[string]int64),
-	lastErrors: make(map[string]time.Time),
-}
-
-func RecordError(err error) {
-	globalMetrics.mu.Lock()
-	defer globalMetrics.mu.Unlock()
-
-	code := GetErrorCode(err)
-	if code == "" {
-		code = "UNKNOWN"
-	}
-
-	globalMetrics.counts[code]++
-	globalMetrics.lastErrors[code] = time.Now()
-	globalMetrics.totalCount++
-}
-
-func GetErrorMetrics() map[string]interface{} {
-	globalMetrics.mu.RLock()
-	defer globalMetrics.mu.RUnlock()
-
-	result := make(map[string]interface{})
-	for code, count := range globalMetrics.counts {
-		result[code] = map[string]interface{}{
-			"count":     count,
-			"last_seen": globalMetrics.lastErrors[code],
-		}
-	}
-
-	result["total_errors"] = globalMetrics.totalCount
-	result["error_types"] = len(globalMetrics.counts)
-	return result
-}
-
-func ResetErrorMetrics() {
-	globalMetrics.mu.Lock()
-	defer globalMetrics.mu.Unlock()
-
-	globalMetrics.counts = make(map[string]int64)
-	globalMetrics.lastErrors = make(map[string]time.Time)
-	globalMetrics.totalCount = 0
-}
-
-// ValidationError for specific validation errors
-type ValidationError struct {
-	Field   string `json:"field"`
-	Value   string `json:"value,omitempty"`
-	Rule    string `json:"rule"`
-	Message string `json:"message"`
-}
-
-func (ve *ValidationError) Error() string {
-	return fmt.Sprintf("validation failed for field '%s': %s", ve.Field, ve.Message)
-}
-
-func NewValidationError(field, rule, message string) *ValidationError {
-	return &ValidationError{
-		Field:   field,
-		Rule:    rule,
-		Message: message,
+		return "Erreur inconnue"
 	}
 }

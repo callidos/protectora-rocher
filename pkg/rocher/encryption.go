@@ -1,344 +1,254 @@
+// encryption.go
 package rocher
 
 import (
 	"crypto/rand"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/binary"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"time"
 
 	"golang.org/x/crypto/hkdf"
 	"golang.org/x/crypto/nacl/secretbox"
 )
 
 const (
-	maxPlaintextSize = 10 * 1024 * 1024 // 10MB limite
-	encKeySize       = 32
-	encNonceSize     = 24
+	KeySize    = 32
+	NonceSize  = 24
+	MaxMsgSize = 1024 * 1024 // 1MB
 )
 
-// EncryptNaClBox chiffre avec NaCl secretbox (XSalsa20 + Poly1305)
-func EncryptNaClBox(plaintext, masterKey []byte) (string, error) {
-	if len(plaintext) == 0 {
-		return "", ErrEmptyInput
-	}
-	if len(masterKey) == 0 {
-		return "", ErrInvalidKey
-	}
-	if len(plaintext) > maxPlaintextSize {
-		return "", ErrDataTooLarge
-	}
+var (
+	ErrEmptyMessage     = errors.New("empty message")
+	ErrMessageTooLarge  = errors.New("message too large")
+	ErrInvalidNonce     = errors.New("invalid nonce")
+	ErrDecryptionFailed = errors.New("decryption failed")
+)
 
-	// Dérivation de clé sécurisée
-	encKey, err := deriveEncryptionKey(masterKey)
-	if err != nil {
-		return "", err
-	}
-	defer secureZeroMemory(encKey)
-
-	// Conversion en format NaCl
-	var key [encKeySize]byte
-	copy(key[:], encKey[:encKeySize])
-
-	// Génération du nonce
-	var nonce [encNonceSize]byte
-	if _, err := rand.Read(nonce[:]); err != nil {
-		return "", fmt.Errorf("nonce generation failed: %w", err)
-	}
-
-	// Chiffrement avec NaCl secretbox
-	encrypted := secretbox.Seal(nil, plaintext, &nonce, &key)
-
-	// Format: version(1) + nonce + ciphertext
-	result := make([]byte, 1+encNonceSize+len(encrypted))
-	result[0] = 1 // Version
-	copy(result[1:1+encNonceSize], nonce[:])
-	copy(result[1+encNonceSize:], encrypted)
-
-	encoded := base64.StdEncoding.EncodeToString(result)
-
-	// Nettoyage sécurisé
-	secureZeroMemory(result)
-	secureZeroMemory(key[:])
-	secureZeroMemory(nonce[:])
-
-	return encoded, nil
+// Message représente un message chiffré avec ses métadonnées
+type Message struct {
+	ID        string `json:"id"`
+	Timestamp int64  `json:"timestamp"`
+	Data      []byte `json:"data"`  // Données chiffrées
+	Nonce     []byte `json:"nonce"` // Nonce pour le chiffrement
 }
 
-// DecryptNaClBox déchiffre avec NaCl secretbox
-func DecryptNaClBox(ciphertextBase64 string, masterKey []byte) ([]byte, error) {
-	if ciphertextBase64 == "" {
-		return nil, ErrEmptyInput
-	}
-	if len(masterKey) == 0 {
-		return nil, ErrInvalidKey
-	}
-
-	// Décodage base64
-	data, err := base64.StdEncoding.DecodeString(ciphertextBase64)
-	if err != nil {
-		return nil, ErrInvalidFormat
-	}
-	defer secureZeroMemory(data)
-
-	// Validation de la taille minimale
-	if len(data) < 1+encNonceSize+secretbox.Overhead {
-		return nil, ErrInvalidFormat
-	}
-
-	// Vérification de la version
-	if data[0] != 1 {
-		return nil, ErrInvalidFormat
-	}
-
-	// Dérivation de clé
-	encKey, err := deriveEncryptionKey(masterKey)
-	if err != nil {
-		return nil, err
-	}
-	defer secureZeroMemory(encKey)
-
-	var key [encKeySize]byte
-	copy(key[:], encKey[:encKeySize])
-
-	// Extraction des composants
-	var nonce [encNonceSize]byte
-	copy(nonce[:], data[1:1+encNonceSize])
-	ciphertext := data[1+encNonceSize:]
-
-	// Déchiffrement avec NaCl secretbox
-	plaintext, ok := secretbox.Open(nil, ciphertext, &nonce, &key)
-	if !ok {
-		return nil, ErrDecryption
-	}
-
-	// Nettoyage sécurisé
-	secureZeroMemory(key[:])
-	secureZeroMemory(nonce[:])
-
-	return plaintext, nil
+// SecureChannel gère le chiffrement/déchiffrement des messages
+type SecureChannel struct {
+	encryptKey [KeySize]byte
+	decryptKey [KeySize]byte
 }
 
-// EncryptWithAdditionalData chiffre avec données additionnelles
-func EncryptWithAdditionalData(plaintext, masterKey, additionalData []byte) (string, error) {
-	if len(plaintext) == 0 {
-		return "", ErrEmptyInput
-	}
-	if len(masterKey) == 0 {
-		return "", ErrInvalidKey
-	}
-	if len(plaintext) > maxPlaintextSize {
-		return "", ErrDataTooLarge
+// NewSecureChannel crée un nouveau canal sécurisé à partir d'un secret partagé
+func NewSecureChannel(sharedSecret []byte) (*SecureChannel, error) {
+	if len(sharedSecret) < KeySize {
+		return nil, errors.New("shared secret too short")
 	}
 
-	// Combiner plaintext et additional data pour NaCl
-	combined := make([]byte, len(additionalData)+len(plaintext))
-	copy(combined[:len(additionalData)], additionalData)
-	copy(combined[len(additionalData):], plaintext)
-	defer secureZeroMemory(combined)
+	sc := &SecureChannel{}
 
-	// Dérivation de clé avec contexte additional data
-	encKey, err := deriveKeyWithContext(masterKey, "with-ad", encKeySize)
-	if err != nil {
-		return "", err
-	}
-	defer secureZeroMemory(encKey)
-
-	var key [encKeySize]byte
-	copy(key[:], encKey)
-
-	// Génération du nonce
-	var nonce [encNonceSize]byte
-	if _, err := rand.Read(nonce[:]); err != nil {
-		return "", fmt.Errorf("nonce generation failed: %w", err)
-	}
-
-	// Chiffrement
-	encrypted := secretbox.Seal(nil, combined, &nonce, &key)
-
-	// Format: version(1) + ad_length(4) + nonce + ciphertext
-	result := make([]byte, 1+4+encNonceSize+len(encrypted))
-	result[0] = 2 // Version avec AD
-	binary.BigEndian.PutUint32(result[1:5], uint32(len(additionalData)))
-	copy(result[5:5+encNonceSize], nonce[:])
-	copy(result[5+encNonceSize:], encrypted)
-
-	encoded := base64.StdEncoding.EncodeToString(result)
-	secureZeroMemory(result)
-	secureZeroMemory(key[:])
-	secureZeroMemory(nonce[:])
-
-	return encoded, nil
-}
-
-// DecryptWithAdditionalData déchiffre avec vérification des données additionnelles
-func DecryptWithAdditionalData(ciphertextBase64 string, masterKey, expectedAdditionalData []byte) ([]byte, error) {
-	if ciphertextBase64 == "" {
-		return nil, ErrEmptyInput
-	}
-	if len(masterKey) == 0 {
-		return nil, ErrInvalidKey
-	}
-
-	// Décodage base64
-	data, err := base64.StdEncoding.DecodeString(ciphertextBase64)
-	if err != nil {
-		return nil, ErrInvalidFormat
-	}
-	defer secureZeroMemory(data)
-
-	// Validation de la taille minimale
-	if len(data) < 5+encNonceSize+secretbox.Overhead {
-		return nil, ErrInvalidFormat
-	}
-
-	// Vérification de la version
-	if data[0] != 2 {
-		return nil, ErrInvalidFormat
-	}
-
-	// Extraction de la longueur des données additionnelles
-	adLength := binary.BigEndian.Uint32(data[1:5])
-	if adLength > 1024 {
-		return nil, ErrInvalidFormat
-	}
-
-	// Dérivation de clé
-	encKey, err := deriveKeyWithContext(masterKey, "with-ad", encKeySize)
-	if err != nil {
-		return nil, err
-	}
-	defer secureZeroMemory(encKey)
-
-	var key [encKeySize]byte
-	copy(key[:], encKey)
-
-	// Extraction des composants
-	var nonce [encNonceSize]byte
-	copy(nonce[:], data[5:5+encNonceSize])
-	ciphertext := data[5+encNonceSize:]
-
-	// Déchiffrement
-	combined, ok := secretbox.Open(nil, ciphertext, &nonce, &key)
-	if !ok {
-		return nil, ErrDecryption
-	}
-	defer secureZeroMemory(combined)
-
-	// Validation de la longueur
-	if len(combined) < int(adLength) {
-		return nil, ErrDecryption
-	}
-
-	// Vérification des données additionnelles
-	actualAD := combined[:adLength]
-	if !ConstantTimeCompare(actualAD, expectedAdditionalData) {
-		return nil, ErrDecryption
-	}
-
-	// Extraction du plaintext
-	plaintext := make([]byte, len(combined)-int(adLength))
-	copy(plaintext, combined[adLength:])
-
-	// Nettoyage sécurisé
-	secureZeroMemory(key[:])
-	secureZeroMemory(nonce[:])
-
-	return plaintext, nil
-}
-
-// deriveEncryptionKey dérive une clé de chiffrement avec HKDF
-func deriveEncryptionKey(masterKey []byte) ([]byte, error) {
-	if len(masterKey) == 0 {
-		return nil, ErrInvalidKey
-	}
-
-	salt := []byte("protectora-rocher-salt-v2")
-	info := []byte("protectora-rocher-nacl-encryption-v2")
-
-	h := hkdf.New(sha256.New, masterKey, salt, info)
-	key := make([]byte, encKeySize)
-	if _, err := io.ReadFull(h, key); err != nil {
-		return nil, fmt.Errorf("key derivation failed: %w", err)
-	}
-	return key, nil
-}
-
-// deriveKeyWithContext dérive une clé avec un contexte spécifique
-func deriveKeyWithContext(masterKey []byte, context string, keySize int) ([]byte, error) {
-	if len(masterKey) == 0 {
-		return nil, ErrInvalidKey
-	}
-	if keySize <= 0 || keySize > 64 {
-		return nil, fmt.Errorf("invalid key size: %d", keySize)
-	}
-
-	salt := []byte("protectora-rocher-salt-v2")
-	contextBytes := []byte("protectora-rocher-" + context + "-v2")
-	h := hkdf.New(sha256.New, masterKey, salt, contextBytes)
-
-	key := make([]byte, keySize)
-	if _, err := io.ReadFull(h, key); err != nil {
+	// Dérivation des clés de chiffrement et déchiffrement
+	if err := sc.deriveKeys(sharedSecret); err != nil {
 		return nil, fmt.Errorf("key derivation failed: %w", err)
 	}
 
-	return key, nil
+	return sc, nil
 }
 
-// ValidateEncryptedData valide qu'une chaîne est un ciphertext valide
-func ValidateEncryptedData(ciphertextBase64 string) error {
-	if ciphertextBase64 == "" {
-		return ErrEmptyInput
+// deriveKeys dérive les clés de chiffrement/déchiffrement avec HKDF
+func (sc *SecureChannel) deriveKeys(secret []byte) error {
+	salt := []byte("rocher-simple-salt-v1")
+
+	// Clé de chiffrement
+	encInfo := []byte("rocher-encrypt-key-v1")
+	hkdfEnc := hkdf.New(sha256.New, secret, salt, encInfo)
+	if _, err := io.ReadFull(hkdfEnc, sc.encryptKey[:]); err != nil {
+		return err
 	}
 
-	// Vérification du format base64
-	data, err := base64.StdEncoding.DecodeString(ciphertextBase64)
-	if err != nil {
-		return ErrInvalidFormat
-	}
-	defer secureZeroMemory(data)
-
-	// Vérification de la taille minimale
-	if len(data) < 1+encNonceSize+secretbox.Overhead {
-		return ErrInvalidFormat
+	// Clé de déchiffrement (pour éviter la réutilisation de clé)
+	decInfo := []byte("rocher-decrypt-key-v1")
+	hkdfDec := hkdf.New(sha256.New, secret, salt, decInfo)
+	if _, err := io.ReadFull(hkdfDec, sc.decryptKey[:]); err != nil {
+		return err
 	}
 
-	// Vérification de la version
-	version := data[0]
-	if version != 1 && version != 2 {
-		return ErrInvalidFormat
-	}
-
-	// Validation spécifique selon la version
-	if version == 2 {
-		if len(data) < 5+encNonceSize+secretbox.Overhead {
-			return ErrInvalidFormat
-		}
-		adLength := binary.BigEndian.Uint32(data[1:5])
-		if adLength > 1024 {
-			return ErrInvalidFormat
-		}
+	// Vérifier que les clés ne sont pas nulles
+	if isAllZeros(sc.encryptKey[:]) || isAllZeros(sc.decryptKey[:]) {
+		return errors.New("derived keys are zero")
 	}
 
 	return nil
 }
 
-// GenerateRandomKey génère une clé aléatoire sécurisée
-func GenerateRandomKey(size int) ([]byte, error) {
-	if size <= 0 || size > 64 {
-		return nil, fmt.Errorf("invalid key size: %d", size)
+// EncryptMessage chiffre un message avec NaCl secretbox
+func (sc *SecureChannel) EncryptMessage(plaintext []byte) (*Message, error) {
+	if len(plaintext) == 0 {
+		return nil, ErrEmptyMessage
 	}
 
-	key := make([]byte, size)
-	if _, err := rand.Read(key); err != nil {
-		return nil, fmt.Errorf("random key generation failed: %w", err)
+	if len(plaintext) > MaxMsgSize {
+		return nil, ErrMessageTooLarge
 	}
 
-	return key, nil
+	// Génération d'un nonce aléatoire
+	var nonce [NonceSize]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return nil, fmt.Errorf("nonce generation failed: %w", err)
+	}
+
+	// Chiffrement avec NaCl secretbox
+	encrypted := secretbox.Seal(nil, plaintext, &nonce, &sc.encryptKey)
+
+	message := &Message{
+		ID:        generateMessageID(),
+		Timestamp: time.Now().Unix(),
+		Data:      encrypted,
+		Nonce:     nonce[:],
+	}
+
+	return message, nil
 }
 
-// CompareConstantTime compare deux slices de bytes de manière sécurisée
-func CompareConstantTime(a, b []byte) bool {
-	return ConstantTimeCompare(a, b)
+// DecryptMessage déchiffre un message
+func (sc *SecureChannel) DecryptMessage(msg *Message) ([]byte, error) {
+	if msg == nil {
+		return nil, errors.New("nil message")
+	}
+
+	if len(msg.Data) == 0 {
+		return nil, ErrEmptyMessage
+	}
+
+	if len(msg.Nonce) != NonceSize {
+		return nil, ErrInvalidNonce
+	}
+
+	// Copier le nonce dans un tableau de taille fixe
+	var nonce [NonceSize]byte
+	copy(nonce[:], msg.Nonce)
+
+	// Déchiffrement avec NaCl secretbox
+	plaintext, ok := secretbox.Open(nil, msg.Data, &nonce, &sc.decryptKey)
+	if !ok {
+		return nil, ErrDecryptionFailed
+	}
+
+	return plaintext, nil
+}
+
+// SendMessage sérialise et envoie un message chiffré
+func (sc *SecureChannel) SendMessage(plaintext []byte, writer io.Writer) error {
+	// Chiffrer le message
+	msg, err := sc.EncryptMessage(plaintext)
+	if err != nil {
+		return fmt.Errorf("encryption failed: %w", err)
+	}
+
+	// Sérialiser en JSON
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return fmt.Errorf("serialization failed: %w", err)
+	}
+
+	// Envoyer la taille puis les données
+	size := uint32(len(data))
+	if err := binary.Write(writer, binary.BigEndian, size); err != nil {
+		return fmt.Errorf("failed to write size: %w", err)
+	}
+
+	if _, err := writer.Write(data); err != nil {
+		return fmt.Errorf("failed to write data: %w", err)
+	}
+
+	return nil
+}
+
+// ReceiveMessage reçoit et déchiffre un message
+func (sc *SecureChannel) ReceiveMessage(reader io.Reader) ([]byte, error) {
+	// Lire la taille du message
+	var size uint32
+	if err := binary.Read(reader, binary.BigEndian, &size); err != nil {
+		return nil, fmt.Errorf("failed to read size: %w", err)
+	}
+
+	// Vérifier la taille
+	if size == 0 {
+		return nil, ErrEmptyMessage
+	}
+
+	if size > MaxMsgSize*2 { // Marge pour les métadonnées JSON
+		return nil, ErrMessageTooLarge
+	}
+
+	// Lire les données
+	data := make([]byte, size)
+	if _, err := io.ReadFull(reader, data); err != nil {
+		return nil, fmt.Errorf("failed to read data: %w", err)
+	}
+
+	// Désérialiser le message
+	var msg Message
+	if err := json.Unmarshal(data, &msg); err != nil {
+		return nil, fmt.Errorf("deserialization failed: %w", err)
+	}
+
+	// Déchiffrer le message
+	plaintext, err := sc.DecryptMessage(&msg)
+	if err != nil {
+		return nil, fmt.Errorf("decryption failed: %w", err)
+	}
+
+	return plaintext, nil
+}
+
+// Close nettoie le canal sécurisé
+func (sc *SecureChannel) Close() {
+	// Effacer les clés de la mémoire
+	secureZeroMemory(sc.encryptKey[:])
+	secureZeroMemory(sc.decryptKey[:])
+}
+
+// GetOverhead retourne la taille de l'overhead par message
+func (sc *SecureChannel) GetOverhead() int {
+	// secretbox.Overhead + nonce + métadonnées JSON approximatives
+	return secretbox.Overhead + NonceSize + 100
+}
+
+// ValidateMessage valide qu'un message est bien formé
+func ValidateMessage(msg *Message) error {
+	if msg == nil {
+		return errors.New("nil message")
+	}
+
+	if msg.ID == "" {
+		return errors.New("empty message ID")
+	}
+
+	if msg.Timestamp == 0 {
+		return errors.New("invalid timestamp")
+	}
+
+	if len(msg.Data) == 0 {
+		return errors.New("empty message data")
+	}
+
+	if len(msg.Nonce) != NonceSize {
+		return errors.New("invalid nonce size")
+	}
+
+	return nil
+}
+
+// generateMessageID génère un ID unique pour un message
+func generateMessageID() string {
+	bytes := make([]byte, 16)
+	if _, err := rand.Read(bytes); err != nil {
+		// Fallback en cas d'erreur
+		return fmt.Sprintf("msg_%d", time.Now().UnixNano())
+	}
+	return fmt.Sprintf("%x", bytes)
 }
