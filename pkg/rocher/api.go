@@ -10,281 +10,247 @@ import (
 )
 
 var (
-	ErrSessionNotInitialized = errors.New("session not initialized")
-	ErrHandshakeFailed       = errors.New("handshake failed")
-	ErrNoiseNotReady         = errors.New("noise not ready")
-	ErrConnectionClosed      = errors.New("connection closed")
-	ErrSessionAlreadyActive  = errors.New("session already active")
+	ErrSessionNotFound      = errors.New("session not found")
+	ErrSessionAlreadyExists = errors.New("session already exists")
+	ErrMaxSessionsReached   = errors.New("maximum sessions reached")
+	ErrInvalidSessionID     = errors.New("invalid session ID")
 )
 
-// Session représente une connexion sécurisée avec Noise Protocol
+// Session représente une connexion sécurisée complète avec échange de clés et canal chiffré
 type Session struct {
-	conn       io.ReadWriter
-	noise      *NoiseState
-	sessionKey [32]byte
-	isClient   bool
-	isActive   bool
-	mutex      sync.RWMutex
-	sessionID  string
+	channel   *SecureChannel
+	sessionID string
+	isClient  bool
+	startTime time.Time
+	mutex     sync.RWMutex
 
-	// Compteurs de messages
-	sendSeq uint64
-	recvSeq uint64
+	// Clés utilisées pour l'établissement
+	localPrivKey ed25519.PrivateKey
+	localPubKey  ed25519.PublicKey
+	remotePubKey ed25519.PublicKey
+	sharedSecret [32]byte
 
-	// Clés statiques pour le handshake
-	localKey  *NoiseKeyPair
-	remoteKey []byte
+	// État de la session
+	isEstablished bool
+	isClosed      bool
 
-	// Métriques
-	startTime    time.Time
-	lastActivity time.Time
+	// Métadonnées
+	metadata map[string]interface{}
 }
 
-// SessionConfig configuration pour une session
+// SessionConfig configuration pour établir une session
 type SessionConfig struct {
 	IsClient bool
 	Timeout  time.Duration
+	Metadata map[string]interface{}
 }
 
-// NewSession crée une nouvelle session avec handshake Noise
-func NewSession(conn io.ReadWriter, privKey ed25519.PrivateKey, remotePubKey ed25519.PublicKey, config SessionConfig) (*Session, error) {
+// NewSession crée une nouvelle session avec échange de clés et canal sécurisé
+func NewSession(conn io.ReadWriter, localPrivKey ed25519.PrivateKey, remotePubKey ed25519.PublicKey, config SessionConfig) (*Session, error) {
+	if conn == nil {
+		return nil, errors.New("connection cannot be nil")
+	}
+
 	if config.Timeout == 0 {
 		config.Timeout = 30 * time.Second
 	}
 
-	// Générer un ID de session unique
-	sessionID := fmt.Sprintf("noise_session_%d", time.Now().UnixNano())
-
-	// Convertir les clés Ed25519 en clés Noise (pour cette démo, on génère de nouvelles clés Noise)
-	// Dans une vraie implémentation, il faudrait une conversion appropriée
-	localNoiseKey, err := GenerateNoiseKeyPair()
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate noise keypair: %w", err)
+	// Valider les clés
+	if err := validateEd25519Keys(localPrivKey, remotePubKey); err != nil {
+		return nil, fmt.Errorf("invalid keys: %w", err)
 	}
+
+	// Extraire la clé publique locale
+	localPubKey := localPrivKey.Public().(ed25519.PublicKey)
 
 	session := &Session{
-		conn:         conn,
+		sessionID:    generateSessionID(),
 		isClient:     config.IsClient,
-		isActive:     false,
-		sessionID:    sessionID,
-		localKey:     localNoiseKey,
-		remoteKey:    remotePubKey, // Pour l'instant, on stocke la clé Ed25519
 		startTime:    time.Now(),
-		lastActivity: time.Now(),
+		localPrivKey: localPrivKey,
+		localPubKey:  localPubKey,
+		remotePubKey: remotePubKey,
+		metadata:     config.Metadata,
 	}
 
-	// Initialiser Noise selon le rôle
-	if config.IsClient {
-		session.noise = CreateNoiseInitiator()
-	} else {
-		session.noise = CreateNoiseResponder()
+	// Effectuer l'échange de clés
+	if err := session.performKeyExchange(conn, config.Timeout); err != nil {
+		return nil, fmt.Errorf("key exchange failed: %w", err)
 	}
 
-	// Effectuer le handshake
-	if err := session.performHandshake(config.Timeout); err != nil {
+	// Créer le canal sécurisé
+	channel, err := NewSecureChannel(conn, session.sharedSecret, config.IsClient)
+	if err != nil {
 		session.cleanup()
-		return nil, fmt.Errorf("handshake failed: %w", err)
+		return nil, fmt.Errorf("secure channel creation failed: %w", err)
 	}
 
-	// Dériver la clé de session à partir de l'état Noise
-	session.deriveSessionKey()
+	session.channel = channel
+	session.isEstablished = true
 
-	session.isActive = true
 	return session, nil
 }
 
-// performHandshake effectue l'échange de clés Noise
-func (s *Session) performHandshake(timeout time.Duration) error {
+// performKeyExchange effectue l'échange de clés hybride avec timeout
+func (s *Session) performKeyExchange(conn io.ReadWriter, timeout time.Duration) error {
 	done := make(chan error, 1)
 
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				done <- fmt.Errorf("handshake panic: %v", r)
+				done <- fmt.Errorf("key exchange panic: %v", r)
 			}
 		}()
 
-		// Pour cette démo, on utilise la clé publique Noise locale comme "remote key"
-		// Dans une vraie implémentation, il faudrait échanger/valider les vraies clés
-		err := s.noise.PerformHandshake(s.conn, s.localKey, s.localKey.Public[:])
-		done <- err
-	}()
+		var result *KeyExchangeResult
+		var err error
 
-	select {
-	case err := <-done:
-		if err != nil {
-			return fmt.Errorf("noise handshake error: %w", err)
+		if s.isClient {
+			exchanger := NewClientKeyExchanger()
+			result, err = exchanger.PerformExchange(conn, s.localPrivKey, s.remotePubKey)
+		} else {
+			exchanger := NewServerKeyExchanger()
+			result, err = exchanger.PerformExchange(conn, s.localPrivKey, s.remotePubKey)
 		}
-		return nil
-	case <-time.After(timeout):
-		return errors.New("handshake timeout")
-	}
-}
 
-// deriveSessionKey dérive une clé de session à partir de l'état Noise
-func (s *Session) deriveSessionKey() {
-	// Utiliser les clés Noise pour dériver une clé de session
-	// Pour cette démo, on utilise une dérivation simple
-	sessionData := fmt.Sprintf("%s_%t_%d", s.sessionID, s.isClient, s.startTime.UnixNano())
-	key := DeriveSessionKey([]byte(sessionData))
-	s.sessionKey = key
-}
+		if err != nil {
+			done <- err
+			return
+		}
 
-// SendMessage envoie un message sécurisé via Noise
-func (s *Session) SendMessage(message string) error {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
+		if result.Error != nil {
+			done <- result.Error
+			return
+		}
 
-	if !s.isActive {
-		return ErrSessionNotInitialized
-	}
+		// Valider le résultat
+		if err := ValidateKeyExchangeResult(result); err != nil {
+			done <- err
+			return
+		}
 
-	if !s.noise.IsInitialized() {
-		return ErrNoiseNotReady
-	}
-
-	s.updateActivity()
-
-	// Chiffrer avec Noise
-	encrypted, err := s.noise.EncryptMessage([]byte(message))
-	if err != nil {
-		return fmt.Errorf("noise encryption failed: %w", err)
-	}
-
-	// Envoyer le message chiffré avec le protocole de message standard
-	s.sendSeq++
-	msgID := GenerateMessageID()
-
-	if err := SendMessageWithRecipient(s.conn, string(encrypted), s.sessionKey[:], msgID, 0, s.sessionID, ""); err != nil {
-		return fmt.Errorf("failed to send encrypted message: %w", err)
-	}
-
-	return nil
-}
-
-// ReceiveMessage reçoit et déchiffre un message
-func (s *Session) ReceiveMessage() (string, error) {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-
-	if !s.isActive {
-		return "", ErrSessionNotInitialized
-	}
-
-	if !s.noise.IsInitialized() {
-		return "", ErrNoiseNotReady
-	}
-
-	s.updateActivity()
-
-	// Recevoir le message chiffré avec session isolée
-	encryptedMessage, _, _, err := ReceiveMessageWithDetails(s.conn, s.sessionKey[:], s.sessionID)
-	if err != nil {
-		return "", fmt.Errorf("receive failed: %w", err)
-	}
-
-	// Déchiffrer avec Noise
-	decrypted, err := s.noise.DecryptMessage([]byte(encryptedMessage))
-	if err != nil {
-		return "", fmt.Errorf("noise decryption failed: %w", err)
-	}
-
-	s.recvSeq++
-	return string(decrypted), nil
-}
-
-// SendMessageWithTimeout envoie un message avec timeout
-func (s *Session) SendMessageWithTimeout(message string, timeout time.Duration) error {
-	if timeout <= 0 {
-		return s.SendMessage(message)
-	}
-
-	done := make(chan error, 1)
-	go func() {
-		done <- s.SendMessage(message)
+		s.sharedSecret = result.SharedSecret
+		done <- nil
 	}()
 
 	select {
 	case err := <-done:
 		return err
 	case <-time.After(timeout):
-		return ErrTimeout
+		return NewTimeoutError("Key exchange timeout", nil)
 	}
+}
+
+// SendMessage envoie un message sécurisé
+func (s *Session) SendMessage(message []byte) error {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+
+	if !s.isEstablished {
+		return errors.New("session not established")
+	}
+
+	if s.isClosed {
+		return errors.New("session closed")
+	}
+
+	return s.channel.SendMessage(message)
+}
+
+// ReceiveMessage reçoit un message sécurisé
+func (s *Session) ReceiveMessage() ([]byte, error) {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+
+	if !s.isEstablished {
+		return nil, errors.New("session not established")
+	}
+
+	if s.isClosed {
+		return nil, errors.New("session closed")
+	}
+
+	return s.channel.ReceiveMessage()
+}
+
+// SendMessageWithTimeout envoie un message avec timeout
+func (s *Session) SendMessageWithTimeout(message []byte, timeout time.Duration) error {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+
+	if !s.isEstablished {
+		return errors.New("session not established")
+	}
+
+	if s.isClosed {
+		return errors.New("session closed")
+	}
+
+	return s.channel.SendMessageWithTimeout(message, timeout)
 }
 
 // ReceiveMessageWithTimeout reçoit un message avec timeout
-func (s *Session) ReceiveMessageWithTimeout(timeout time.Duration) (string, error) {
-	if timeout <= 0 {
-		return s.ReceiveMessage()
+func (s *Session) ReceiveMessageWithTimeout(timeout time.Duration) ([]byte, error) {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+
+	if !s.isEstablished {
+		return nil, errors.New("session not established")
 	}
 
-	type result struct {
-		message string
-		err     error
+	if s.isClosed {
+		return nil, errors.New("session closed")
 	}
 
-	done := make(chan result, 1)
-	go func() {
-		msg, err := s.ReceiveMessage()
-		done <- result{message: msg, err: err}
-	}()
-
-	select {
-	case res := <-done:
-		return res.message, res.err
-	case <-time.After(timeout):
-		return "", ErrTimeout
-	}
+	return s.channel.ReceiveMessageWithTimeout(timeout)
 }
 
-// Close ferme la session proprement
+// Close ferme la session et nettoie les ressources
 func (s *Session) Close() error {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 
-	if !s.isActive {
+	if s.isClosed {
 		return nil
 	}
 
-	s.isActive = false
-	s.cleanup()
+	s.isClosed = true
+	s.isEstablished = false
 
-	// Fermer la connexion si possible
-	if closer, ok := s.conn.(io.Closer); ok {
-		return closer.Close()
+	// Fermer le canal sécurisé
+	if s.channel != nil {
+		s.channel.Close()
 	}
+
+	// Nettoyer les données sensibles
+	s.cleanup()
 
 	return nil
 }
 
-// cleanup nettoie les ressources de la session
+// cleanup nettoie les données sensibles de la session
 func (s *Session) cleanup() {
-	// Nettoyage sécurisé
-	if s.noise != nil {
-		s.noise.Reset()
+	// Nettoyer le secret partagé
+	secureZeroMemory(s.sharedSecret[:])
+
+	// Nettoyer la clé privée (copie)
+	if s.localPrivKey != nil {
+		secureZeroMemory(s.localPrivKey)
 	}
-
-	secureZeroResistant(s.sessionKey[:])
-
-	if s.localKey != nil {
-		secureZeroResistant(s.localKey.Private[:])
-		secureZeroResistant(s.localKey.Public[:])
-	}
-
-	// Nettoyer l'historique de session
-	ResetSessionHistory(s.sessionID)
-}
-
-// updateActivity met à jour le timestamp de la dernière activité
-func (s *Session) updateActivity() {
-	s.lastActivity = time.Now()
 }
 
 // IsActive retourne l'état de la session
 func (s *Session) IsActive() bool {
 	s.mutex.RLock()
 	defer s.mutex.RUnlock()
-	return s.isActive
+	return s.isEstablished && !s.isClosed
+}
+
+// IsEstablished retourne si la session est établie
+func (s *Session) IsEstablished() bool {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+	return s.isEstablished
 }
 
 // GetSessionID retourne l'identifiant de session
@@ -294,172 +260,95 @@ func (s *Session) GetSessionID() string {
 	return s.sessionID
 }
 
-// GetStats retourne les statistiques de la session
-func (s *Session) GetStats() map[string]interface{} {
+// GetLocalPublicKey retourne la clé publique locale
+func (s *Session) GetLocalPublicKey() ed25519.PublicKey {
 	s.mutex.RLock()
 	defer s.mutex.RUnlock()
+	return s.localPubKey
+}
 
-	stats := map[string]interface{}{
-		"is_active":     s.isActive,
-		"is_client":     s.isClient,
-		"send_count":    s.sendSeq,
-		"recv_count":    s.recvSeq,
-		"session_id":    s.sessionID,
-		"start_time":    s.startTime,
-		"last_activity": s.lastActivity,
-		"duration":      time.Since(s.startTime),
-		"idle_time":     time.Since(s.lastActivity),
-		"protocol":      "Noise_XX_25519",
-	}
-
-	if s.noise != nil {
-		noiseStats := s.noise.GetStats()
-		stats["noise"] = noiseStats
-	}
-
-	return stats
+// GetRemotePublicKey retourne la clé publique distante
+func (s *Session) GetRemotePublicKey() ed25519.PublicKey {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+	return s.remotePubKey
 }
 
 // IsIdle vérifie si la session est inactive
 func (s *Session) IsIdle(maxIdleTime time.Duration) bool {
 	s.mutex.RLock()
 	defer s.mutex.RUnlock()
-	return time.Since(s.lastActivity) > maxIdleTime
-}
 
-// GetProtocolInfo retourne les informations sur le protocole utilisé
-func (s *Session) GetProtocolInfo() map[string]interface{} {
-	return map[string]interface{}{
-		"name":           "Noise Protocol Framework",
-		"pattern":        "XX",
-		"dh":             "Curve25519",
-		"cipher":         "Simplified (Demo)",
-		"hash":           "SHA-256",
-		"implementation": "Rocher Simple Noise",
-		"version":        "1.0",
+	if s.channel == nil {
+		return true
 	}
+
+	return s.channel.IsIdle(maxIdleTime)
 }
 
-// RekeySession effectue un re-keying de la session
-func (s *Session) RekeySession() error {
+// GetStats retourne les statistiques de la session
+func (s *Session) GetStats() map[string]interface{} {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+
+	stats := map[string]interface{}{
+		"session_id":     s.sessionID,
+		"is_client":      s.isClient,
+		"is_established": s.isEstablished,
+		"is_active":      s.isEstablished && !s.isClosed,
+		"start_time":     s.startTime,
+		"duration":       time.Since(s.startTime),
+		"metadata":       s.metadata,
+	}
+
+	// Ajouter les stats du canal si disponible
+	if s.channel != nil {
+		channelStats := s.channel.GetStats()
+		stats["channel"] = channelStats
+	}
+
+	return stats
+}
+
+// SetMetadata définit des métadonnées pour la session
+func (s *Session) SetMetadata(key string, value interface{}) {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 
-	if !s.isActive {
-		return ErrSessionNotInitialized
+	if s.metadata == nil {
+		s.metadata = make(map[string]interface{})
+	}
+	s.metadata[key] = value
+}
+
+// GetMetadata récupère une métadonnée
+func (s *Session) GetMetadata(key string) (interface{}, bool) {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+
+	if s.metadata == nil {
+		return nil, false
 	}
 
-	// Pour Noise, le re-keying se fait automatiquement avec les nonces
-	// Ici on peut forcer une nouvelle dérivation de clé de session
-	s.deriveSessionKey()
-	s.updateActivity()
-
-	return nil
+	value, exists := s.metadata[key]
+	return value, exists
 }
 
-// NewClientSession crée une session client avec Noise
-func NewClientSession(conn io.ReadWriter, privKey ed25519.PrivateKey, serverPubKey ed25519.PublicKey) (*Session, error) {
-	config := SessionConfig{
-		IsClient: true,
-		Timeout:  30 * time.Second,
-	}
-	return NewSession(conn, privKey, serverPubKey, config)
-}
-
-// NewServerSession crée une session serveur avec Noise
-func NewServerSession(conn io.ReadWriter, privKey ed25519.PrivateKey, clientPubKey ed25519.PublicKey) (*Session, error) {
-	config := SessionConfig{
-		IsClient: false,
-		Timeout:  30 * time.Second,
-	}
-	return NewSession(conn, privKey, clientPubKey, config)
-}
-
-// ResetSecurityState réinitialise l'état de sécurité global
-func ResetSecurityState() {
-	ResetMessageHistory()
-}
-
-// Fonctions de compatibilité avec l'ancienne API Double Ratchet
-
-// DoubleRatchet wrapper pour compatibilité (DÉPRÉCIÉ - utiliser Session)
-type DoubleRatchet struct {
-	session *Session
-}
-
-// InitializeDoubleRatchet crée un wrapper de compatibilité (DÉPRÉCIÉ)
-func InitializeDoubleRatchet(sessionKey []byte, ourDH *NoiseKeyPair, remoteDHPublic [32]byte) (*DoubleRatchet, error) {
-	// Cette fonction est maintenue pour la compatibilité mais n'est plus recommandée
-	// Elle crée une session simplifiée
-
-	if len(sessionKey) < 32 {
-		return nil, errors.New("session key too short")
-	}
-	if ourDH == nil {
-		return nil, errors.New("DH keypair required")
-	}
-
-	// Créer une session factice pour la compatibilité
-	dr := &DoubleRatchet{}
-
-	// Pour la compatibilité, on crée un état minimal
-	// En réalité, il faudrait une vraie connexion pour utiliser Noise
-
-	return dr, nil
-}
-
-// RatchetEncrypt pour compatibilité (DÉPRÉCIÉ)
-func (dr *DoubleRatchet) RatchetEncrypt() ([]byte, error) {
-	if dr.session == nil {
-		return nil, errors.New("session not initialized")
-	}
-
-	// Générer une clé aléatoire pour cette démo
-	return GenerateRandomKey(32)
-}
-
-// RatchetDecrypt pour compatibilité (DÉPRÉCIÉ)
-func (dr *DoubleRatchet) RatchetDecrypt() ([]byte, error) {
-	if dr.session == nil {
-		return nil, errors.New("session not initialized")
-	}
-
-	// Générer une clé aléatoire pour cette démo
-	return GenerateRandomKey(32)
-}
-
-// Reset pour compatibilité (DÉPRÉCIÉ)
-func (dr *DoubleRatchet) Reset() {
-	if dr.session != nil {
-		dr.session.Close()
-	}
-}
-
-// GetStats pour compatibilité (DÉPRÉCIÉ)
-func (dr *DoubleRatchet) GetStats() map[string]interface{} {
-	if dr.session != nil {
-		return dr.session.GetStats()
-	}
-
-	return map[string]interface{}{
-		"deprecated": true,
-		"message":    "Use Session instead of DoubleRatchet",
-	}
-}
-
-// DHKeyPair alias pour compatibilité (DÉPRÉCIÉ)
-type DHKeyPair = NoiseKeyPair
-
-// GenerateDHKeyPair pour compatibilité (DÉPRÉCIÉ)
-func GenerateDHKeyPair() (*DHKeyPair, error) {
-	return GenerateNoiseKeyPair()
-}
-
-// SessionManager gère plusieurs sessions
+// SessionManager gère plusieurs sessions simultanées
 type SessionManager struct {
 	sessions    map[string]*Session
-	mutex       sync.RWMutex
 	maxSessions int
+	mutex       sync.RWMutex
+	stats       SessionManagerStats
+}
+
+// SessionManagerStats statistiques du gestionnaire de sessions
+type SessionManagerStats struct {
+	TotalCreated  uint64
+	TotalClosed   uint64
+	CurrentActive int
+	LastCleanup   time.Time
+	CleanupCount  uint64
 }
 
 // NewSessionManager crée un nouveau gestionnaire de sessions
@@ -471,63 +360,84 @@ func NewSessionManager(maxSessions int) *SessionManager {
 	return &SessionManager{
 		sessions:    make(map[string]*Session),
 		maxSessions: maxSessions,
+		stats: SessionManagerStats{
+			LastCleanup: time.Now(),
+		},
 	}
 }
 
-// AddSession ajoute une session au gestionnaire
-func (sm *SessionManager) AddSession(session *Session) error {
+// CreateSession crée et enregistre une nouvelle session
+func (sm *SessionManager) CreateSession(conn io.ReadWriter, localPrivKey ed25519.PrivateKey, remotePubKey ed25519.PublicKey, config SessionConfig) (*Session, error) {
 	sm.mutex.Lock()
 	defer sm.mutex.Unlock()
 
+	// Vérifier les limites
 	if len(sm.sessions) >= sm.maxSessions {
-		return errors.New("maximum sessions reached")
+		return nil, ErrMaxSessionsReached
 	}
 
+	// Créer la session
+	session, err := NewSession(conn, localPrivKey, remotePubKey, config)
+	if err != nil {
+		return nil, err
+	}
+
+	// Enregistrer la session
 	sessionID := session.GetSessionID()
-	if _, exists := sm.sessions[sessionID]; exists {
-		return ErrSessionAlreadyActive
-	}
-
 	sm.sessions[sessionID] = session
-	return nil
+	sm.stats.TotalCreated++
+	sm.stats.CurrentActive = len(sm.sessions)
+
+	return session, nil
 }
 
-// RemoveSession supprime une session du gestionnaire
+// GetSession récupère une session par ID
+func (sm *SessionManager) GetSession(sessionID string) (*Session, error) {
+	sm.mutex.RLock()
+	defer sm.mutex.RUnlock()
+
+	session, exists := sm.sessions[sessionID]
+	if !exists {
+		return nil, ErrSessionNotFound
+	}
+
+	return session, nil
+}
+
+// RemoveSession supprime une session
 func (sm *SessionManager) RemoveSession(sessionID string) error {
 	sm.mutex.Lock()
 	defer sm.mutex.Unlock()
 
 	session, exists := sm.sessions[sessionID]
 	if !exists {
-		return errors.New("session not found")
+		return ErrSessionNotFound
 	}
 
+	// Fermer la session
 	session.Close()
+
+	// Supprimer de la map
 	delete(sm.sessions, sessionID)
+	sm.stats.TotalClosed++
+	sm.stats.CurrentActive = len(sm.sessions)
+
 	return nil
 }
 
-// GetSession récupère une session par ID
-func (sm *SessionManager) GetSession(sessionID string) (*Session, bool) {
+// ListSessions retourne la liste des IDs de sessions actives
+func (sm *SessionManager) ListSessions() []string {
 	sm.mutex.RLock()
 	defer sm.mutex.RUnlock()
 
-	session, exists := sm.sessions[sessionID]
-	return session, exists
-}
-
-// GetAllSessions retourne toutes les sessions actives
-func (sm *SessionManager) GetAllSessions() map[string]*Session {
-	sm.mutex.RLock()
-	defer sm.mutex.RUnlock()
-
-	result := make(map[string]*Session)
-	for id, session := range sm.sessions {
+	sessionIDs := make([]string, 0, len(sm.sessions))
+	for sessionID, session := range sm.sessions {
 		if session.IsActive() {
-			result[id] = session
+			sessionIDs = append(sessionIDs, sessionID)
 		}
 	}
-	return result
+
+	return sessionIDs
 }
 
 // CleanupIdleSessions nettoie les sessions inactives
@@ -536,56 +446,27 @@ func (sm *SessionManager) CleanupIdleSessions(maxIdleTime time.Duration) int {
 	defer sm.mutex.Unlock()
 
 	var toRemove []string
+
 	for sessionID, session := range sm.sessions {
 		if !session.IsActive() || session.IsIdle(maxIdleTime) {
 			toRemove = append(toRemove, sessionID)
 		}
 	}
 
+	// Supprimer les sessions inactives
 	for _, sessionID := range toRemove {
 		if session, exists := sm.sessions[sessionID]; exists {
 			session.Close()
 			delete(sm.sessions, sessionID)
+			sm.stats.TotalClosed++
 		}
 	}
+
+	sm.stats.CurrentActive = len(sm.sessions)
+	sm.stats.LastCleanup = time.Now()
+	sm.stats.CleanupCount++
 
 	return len(toRemove)
-}
-
-// GetStats retourne les statistiques du gestionnaire
-func (sm *SessionManager) GetStats() map[string]interface{} {
-	sm.mutex.RLock()
-	defer sm.mutex.RUnlock()
-
-	activeSessions := 0
-	idleSessions := 0
-	clientSessions := 0
-	serverSessions := 0
-
-	for _, session := range sm.sessions {
-		if session.IsActive() {
-			activeSessions++
-			if session.isClient {
-				clientSessions++
-			} else {
-				serverSessions++
-			}
-		}
-
-		if session.IsIdle(5 * time.Minute) {
-			idleSessions++
-		}
-	}
-
-	return map[string]interface{}{
-		"total_sessions":  len(sm.sessions),
-		"active_sessions": activeSessions,
-		"idle_sessions":   idleSessions,
-		"client_sessions": clientSessions,
-		"server_sessions": serverSessions,
-		"max_sessions":    sm.maxSessions,
-		"protocol":        "Noise Protocol Framework",
-	}
 }
 
 // CloseAllSessions ferme toutes les sessions
@@ -596,29 +477,111 @@ func (sm *SessionManager) CloseAllSessions() {
 	for sessionID, session := range sm.sessions {
 		session.Close()
 		delete(sm.sessions, sessionID)
+		sm.stats.TotalClosed++
+	}
+
+	sm.stats.CurrentActive = 0
+}
+
+// GetStats retourne les statistiques du gestionnaire
+func (sm *SessionManager) GetStats() map[string]interface{} {
+	sm.mutex.RLock()
+	defer sm.mutex.RUnlock()
+
+	activeCount := 0
+	idleCount := 0
+	clientCount := 0
+	serverCount := 0
+
+	for _, session := range sm.sessions {
+		if session.IsActive() {
+			activeCount++
+			if session.isClient {
+				clientCount++
+			} else {
+				serverCount++
+			}
+		}
+
+		if session.IsIdle(5 * time.Minute) {
+			idleCount++
+		}
+	}
+
+	return map[string]interface{}{
+		"total_sessions":  len(sm.sessions),
+		"active_sessions": activeCount,
+		"idle_sessions":   idleCount,
+		"client_sessions": clientCount,
+		"server_sessions": serverCount,
+		"max_sessions":    sm.maxSessions,
+		"total_created":   sm.stats.TotalCreated,
+		"total_closed":    sm.stats.TotalClosed,
+		"last_cleanup":    sm.stats.LastCleanup,
+		"cleanup_count":   sm.stats.CleanupCount,
+		"algorithms":      []string{"Kyber768", "X25519", "Ed25519", "NaCl-secretbox"},
 	}
 }
 
-// Fonctions utilitaires globales
+// GetDetailedStats retourne les statistiques détaillées de toutes les sessions
+func (sm *SessionManager) GetDetailedStats() map[string]interface{} {
+	sm.mutex.RLock()
+	defer sm.mutex.RUnlock()
 
-// CreateSecureConnection crée une connexion sécurisée avec configuration automatique
-func CreateSecureConnection(conn io.ReadWriter, isClient bool) (*Session, error) {
-	// Générer des clés temporaires pour la démo
-	pubKey, privKey, err := GenerateEd25519KeyPair()
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate keys: %w", err)
+	sessionsStats := make(map[string]interface{})
+	for sessionID, session := range sm.sessions {
+		sessionsStats[sessionID] = session.GetStats()
 	}
 
+	generalStats := sm.GetStats()
+	generalStats["sessions_detail"] = sessionsStats
+
+	return generalStats
+}
+
+// Fonctions de commodité pour créer des sessions
+
+// CreateClientSession crée une session côté client
+func CreateClientSession(conn io.ReadWriter, localPrivKey ed25519.PrivateKey, serverPubKey ed25519.PublicKey) (*Session, error) {
+	config := SessionConfig{
+		IsClient: true,
+		Timeout:  30 * time.Second,
+	}
+	return NewSession(conn, localPrivKey, serverPubKey, config)
+}
+
+// CreateServerSession crée une session côté serveur
+func CreateServerSession(conn io.ReadWriter, localPrivKey ed25519.PrivateKey, clientPubKey ed25519.PublicKey) (*Session, error) {
+	config := SessionConfig{
+		IsClient: false,
+		Timeout:  30 * time.Second,
+	}
+	return NewSession(conn, localPrivKey, clientPubKey, config)
+}
+
+// CreateSessionWithTimeout crée une session avec timeout personnalisé
+func CreateSessionWithTimeout(conn io.ReadWriter, localPrivKey ed25519.PrivateKey, remotePubKey ed25519.PublicKey, isClient bool, timeout time.Duration) (*Session, error) {
+	config := SessionConfig{
+		IsClient: isClient,
+		Timeout:  timeout,
+	}
+	return NewSession(conn, localPrivKey, remotePubKey, config)
+}
+
+// EstablishSecureConnection - Point d'entrée principal simplifié
+func EstablishSecureConnection(conn io.ReadWriter, isClient bool, localPrivKey ed25519.PrivateKey, remotePubKey ed25519.PublicKey) (*Session, error) {
 	config := SessionConfig{
 		IsClient: isClient,
 		Timeout:  30 * time.Second,
+		Metadata: map[string]interface{}{
+			"established_at": time.Now(),
+			"version":        "rocher-v2",
+		},
 	}
 
-	// Pour la démo, utiliser la même clé comme clé distante
-	session, err := NewSession(conn, privKey, pubKey, config)
+	session, err := NewSession(conn, localPrivKey, remotePubKey, config)
 	if err != nil {
-		secureZeroResistant(privKey)
-		return nil, err
+		return nil, fmt.Errorf("failed to establish secure connection: %w", err)
 	}
 
 	return session, nil
@@ -631,29 +594,210 @@ func ValidateSessionConfig(config SessionConfig) error {
 	}
 
 	if config.Timeout > 5*time.Minute {
-		return errors.New("timeout too long")
+		return errors.New("timeout too long (max 5 minutes)")
+	}
+
+	if config.Timeout == 0 {
+		return errors.New("timeout cannot be zero")
 	}
 
 	return nil
 }
 
-// EstimateSessionOverhead estime l'overhead d'une session Noise
+// SessionInfo contient les informations essentielles d'une session
+type SessionInfo struct {
+	SessionID     string                 `json:"session_id"`
+	IsClient      bool                   `json:"is_client"`
+	IsActive      bool                   `json:"is_active"`
+	IsEstablished bool                   `json:"is_established"`
+	StartTime     time.Time              `json:"start_time"`
+	Duration      time.Duration          `json:"duration"`
+	LocalPubKey   []byte                 `json:"local_public_key"`
+	RemotePubKey  []byte                 `json:"remote_public_key"`
+	Metadata      map[string]interface{} `json:"metadata"`
+}
+
+// GetSessionInfo retourne les informations de base d'une session
+func (s *Session) GetSessionInfo() SessionInfo {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+
+	return SessionInfo{
+		SessionID:     s.sessionID,
+		IsClient:      s.isClient,
+		IsActive:      s.IsActive(),
+		IsEstablished: s.isEstablished,
+		StartTime:     s.startTime,
+		Duration:      time.Since(s.startTime),
+		LocalPubKey:   s.localPubKey,
+		RemotePubKey:  s.remotePubKey,
+		Metadata:      s.metadata,
+	}
+}
+
+// SessionHealthCheck vérifie la santé d'une session
+func (s *Session) SessionHealthCheck() error {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+
+	if !s.isEstablished {
+		return errors.New("session not established")
+	}
+
+	if s.isClosed {
+		return errors.New("session closed")
+	}
+
+	if s.channel == nil {
+		return errors.New("secure channel is nil")
+	}
+
+	// Vérifier l'état du canal
+	if err := ValidateSecureChannel(s.channel); err != nil {
+		return fmt.Errorf("channel validation failed: %w", err)
+	}
+
+	// Vérifier si la session n'est pas trop ancienne
+	if time.Since(s.startTime) > 24*time.Hour {
+		return errors.New("session too old (>24h)")
+	}
+
+	return nil
+}
+
+// RekeySession effectue un nouveau key exchange pour renouveler les clés
+func (s *Session) RekeySession(conn io.ReadWriter, timeout time.Duration) error {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
+	if !s.isEstablished || s.isClosed {
+		return errors.New("session not active")
+	}
+
+	// Effectuer un nouvel échange de clés
+	if err := s.performKeyExchange(conn, timeout); err != nil {
+		return fmt.Errorf("rekey failed: %w", err)
+	}
+
+	// Renouveler les clés du canal
+	if err := s.channel.RekeyChannel(s.sharedSecret); err != nil {
+		return fmt.Errorf("channel rekey failed: %w", err)
+	}
+
+	return nil
+}
+
+// EstimateSessionOverhead estime l'overhead total d'une session
 func EstimateSessionOverhead() map[string]interface{} {
-	noiseOverhead := EstimateNoiseOverhead()
-	messageOverhead := EstimateMessageOverhead(0)
+	keyExchangeOverhead := EstimateKeyExchangeOverhead()
+	channelOverhead := EstimateChannelOverhead()
 
-	// Calcul du total handshake
-	totalHandshake := noiseOverhead["handshake_msg1"] +
-		noiseOverhead["handshake_msg2"] +
-		noiseOverhead["handshake_msg3"]
-
-	perMessage := noiseOverhead["transport_msg"] + messageOverhead
+	// Extraire les valeurs directement (map[string]int)
+	totalHandshake := keyExchangeOverhead["total_round_trip"]
+	perMessage := channelOverhead["per_message_total"]
 
 	return map[string]interface{}{
-		"noise_handshake":  noiseOverhead,
-		"message_overhead": messageOverhead,
+		"key_exchange":     keyExchangeOverhead,
+		"channel":          channelOverhead,
 		"session_metadata": 200, // Estimation pour les métadonnées de session
 		"total_handshake":  totalHandshake,
 		"per_message":      perMessage,
+		"establishment":    totalHandshake + 200,
 	}
+}
+
+// SessionPingPong effectue un test de ping-pong pour vérifier la connectivité
+func (s *Session) SessionPingPong(timeout time.Duration) error {
+	if timeout == 0 {
+		timeout = 5 * time.Second
+	}
+
+	pingMessage := []byte("PING")
+	pongMessage := []byte("PONG")
+
+	if s.isClient {
+		// Client envoie PING
+		if err := s.SendMessageWithTimeout(pingMessage, timeout); err != nil {
+			return fmt.Errorf("ping send failed: %w", err)
+		}
+
+		// Client reçoit PONG
+		response, err := s.ReceiveMessageWithTimeout(timeout)
+		if err != nil {
+			return fmt.Errorf("pong receive failed: %w", err)
+		}
+
+		if string(response) != "PONG" {
+			return fmt.Errorf("unexpected response: %s", string(response))
+		}
+	} else {
+		// Serveur reçoit PING
+		message, err := s.ReceiveMessageWithTimeout(timeout)
+		if err != nil {
+			return fmt.Errorf("ping receive failed: %w", err)
+		}
+
+		if string(message) != "PING" {
+			return fmt.Errorf("unexpected message: %s", string(message))
+		}
+
+		// Serveur envoie PONG
+		if err := s.SendMessageWithTimeout(pongMessage, timeout); err != nil {
+			return fmt.Errorf("pong send failed: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// Global session manager instance
+var defaultSessionManager *SessionManager
+var sessionManagerOnce sync.Once
+
+// GetDefaultSessionManager retourne l'instance globale du gestionnaire de sessions
+func GetDefaultSessionManager() *SessionManager {
+	sessionManagerOnce.Do(func() {
+		defaultSessionManager = NewSessionManager(100)
+	})
+	return defaultSessionManager
+}
+
+// RegisterSession enregistre une session dans le gestionnaire global
+func RegisterSession(session *Session) error {
+	sm := GetDefaultSessionManager()
+	sm.mutex.Lock()
+	defer sm.mutex.Unlock()
+
+	sessionID := session.GetSessionID()
+	if _, exists := sm.sessions[sessionID]; exists {
+		return ErrSessionAlreadyExists
+	}
+
+	if len(sm.sessions) >= sm.maxSessions {
+		return ErrMaxSessionsReached
+	}
+
+	sm.sessions[sessionID] = session
+	sm.stats.CurrentActive = len(sm.sessions)
+	return nil
+}
+
+// UnregisterSession désenregistre une session du gestionnaire global
+func UnregisterSession(sessionID string) error {
+	sm := GetDefaultSessionManager()
+	return sm.RemoveSession(sessionID)
+}
+
+// FindSessionByPublicKey trouve une session par clé publique distante
+func (sm *SessionManager) FindSessionByPublicKey(remotePubKey ed25519.PublicKey) *Session {
+	sm.mutex.RLock()
+	defer sm.mutex.RUnlock()
+
+	for _, session := range sm.sessions {
+		if constantTimeCompare(session.GetRemotePublicKey(), remotePubKey) {
+			return session
+		}
+	}
+
+	return nil
 }

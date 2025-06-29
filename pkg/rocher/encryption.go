@@ -7,7 +7,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"runtime"
 
 	"golang.org/x/crypto/hkdf"
 	"golang.org/x/crypto/nacl/secretbox"
@@ -18,31 +17,6 @@ const (
 	encKeySize       = 32
 	encNonceSize     = 24
 )
-
-// secureZeroMemory efface de manière sécurisée un slice de bytes
-// résistant aux optimisations du compilateur
-func secureZeroMemory(data []byte) {
-	if len(data) == 0 {
-		return
-	}
-
-	// Écriture de motifs multiples pour empêcher la récupération
-	patterns := []byte{0xFF, 0x00, 0xAA, 0x55, 0x33, 0xCC}
-	for _, pattern := range patterns {
-		for i := range data {
-			data[i] = pattern
-		}
-		// Empêcher l'optimisation du compilateur
-		runtime.KeepAlive(data)
-	}
-
-	// Nettoyage final
-	for i := range data {
-		data[i] = 0
-	}
-	// Garantir que les données restent "vivantes" jusqu'ici
-	runtime.KeepAlive(data)
-}
 
 // EncryptNaClBox chiffre avec NaCl secretbox (XSalsa20 + Poly1305)
 func EncryptNaClBox(plaintext, masterKey []byte) (string, error) {
@@ -84,7 +58,7 @@ func EncryptNaClBox(plaintext, masterKey []byte) (string, error) {
 
 	encoded := base64.StdEncoding.EncodeToString(result)
 
-	// Nettoyage sécurisé résistant aux optimisations
+	// Nettoyage sécurisé
 	secureZeroMemory(result)
 	secureZeroMemory(key[:])
 	secureZeroMemory(nonce[:])
@@ -108,7 +82,7 @@ func DecryptNaClBox(ciphertextBase64 string, masterKey []byte) ([]byte, error) {
 	}
 	defer secureZeroMemory(data)
 
-	// Validation de la taille minimale (version + nonce + secretbox overhead minimum)
+	// Validation de la taille minimale
 	if len(data) < 1+encNonceSize+secretbox.Overhead {
 		return nil, ErrInvalidFormat
 	}
@@ -259,7 +233,7 @@ func DecryptWithAdditionalData(ciphertextBase64 string, masterKey, expectedAddit
 
 	// Vérification des données additionnelles
 	actualAD := combined[:adLength]
-	if !CompareConstantTime(actualAD, expectedAdditionalData) {
+	if !ConstantTimeCompare(actualAD, expectedAdditionalData) {
 		return nil, ErrDecryption
 	}
 
@@ -366,13 +340,5 @@ func GenerateRandomKey(size int) ([]byte, error) {
 
 // CompareConstantTime compare deux slices de bytes de manière sécurisée
 func CompareConstantTime(a, b []byte) bool {
-	if len(a) != len(b) {
-		return false
-	}
-
-	var result byte
-	for i := 0; i < len(a); i++ {
-		result |= a[i] ^ b[i]
-	}
-	return result == 0
+	return ConstantTimeCompare(a, b)
 }
