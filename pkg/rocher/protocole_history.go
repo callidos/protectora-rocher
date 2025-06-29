@@ -1,8 +1,8 @@
 package rocher
 
 import (
+	"crypto/sha256"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -10,28 +10,28 @@ import (
 	"github.com/google/uuid"
 )
 
-// messageEntry structure for storing message metadata with UUID
+// messageEntry stores message metadata with UUID
 type messageEntry struct {
 	timestamp time.Time
-	msgID     string   // UUID instead of sequence number
-	hash      [16]byte // Partial hash for duplicate detection
-	recipient string   // Message recipient
+	msgID     string   // UUID
+	hash      [32]byte // Full SHA256 hash for better collision resistance
+	recipient string
 }
 
-// MessageHistory manages anti-replay with automatic cleanup and UUID-based validation
+// MessageHistory manages anti-replay with automatic cleanup
 type MessageHistory struct {
-	messages       map[string]messageEntry // Key is now UUID string
-	hashIndex      map[[16]byte]string     // Hash index points to UUID
+	messages       map[string]messageEntry // Key is UUID string
+	hashIndex      map[[32]byte]string     // Hash -> UUID mapping
 	mu             sync.RWMutex
 	lastCleanup    time.Time
 	cleanupStop    chan struct{}
-	recipientIndex map[string][]string // Index by recipient -> []messageIDs
+	recipientIndex map[string][]string // recipient -> []messageIDs
 }
 
 func NewMessageHistory() *MessageHistory {
 	mh := &MessageHistory{
 		messages:       make(map[string]messageEntry),
-		hashIndex:      make(map[[16]byte]string),
+		hashIndex:      make(map[[32]byte]string),
 		lastCleanup:    time.Now(),
 		cleanupStop:    make(chan struct{}),
 		recipientIndex: make(map[string][]string),
@@ -58,7 +58,7 @@ func (mh *MessageHistory) periodicCleanup() {
 	}
 }
 
-// cleanup removes expired entries efficiently
+// cleanup removes expired entries
 func (mh *MessageHistory) cleanup() {
 	mh.mu.Lock()
 	defer mh.mu.Unlock()
@@ -108,49 +108,50 @@ func (mh *MessageHistory) removeFromRecipientIndex(recipient, msgID string) {
 	}
 }
 
-// generateMessageHash generates a partial hash for a message with UUID and recipient
-func generateMessageHash(msgID string, timestamp int64, recipient string, data []byte) [16]byte {
-	var hash [16]byte
+// generateMessageHash generates a secure hash for deduplication
+func generateMessageHash(msgID string, timestamp int64, recipient string, data []byte) [32]byte {
+	hasher := sha256.New()
 
-	// Combine msgID, timestamp, recipient and data sample
-	idBytes := []byte(msgID)
-	recipientBytes := []byte(recipient)
+	// Include all relevant fields in hash
+	hasher.Write([]byte(msgID))
 
-	// Mix msgID
-	for i := 0; i < 8 && i < len(idBytes); i++ {
-		hash[i] = idBytes[i]
+	timestampBytes := make([]byte, 8)
+	binary.BigEndian.PutUint64(timestampBytes, uint64(timestamp))
+	hasher.Write(timestampBytes)
+
+	if recipient != "" {
+		hasher.Write([]byte(recipient))
 	}
 
-	// Mix timestamp
-	binary.BigEndian.PutUint64(hash[8:16], uint64(timestamp))
-
-	// XOR with recipient
-	for i := 0; i < 8 && i < len(recipientBytes); i++ {
-		hash[i] ^= recipientBytes[i]
-	}
-
-	// XOR with data sample for more uniqueness
+	// Include a sample of data to detect duplicates with same metadata
 	if len(data) > 0 {
-		for i := 0; i < 16 && i < len(data); i++ {
-			hash[i] ^= data[i]
+		sampleSize := len(data)
+		if sampleSize > 256 {
+			sampleSize = 256
 		}
+		hasher.Write(data[:sampleSize])
+
+		// Also include data length
+		lengthBytes := make([]byte, 4)
+		binary.BigEndian.PutUint32(lengthBytes, uint32(len(data)))
+		hasher.Write(lengthBytes)
 	}
 
-	return hash
+	return sha256.Sum256(hasher.Sum(nil))
 }
 
-// CheckAndStore checks and stores a message with UUID-based validation
+// CheckAndStore checks for replay and stores new message
 func (mh *MessageHistory) CheckAndStore(msgID string, timestamp int64, recipient string, data []byte) error {
 	mh.mu.Lock()
 	defer mh.mu.Unlock()
 
-	// Conditional cleanup for performance
+	// Conditional cleanup
 	now := time.Now()
 	if now.Sub(mh.lastCleanup) > cleanupInterval {
 		mh.cleanupUnsafe(now)
 	}
 
-	// Check size limit to avoid memory exhaustion
+	// Check size limit
 	if len(mh.messages) >= maxHistoryEntries {
 		return ErrInvalidMessage
 	}
@@ -160,17 +161,19 @@ func (mh *MessageHistory) CheckAndStore(msgID string, timestamp int64, recipient
 		return ErrInvalidMessage
 	}
 
-	// Generate message hash
-	hash := generateMessageHash(msgID, timestamp, recipient, data)
-
-	// Fast hash check
-	if _, exists := mh.hashIndex[hash]; exists {
-		return ErrInvalidMessage
+	// Primary check: UUID must be unique
+	if _, exists := mh.messages[msgID]; exists {
+		return ErrInvalidMessage // Replay attack detected
 	}
 
-	// UUID check (should be unique)
-	if _, exists := mh.messages[msgID]; exists {
-		return ErrInvalidMessage
+	// Generate hash for secondary validation
+	hash := generateMessageHash(msgID, timestamp, recipient, data)
+
+	// Secondary check: hash collision detection
+	if existingUUID, exists := mh.hashIndex[hash]; exists && existingUUID != msgID {
+		// This is extremely unlikely with SHA256, but we log it
+		fmt.Printf("[WARNING] Hash collision detected: new UUID %s collides with existing UUID %s\n", msgID, existingUUID)
+		// We still allow it since UUIDs are different
 	}
 
 	// Store message
@@ -192,7 +195,7 @@ func (mh *MessageHistory) CheckAndStore(msgID string, timestamp int64, recipient
 	return nil
 }
 
-// cleanupUnsafe non-thread-safe version for internal use
+// cleanupUnsafe performs cleanup without locking (caller must hold lock)
 func (mh *MessageHistory) cleanupUnsafe(now time.Time) {
 	cutoff := now.Add(-replayWindow)
 
@@ -217,31 +220,29 @@ func (mh *MessageHistory) cleanupUnsafe(now time.Time) {
 	mh.lastCleanup = now
 }
 
-// Reset cleans history safely
+// Reset clears history safely
 func (mh *MessageHistory) Reset() {
 	mh.mu.Lock()
 	defer mh.mu.Unlock()
 
-	// Clean maps
-	for msgID := range mh.messages {
-		delete(mh.messages, msgID)
-	}
-	for hash := range mh.hashIndex {
-		delete(mh.hashIndex, hash)
-	}
-	for recipient := range mh.recipientIndex {
-		delete(mh.recipientIndex, recipient)
-	}
-
+	// Clear all maps
+	mh.messages = make(map[string]messageEntry)
+	mh.hashIndex = make(map[[32]byte]string)
+	mh.recipientIndex = make(map[string][]string)
 	mh.lastCleanup = time.Now()
 }
 
 // Stop stops automatic cleanup
 func (mh *MessageHistory) Stop() {
-	close(mh.cleanupStop)
+	select {
+	case <-mh.cleanupStop:
+		// Already stopped
+	default:
+		close(mh.cleanupStop)
+	}
 }
 
-// GetStats returns optimized statistics
+// GetStats returns statistics
 func (mh *MessageHistory) GetStats() map[string]interface{} {
 	mh.mu.RLock()
 	defer mh.mu.RUnlock()
@@ -277,7 +278,7 @@ func (mh *MessageHistory) GetRecipientStats(recipient string) map[string]interfa
 	}
 }
 
-// Session history isolation - no more global singleton
+// Session history management
 var (
 	sessionHistories   = make(map[string]*MessageHistory)
 	sessionHistoriesMu sync.RWMutex
@@ -307,7 +308,7 @@ func getSessionHistory(sessionID string) *MessageHistory {
 	return history
 }
 
-// ResetMessageHistory safely resets global history
+// ResetMessageHistory resets all session histories
 func ResetMessageHistory() {
 	sessionHistoriesMu.Lock()
 	defer sessionHistoriesMu.Unlock()
@@ -356,10 +357,16 @@ func GetMessageHistoryStats() map[string]interface{} {
 	stats["total_sessions"] = len(sessionHistories)
 
 	sessionStats := make(map[string]interface{})
+	totalMessages := 0
 	for sessionID, history := range sessionHistories {
-		sessionStats[sessionID] = history.GetStats()
+		histStats := history.GetStats()
+		sessionStats[sessionID] = histStats
+		if msgCount, ok := histStats["total_messages"].(int); ok {
+			totalMessages += msgCount
+		}
 	}
 	stats["sessions"] = sessionStats
+	stats["total_messages_all_sessions"] = totalMessages
 
 	return stats
 }
@@ -378,155 +385,22 @@ func GetSessionHistoryStats(sessionID string) map[string]interface{} {
 	}
 }
 
-// GetRecipientHistoryStats returns statistics for a specific recipient in a session
-func GetRecipientHistoryStats(sessionID string, recipient string) map[string]interface{} {
+// MessageExists checks if a message ID exists in any session
+func MessageExists(msgID string) bool {
 	sessionHistoriesMu.RLock()
 	defer sessionHistoriesMu.RUnlock()
-
-	if history, exists := sessionHistories[sessionID]; exists {
-		return history.GetRecipientStats(recipient)
-	}
-
-	return map[string]interface{}{
-		"error": "session not found",
-	}
-}
-
-// Message filtering and routing utilities
-
-// MessageFilter represents a filter for messages
-type MessageFilter struct {
-	Recipients []string          `json:"recipients,omitempty"`
-	FromTime   *time.Time        `json:"from_time,omitempty"`
-	ToTime     *time.Time        `json:"to_time,omitempty"`
-	MessageIDs []string          `json:"message_ids,omitempty"`
-	SessionIDs []string          `json:"session_ids,omitempty"`
-	MaxResults int               `json:"max_results,omitempty"`
-	Custom     map[string]string `json:"custom,omitempty"`
-}
-
-// ValidateMessageFilter validates a message filter
-func ValidateMessageFilter(filter *MessageFilter) error {
-	if filter == nil {
-		return errors.New("filter cannot be nil")
-	}
-
-	// Validate recipients
-	for _, recipient := range filter.Recipients {
-		if err := ValidateRecipient(recipient); err != nil {
-			return fmt.Errorf("invalid recipient '%s': %w", recipient, err)
-		}
-	}
-
-	// Validate message IDs
-	for _, msgID := range filter.MessageIDs {
-		if err := ValidateMessageID(msgID); err != nil {
-			return fmt.Errorf("invalid message ID '%s': %w", msgID, err)
-		}
-	}
-
-	// Validate session IDs
-	for _, sessionID := range filter.SessionIDs {
-		if err := ValidateSessionIDString(sessionID); err != nil {
-			return fmt.Errorf("invalid session ID '%s': %w", sessionID, err)
-		}
-	}
-
-	// Validate time range
-	if filter.FromTime != nil && filter.ToTime != nil {
-		if filter.FromTime.After(*filter.ToTime) {
-			return errors.New("from_time cannot be after to_time")
-		}
-	}
-
-	// Validate max results
-	if filter.MaxResults < 0 {
-		return errors.New("max_results cannot be negative")
-	}
-	if filter.MaxResults > 10000 {
-		filter.MaxResults = 10000 // Cap at reasonable limit
-	}
-
-	return nil
-}
-
-// MessageInfo represents information about a message without the content
-type MessageInfo struct {
-	ID        string    `json:"id"`
-	Timestamp time.Time `json:"timestamp"`
-	Recipient string    `json:"recipient"`
-	SessionID string    `json:"session_id"`
-	Size      int       `json:"size"`
-	TTL       int       `json:"ttl"`
-}
-
-// ExtractMessageInfo extracts metadata from an envelope without revealing content
-func ExtractMessageInfo(envelope *Envelope) *MessageInfo {
-	if envelope == nil {
-		return nil
-	}
-
-	return &MessageInfo{
-		ID:        envelope.ID,
-		Timestamp: time.Unix(envelope.Timestamp, 0),
-		Recipient: envelope.Recipient,
-		SessionID: envelope.SessionID,
-		Size:      len(envelope.Data),
-		TTL:       envelope.TTL,
-	}
-}
-
-// Enhanced statistics and monitoring
-
-// GetDetailedMessageStats returns detailed statistics about messages
-func GetDetailedMessageStats() map[string]interface{} {
-	sessionHistoriesMu.RLock()
-	defer sessionHistoriesMu.RUnlock()
-
-	totalMessages := 0
-	totalRecipients := make(map[string]int)
-	sessionCount := len(sessionHistories)
-	oldestMessage := time.Now()
-	newestMessage := time.Time{}
 
 	for _, history := range sessionHistories {
 		history.mu.RLock()
-
-		sessionMessages := len(history.messages)
-		totalMessages += sessionMessages
-
-		// Count messages per recipient
-		for recipient, msgIDs := range history.recipientIndex {
-			totalRecipients[recipient] += len(msgIDs)
-		}
-
-		// Find oldest and newest messages
-		for _, entry := range history.messages {
-			if entry.timestamp.Before(oldestMessage) {
-				oldestMessage = entry.timestamp
-			}
-			if entry.timestamp.After(newestMessage) {
-				newestMessage = entry.timestamp
-			}
-		}
-
+		_, exists := history.messages[msgID]
 		history.mu.RUnlock()
+
+		if exists {
+			return true
+		}
 	}
 
-	stats := map[string]interface{}{
-		"total_messages":    totalMessages,
-		"total_sessions":    sessionCount,
-		"unique_recipients": len(totalRecipients),
-		"recipients_stats":  totalRecipients,
-	}
-
-	if totalMessages > 0 {
-		stats["oldest_message"] = oldestMessage
-		stats["newest_message"] = newestMessage
-		stats["time_span"] = newestMessage.Sub(oldestMessage)
-	}
-
-	return stats
+	return false
 }
 
 // CleanupExpiredMessages removes expired messages across all sessions
@@ -548,173 +422,4 @@ func CleanupExpiredMessages() int {
 	}
 
 	return cleanedCount
-}
-
-// Advanced message operations
-
-// FindMessagesByRecipient finds all messages for a specific recipient across sessions
-func FindMessagesByRecipient(recipient string, limit int) []MessageInfo {
-	if limit <= 0 {
-		limit = 100
-	}
-
-	sessionHistoriesMu.RLock()
-	defer sessionHistoriesMu.RUnlock()
-
-	var results []MessageInfo
-
-	for _, history := range sessionHistories {
-		history.mu.RLock()
-
-		if msgIDs, exists := history.recipientIndex[recipient]; exists {
-			for _, msgID := range msgIDs {
-				if len(results) >= limit {
-					history.mu.RUnlock()
-					return results
-				}
-
-				if entry, exists := history.messages[msgID]; exists {
-					info := MessageInfo{
-						ID:        entry.msgID,
-						Timestamp: entry.timestamp,
-						Recipient: entry.recipient,
-						Size:      0, // Size not stored in entry
-					}
-					results = append(results, info)
-				}
-			}
-		}
-
-		history.mu.RUnlock()
-	}
-
-	return results
-}
-
-// MessageExists checks if a message ID exists in any session
-func MessageExists(msgID string) bool {
-	sessionHistoriesMu.RLock()
-	defer sessionHistoriesMu.RUnlock()
-
-	for _, history := range sessionHistories {
-		history.mu.RLock()
-		_, exists := history.messages[msgID]
-		history.mu.RUnlock()
-
-		if exists {
-			return true
-		}
-	}
-
-	return false
-}
-
-// GetMessageInfo retrieves information about a specific message
-func GetMessageInfo(msgID string) *MessageInfo {
-	sessionHistoriesMu.RLock()
-	defer sessionHistoriesMu.RUnlock()
-
-	for _, history := range sessionHistories {
-		history.mu.RLock()
-
-		if entry, exists := history.messages[msgID]; exists {
-			info := &MessageInfo{
-				ID:        entry.msgID,
-				Timestamp: entry.timestamp,
-				Recipient: entry.recipient,
-				Size:      0, // Size not stored in entry
-			}
-			history.mu.RUnlock()
-			return info
-		}
-
-		history.mu.RUnlock()
-	}
-
-	return nil
-}
-
-// Performance optimizations and caching
-
-// MessageCache represents a simple LRU cache for recent messages
-type MessageCache struct {
-	entries    map[string]*MessageInfo
-	order      []string
-	maxEntries int
-	mu         sync.RWMutex
-}
-
-// NewMessageCache creates a new message cache
-func NewMessageCache(maxEntries int) *MessageCache {
-	if maxEntries <= 0 {
-		maxEntries = 1000
-	}
-
-	return &MessageCache{
-		entries:    make(map[string]*MessageInfo),
-		order:      make([]string, 0, maxEntries),
-		maxEntries: maxEntries,
-	}
-}
-
-// Get retrieves a message info from cache
-func (mc *MessageCache) Get(msgID string) (*MessageInfo, bool) {
-	mc.mu.RLock()
-	defer mc.mu.RUnlock()
-
-	info, exists := mc.entries[msgID]
-	return info, exists
-}
-
-// Put stores a message info in cache
-func (mc *MessageCache) Put(msgID string, info *MessageInfo) {
-	mc.mu.Lock()
-	defer mc.mu.Unlock()
-
-	// If already exists, update and move to front
-	if _, exists := mc.entries[msgID]; exists {
-		mc.entries[msgID] = info
-		mc.moveToFront(msgID)
-		return
-	}
-
-	// Add new entry
-	mc.entries[msgID] = info
-	mc.order = append([]string{msgID}, mc.order...)
-
-	// Evict if necessary
-	if len(mc.order) > mc.maxEntries {
-		oldest := mc.order[len(mc.order)-1]
-		delete(mc.entries, oldest)
-		mc.order = mc.order[:len(mc.order)-1]
-	}
-}
-
-// moveToFront moves an entry to the front of the order slice
-func (mc *MessageCache) moveToFront(msgID string) {
-	for i, id := range mc.order {
-		if id == msgID {
-			// Remove from current position
-			mc.order = append(mc.order[:i], mc.order[i+1:]...)
-			// Add to front
-			mc.order = append([]string{msgID}, mc.order...)
-			break
-		}
-	}
-}
-
-// Clear clears the cache
-func (mc *MessageCache) Clear() {
-	mc.mu.Lock()
-	defer mc.mu.Unlock()
-
-	mc.entries = make(map[string]*MessageInfo)
-	mc.order = mc.order[:0]
-}
-
-// Size returns the current cache size
-func (mc *MessageCache) Size() int {
-	mc.mu.RLock()
-	defer mc.mu.RUnlock()
-	return len(mc.entries)
 }

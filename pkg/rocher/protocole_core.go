@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	mathrand "math/rand"
 	"strings"
 	"time"
 
@@ -19,17 +18,16 @@ import (
 const (
 	replayWindow      = 30 * time.Second
 	messageSizeLimit  = 16 * 1024 * 1024
-	maxSkippedMsgs    = 100
 	maxHistoryEntries = 10000
 	cleanupInterval   = 5 * time.Minute
 	maxTTL            = 86400 // 24 hours maximum
-	protocolVersion   = 3     // Version bumped for UUID support
+	protocolVersion   = 3
 	protocolNonceSize = 24
 	protocolKeySize   = 32
-	maxRecipientLen   = 64 // Maximum recipient identifier length
+	maxRecipientLen   = 64
 )
 
-// Unified error to avoid information oracles
+// Unified error to avoid information leakage
 var (
 	ErrInvalidMessage = errors.New("invalid message")
 )
@@ -51,8 +49,9 @@ func init() {
 // Custom validation functions
 func validateSafeString(fl validator.FieldLevel) bool {
 	str := fl.Field().String()
+	// Allow valid UTF-8 characters, not just ASCII
 	for _, r := range str {
-		if r < 32 || r > 126 {
+		if r == 0 || (r > 0 && r < 32 && r != '\n' && r != '\r' && r != '\t') {
 			return false
 		}
 	}
@@ -62,7 +61,7 @@ func validateSafeString(fl validator.FieldLevel) bool {
 func validateSessionID(fl validator.FieldLevel) bool {
 	sessionID := fl.Field().String()
 
-	// Permettre les SessionID vides pour la compatibilité
+	// Allow empty SessionID for compatibility
 	if len(sessionID) == 0 {
 		return true
 	}
@@ -83,7 +82,7 @@ func validateSessionID(fl validator.FieldLevel) bool {
 
 func validateNonceSize(fl validator.FieldLevel) bool {
 	nonce := fl.Field().Bytes()
-	return len(nonce) == 0 || len(nonce) == 16 // Empty or 16 bytes
+	return len(nonce) == 0 || len(nonce) == 16
 }
 
 func validateUUIDString(fl validator.FieldLevel) bool {
@@ -117,16 +116,16 @@ func validateRecipient(fl validator.FieldLevel) bool {
 	return true
 }
 
-// Envelope message structure with enhanced security, validation, recipient and UUID
+// Envelope message structure with enhanced security
 type Envelope struct {
-	ID        string `json:"id" validate:"required,uuid_string"` // UUID instead of sequence
+	ID        string `json:"id" validate:"required,uuid_string"`
 	Timestamp int64  `json:"ts" validate:"required"`
 	TTL       int    `json:"ttl,omitempty" validate:"min=0,max=86400"`
 	Data      string `json:"data" validate:"required,max=1048576,safe_string"`
-	Version   int    `json:"v" validate:"eq=3"` // Version 3 for UUID support
+	Version   int    `json:"v" validate:"eq=3"`
 	Nonce     []byte `json:"nonce,omitempty" validate:"nonce_size"`
 	SessionID string `json:"sid,omitempty" validate:"session_id"`
-	Recipient string `json:"recipient,omitempty" validate:"recipient"` // New recipient field
+	Recipient string `json:"recipient,omitempty" validate:"recipient"`
 }
 
 // ValidateEnvelope validates an envelope using validator tags
@@ -143,21 +142,19 @@ func generateSecureNonce() []byte {
 	return nonce
 }
 
-// SendMessage sends encrypted message with NaCl secretbox (legacy interface)
+// SendMessage sends encrypted message (simplified interface)
 func SendMessage(w io.Writer, message string, key []byte, seq uint64, ttl int) error {
-	// Generate UUID for legacy interface
 	msgID := uuid.New().String()
 	return SendMessageWithRecipient(w, message, key, msgID, ttl, "", "")
 }
 
-// SendMessageWithSession sends encrypted message with session isolation (legacy interface)
+// SendMessageWithSession sends encrypted message with session isolation
 func SendMessageWithSession(w io.Writer, message string, key []byte, seq uint64, ttl int, sessionID string) error {
-	// Generate UUID for legacy interface
 	msgID := uuid.New().String()
 	return SendMessageWithRecipient(w, message, key, msgID, ttl, sessionID, "")
 }
 
-// SendMessageWithRecipient sends encrypted message with recipient and UUID
+// SendMessageWithRecipient sends encrypted message with all features
 func SendMessageWithRecipient(w io.Writer, message string, key []byte, msgID string, ttl int, sessionID string, recipient string) error {
 	if w == nil {
 		return errors.New("writer cannot be nil")
@@ -165,14 +162,14 @@ func SendMessageWithRecipient(w io.Writer, message string, key []byte, msgID str
 	if len(message) == 0 {
 		return errors.New("empty message")
 	}
-	if len(key) == 0 {
-		return errors.New("empty key")
+	if len(key) < 32 {
+		return errors.New("key too short")
 	}
 	if ttl < 0 || ttl > maxTTL {
-		ttl = 0 // Unlimited TTL or default value
+		ttl = 0 // Default: no expiration
 	}
 
-	// If no msgID provided, generate one
+	// Generate UUID if not provided
 	if msgID == "" {
 		msgID = uuid.New().String()
 	}
@@ -193,7 +190,7 @@ func SendMessageWithRecipient(w io.Writer, message string, key []byte, msgID str
 		Recipient: recipient,
 	}
 
-	// Validate envelope with tags
+	// Validate envelope
 	if err := ValidateEnvelope(&envelope); err != nil {
 		return fmt.Errorf("envelope validation failed: %w", err)
 	}
@@ -214,7 +211,7 @@ func SendMessageWithRecipient(w io.Writer, message string, key []byte, msgID str
 	if err != nil {
 		return fmt.Errorf("key derivation failed: %w", err)
 	}
-	defer secureZeroResistant(protocolKey)
+	defer secureZeroMemory(protocolKey)
 
 	var secretKey [protocolKeySize]byte
 	copy(secretKey[:], protocolKey)
@@ -242,43 +239,43 @@ func SendMessageWithRecipient(w io.Writer, message string, key []byte, msgID str
 	// Atomic message send
 	_, err = w.Write(finalMessage)
 
-	// Secure cleanup resistant to optimizations
-	secureZeroResistant(secretKey[:])
-	secureZeroResistant(nonce[:])
-	secureZeroResistant(finalMessage)
+	// Secure cleanup
+	secureZeroMemory(secretKey[:])
+	secureZeroMemory(nonce[:])
+	secureZeroMemory(finalMessage)
 
 	return err
 }
 
-// ReceiveMessage receives and decrypts message with NaCl secretbox (legacy interface)
+// ReceiveMessage receives and decrypts message (simplified interface)
 func ReceiveMessage(r io.Reader, key []byte) (string, error) {
 	msg, _, _, err := ReceiveMessageWithDetails(r, key, "")
 	return msg, err
 }
 
-// ReceiveMessageWithSession receives and decrypts message with session isolation (legacy interface)
+// ReceiveMessageWithSession receives and decrypts message with session isolation
 func ReceiveMessageWithSession(r io.Reader, key []byte, sessionID string) (string, error) {
 	msg, _, _, err := ReceiveMessageWithDetails(r, key, sessionID)
 	return msg, err
 }
 
-// ReceiveMessageWithDetails receives and decrypts message with full details including recipient and UUID
+// ReceiveMessageWithDetails receives and decrypts message with full details
 func ReceiveMessageWithDetails(r io.Reader, key []byte, sessionID string) (message string, msgID string, recipient string, err error) {
 	if r == nil {
 		return "", "", "", errors.New("reader cannot be nil")
 	}
-	if len(key) == 0 {
-		return "", "", "", errors.New("empty key")
+	if len(key) < 32 {
+		return "", "", "", errors.New("key too short")
 	}
 
 	// Read with strict size limit
 	reader := bufio.NewReader(io.LimitReader(r, messageSizeLimit))
 	line, err := reader.ReadString('\n')
 	if err != nil {
-		return "", "", "", ErrInvalidMessage // Unified error
+		return "", "", "", ErrInvalidMessage
 	}
 
-	// Remove newline character
+	// Remove newline
 	if len(line) > 0 && line[len(line)-1] == '\n' {
 		line = line[:len(line)-1]
 	}
@@ -289,7 +286,7 @@ func ReceiveMessageWithDetails(r io.Reader, key []byte, sessionID string) (messa
 
 	// Convert to bytes
 	data := []byte(line)
-	defer secureZeroResistant(data)
+	defer secureZeroMemory(data)
 
 	// Validate minimum size
 	if len(data) < protocolNonceSize+secretbox.Overhead {
@@ -299,9 +296,9 @@ func ReceiveMessageWithDetails(r io.Reader, key []byte, sessionID string) (messa
 	// Derive key for protocol
 	protocolKey, err := deriveKeyWithContext(key, "protocol", protocolKeySize)
 	if err != nil {
-		return "", "", "", ErrInvalidMessage // Error normalization
+		return "", "", "", ErrInvalidMessage
 	}
-	defer secureZeroResistant(protocolKey)
+	defer secureZeroMemory(protocolKey)
 
 	var secretKey [protocolKeySize]byte
 	copy(secretKey[:], protocolKey)
@@ -314,9 +311,9 @@ func ReceiveMessageWithDetails(r io.Reader, key []byte, sessionID string) (messa
 	// Decrypt with NaCl secretbox
 	decrypted, ok := secretbox.Open(nil, ciphertext, &nonce, &secretKey)
 	if !ok {
-		return "", "", "", ErrInvalidMessage // Error normalization
+		return "", "", "", ErrInvalidMessage
 	}
-	defer secureZeroResistant(decrypted)
+	defer secureZeroMemory(decrypted)
 
 	// Deserialize envelope
 	var envelope Envelope
@@ -324,24 +321,24 @@ func ReceiveMessageWithDetails(r io.Reader, key []byte, sessionID string) (messa
 		return "", "", "", ErrInvalidMessage
 	}
 
-	// Validate envelope with tags
+	// Validate envelope
 	if err := ValidateEnvelope(&envelope); err != nil {
 		return "", "", "", ErrInvalidMessage
 	}
 
-	// Unified message validation with session and UUID
+	// Validate message with session
 	if err := validateMessageWithDetailsAndSession(envelope, sessionID); err != nil {
-		return "", "", "", ErrInvalidMessage // Always same error
+		return "", "", "", ErrInvalidMessage
 	}
 
 	// Secure cleanup
-	secureZeroResistant(secretKey[:])
-	secureZeroResistant(nonce[:])
+	secureZeroMemory(secretKey[:])
+	secureZeroMemory(nonce[:])
 
 	return envelope.Data, envelope.ID, envelope.Recipient, nil
 }
 
-// validateMessageWithDetailsAndSession validates a message with oracle protection, session isolation and UUID validation
+// validateMessageWithDetailsAndSession validates message integrity and replay protection
 func validateMessageWithDetailsAndSession(env Envelope, expectedSessionID string) error {
 	now := time.Now().Unix()
 
@@ -359,7 +356,7 @@ func validateMessageWithDetailsAndSession(env Envelope, expectedSessionID string
 	windowSeconds := int64(replayWindow.Seconds())
 	timeDiff := now - env.Timestamp
 
-	// Temporal validation with unified tolerance
+	// Temporal validation
 	if timeDiff > windowSeconds || timeDiff < -5 {
 		return ErrInvalidMessage
 	}
@@ -369,33 +366,33 @@ func validateMessageWithDetailsAndSession(env Envelope, expectedSessionID string
 		return ErrInvalidMessage
 	}
 
-	// Anti-replay verification with DoS protection and session isolation
+	// Anti-replay verification with session isolation
 	sessionKey := env.SessionID
 	if sessionKey == "" {
-		sessionKey = "default" // Default session for backward compatibility
+		sessionKey = "default"
 	}
 
 	history := getSessionHistory(sessionKey)
 	if err := history.CheckAndStore(env.ID, env.Timestamp, env.Recipient, []byte(env.Data)); err != nil {
-		return ErrInvalidMessage // Unified error
+		return ErrInvalidMessage
 	}
 
 	return nil
 }
 
-// SendMessageWithRetry sends message with intelligent retry (legacy interface)
+// SendMessageWithRetry sends message with intelligent retry
 func SendMessageWithRetry(w io.Writer, message string, key []byte, seq uint64, ttl int, maxRetries int) error {
 	msgID := uuid.New().String()
 	return SendMessageWithRetryAndRecipient(w, message, key, msgID, ttl, maxRetries, "", "")
 }
 
-// SendMessageWithRetryAndSession sends message with intelligent retry and session isolation (legacy interface)
+// SendMessageWithRetryAndSession sends message with retry and session
 func SendMessageWithRetryAndSession(w io.Writer, message string, key []byte, seq uint64, ttl int, maxRetries int, sessionID string) error {
 	msgID := uuid.New().String()
 	return SendMessageWithRetryAndRecipient(w, message, key, msgID, ttl, maxRetries, sessionID, "")
 }
 
-// SendMessageWithRetryAndRecipient sends message with intelligent retry, session isolation, and recipient
+// SendMessageWithRetryAndRecipient sends message with full retry support
 func SendMessageWithRetryAndRecipient(w io.Writer, message string, key []byte, msgID string, ttl int, maxRetries int, sessionID string, recipient string) error {
 	if maxRetries < 0 {
 		maxRetries = 3
@@ -408,10 +405,21 @@ func SendMessageWithRetryAndRecipient(w io.Writer, message string, key []byte, m
 		if err := SendMessageWithRecipient(w, message, key, msgID, ttl, sessionID, recipient); err != nil {
 			lastErr = err
 			if i < maxRetries {
-				// Exponential backoff with jitter
-				jitter := time.Duration(mathrand.Int63n(int64(backoff / 2)))
-				time.Sleep(backoff + jitter)
+				// Exponential backoff with cryptographically secure jitter
+				jitterBytes := make([]byte, 4)
+				if _, err := rand.Read(jitterBytes); err == nil {
+					// Convert bytes to a value between 0 and backoff/2
+					jitterValue := uint32(jitterBytes[0])<<24 | uint32(jitterBytes[1])<<16 | uint32(jitterBytes[2])<<8 | uint32(jitterBytes[3])
+					jitter := time.Duration(jitterValue % uint32(backoff/2))
+					time.Sleep(backoff + jitter)
+				} else {
+					// Fallback if crypto/rand fails
+					time.Sleep(backoff)
+				}
 				backoff *= 2
+				if backoff > 5*time.Second {
+					backoff = 5 * time.Second
+				}
 				continue
 			}
 		} else {
@@ -422,19 +430,19 @@ func SendMessageWithRetryAndRecipient(w io.Writer, message string, key []byte, m
 	return fmt.Errorf("failed after %d retries: %w", maxRetries, lastErr)
 }
 
-// ReceiveMessageWithTimeout receives message with configurable timeout (legacy interface)
+// ReceiveMessageWithTimeout receives message with timeout
 func ReceiveMessageWithTimeout(r io.Reader, key []byte, timeout time.Duration) (string, error) {
 	msg, _, _, err := ReceiveMessageWithTimeoutAndDetails(r, key, timeout, "")
 	return msg, err
 }
 
-// ReceiveMessageWithTimeoutAndSession receives message with configurable timeout and session isolation (legacy interface)
+// ReceiveMessageWithTimeoutAndSession receives message with timeout and session
 func ReceiveMessageWithTimeoutAndSession(r io.Reader, key []byte, timeout time.Duration, sessionID string) (string, error) {
 	msg, _, _, err := ReceiveMessageWithTimeoutAndDetails(r, key, timeout, sessionID)
 	return msg, err
 }
 
-// ReceiveMessageWithTimeoutAndDetails receives message with configurable timeout and full details
+// ReceiveMessageWithTimeoutAndDetails receives message with full timeout support
 func ReceiveMessageWithTimeoutAndDetails(r io.Reader, key []byte, timeout time.Duration, sessionID string) (message string, msgID string, recipient string, err error) {
 	if timeout <= 0 {
 		timeout = 30 * time.Second
@@ -463,52 +471,7 @@ func ReceiveMessageWithTimeoutAndDetails(r io.Reader, key []byte, timeout time.D
 	}
 }
 
-// Additional helper functions for validation
-
-// ValidateUsername validates username with tags
-func ValidateUsername(username string) error {
-	type UsernameStruct struct {
-		Username string `validate:"required,min=3,max=64,alphanum"`
-	}
-
-	return validate.Struct(&UsernameStruct{Username: username})
-}
-
-// ValidateSessionIDString validates a session ID string
-func ValidateSessionIDString(sessionID string) error {
-	type SessionStruct struct {
-		SessionID string `validate:"session_id"`
-	}
-
-	return validate.Struct(&SessionStruct{SessionID: sessionID})
-}
-
-// ValidateMessageData validates message data content
-func ValidateMessageData(data string) error {
-	type DataStruct struct {
-		Data string `validate:"required,max=1048576,safe_string"`
-	}
-
-	return validate.Struct(&DataStruct{Data: data})
-}
-
-// ValidateRecipient validates a recipient identifier
-func ValidateRecipient(recipient string) error {
-	type RecipientStruct struct {
-		Recipient string `validate:"recipient"`
-	}
-
-	return validate.Struct(&RecipientStruct{Recipient: recipient})
-}
-
-// ValidateMessageID validates a message UUID
-func ValidateMessageID(msgID string) error {
-	type MessageIDStruct struct {
-		MessageID string `validate:"required,uuid_string"`
-	}
-
-	return validate.Struct(&MessageIDStruct{MessageID: msgID})
-}
+// Helper functions
 
 // GenerateMessageID generates a new UUID for messages
 func GenerateMessageID() string {
@@ -520,33 +483,58 @@ func ParseMessageID(msgID string) (uuid.UUID, error) {
 	return uuid.Parse(msgID)
 }
 
-// RegisterCustomValidation allows registering additional custom validations
-func RegisterCustomValidation(tag string, fn validator.Func) error {
-	return validate.RegisterValidation(tag, fn)
+// ValidateUsername validates username
+func ValidateUsername(username string) error {
+	type UsernameStruct struct {
+		Username string `validate:"required,min=3,max=64,alphanum"`
+	}
+	return validate.Struct(&UsernameStruct{Username: username})
 }
 
-// GetValidatorInstance returns the global validator instance for advanced usage
-func GetValidatorInstance() *validator.Validate {
-	return validate
+// ValidateSessionIDString validates a session ID
+func ValidateSessionIDString(sessionID string) error {
+	type SessionStruct struct {
+		SessionID string `validate:"session_id"`
+	}
+	return validate.Struct(&SessionStruct{SessionID: sessionID})
 }
 
-// Utility functions for recipient management
+// ValidateMessageData validates message content
+func ValidateMessageData(data string) error {
+	type DataStruct struct {
+		Data string `validate:"required,max=1048576,safe_string"`
+	}
+	return validate.Struct(&DataStruct{Data: data})
+}
+
+// ValidateRecipient validates a recipient identifier
+func ValidateRecipient(recipient string) error {
+	type RecipientStruct struct {
+		Recipient string `validate:"recipient"`
+	}
+	return validate.Struct(&RecipientStruct{Recipient: recipient})
+}
+
+// ValidateMessageID validates a message UUID
+func ValidateMessageID(msgID string) error {
+	type MessageIDStruct struct {
+		MessageID string `validate:"required,uuid_string"`
+	}
+	return validate.Struct(&MessageIDStruct{MessageID: msgID})
+}
 
 // IsRecipientValid checks if a recipient identifier is valid
 func IsRecipientValid(recipient string) bool {
 	return ValidateRecipient(recipient) == nil
 }
 
-// NormalizeRecipient normalizes a recipient identifier (lowercase, trim spaces)
+// NormalizeRecipient normalizes a recipient identifier
 func NormalizeRecipient(recipient string) string {
 	if recipient == "" {
 		return ""
 	}
 
-	// Simple normalization - can be extended
 	normalized := strings.ToLower(strings.TrimSpace(recipient))
-
-	// Validate normalized result
 	if !IsRecipientValid(normalized) {
 		return ""
 	}
@@ -554,37 +542,18 @@ func NormalizeRecipient(recipient string) string {
 	return normalized
 }
 
-// IsBroadcastMessage checks if a message is a broadcast (no specific recipient)
+// IsBroadcastMessage checks if a message is a broadcast
 func IsBroadcastMessage(recipient string) bool {
 	return recipient == ""
 }
 
-// ValidateMessageIntegrity validates message integrity without decryption
-func ValidateMessageIntegrity(encryptedMessage string) error {
-	if encryptedMessage == "" {
-		return ErrInvalidMessage
-	}
-
-	data := []byte(encryptedMessage)
-	// Basic size validation
-	if len(data) < protocolNonceSize+secretbox.Overhead {
-		return ErrInvalidMessage
-	}
-
-	return nil
-}
-
-// EstimateMessageOverhead estimates message overhead
+// EstimateMessageOverhead estimates protocol overhead
 func EstimateMessageOverhead(messageSize int) int {
-	// Estimation: JSON envelope + NaCl encryption + newline
-	jsonOverhead := 200                                          // Approximate JSON metadata (including UUID, SessionID, Recipient)
-	encryptionOverhead := protocolNonceSize + secretbox.Overhead // Nonce + NaCl overhead
+	jsonOverhead := 200 // JSON metadata including UUID
+	encryptionOverhead := protocolNonceSize + secretbox.Overhead
 	newlineOverhead := 1
-
 	return jsonOverhead + encryptionOverhead + newlineOverhead
 }
-
-// Protocol version management
 
 // GetProtocolVersion returns the current protocol version
 func GetProtocolVersion() int {
@@ -593,82 +562,20 @@ func GetProtocolVersion() int {
 
 // IsVersionSupported checks if a protocol version is supported
 func IsVersionSupported(version int) bool {
-	// Support versions 1, 2 (legacy) and 3 (current with UUID)
 	return version >= 1 && version <= 3
 }
 
-// GetVersionFeatures returns features available in a specific version
-func GetVersionFeatures(version int) map[string]bool {
-	features := map[string]bool{
-		"encryption":        false,
-		"session_id":        false,
-		"recipient":         false,
-		"uuid_id":           false,
-		"replay_protection": false,
-	}
-
-	switch version {
-	case 1:
-		features["encryption"] = true
-		features["replay_protection"] = true
-	case 2:
-		features["encryption"] = true
-		features["session_id"] = true
-		features["replay_protection"] = true
-	case 3:
-		features["encryption"] = true
-		features["session_id"] = true
-		features["recipient"] = true
-		features["uuid_id"] = true
-		features["replay_protection"] = true
-	}
-
-	return features
-}
-
-// Configuration and constants for new features
-
-// GetMaxRecipientLength returns the maximum allowed recipient length
+// GetMaxRecipientLength returns the maximum recipient length
 func GetMaxRecipientLength() int {
 	return maxRecipientLen
 }
 
-// GetReplayWindow returns the current replay protection window
+// GetReplayWindow returns the replay protection window
 func GetReplayWindow() time.Duration {
 	return replayWindow
 }
 
-// GetMaxHistoryEntries returns the maximum number of history entries per session
+// GetMaxHistoryEntries returns the maximum history entries
 func GetMaxHistoryEntries() int {
 	return maxHistoryEntries
-}
-
-// Migration utilities for upgrading from sequence-based to UUID-based messages
-
-// MigrationStats represents statistics about migration process
-type MigrationStats struct {
-	ProcessedMessages int       `json:"processed_messages"`
-	MigratedMessages  int       `json:"migrated_messages"`
-	FailedMessages    int       `json:"failed_messages"`
-	StartTime         time.Time `json:"start_time"`
-	EndTime           time.Time `json:"end_time"`
-	Duration          string    `json:"duration"`
-}
-
-// BackwardCompatibilityMode enables handling of old sequence-based messages
-var BackwardCompatibilityMode = false
-
-// EnableBackwardCompatibility enables backward compatibility with sequence-based messages
-func EnableBackwardCompatibility() {
-	BackwardCompatibilityMode = true
-}
-
-// DisableBackwardCompatibility disables backward compatibility
-func DisableBackwardCompatibility() {
-	BackwardCompatibilityMode = false
-}
-
-// IsBackwardCompatibilityEnabled returns the current backward compatibility state
-func IsBackwardCompatibilityEnabled() bool {
-	return BackwardCompatibilityMode
 }

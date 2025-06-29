@@ -117,13 +117,6 @@ func validateEd25519Keys(privKey ed25519.PrivateKey, pubKey ed25519.PublicKey) e
 		return NewCryptographicError("Zero public key", nil)
 	}
 
-	// Validation avec crypto/ed25519 - vérifier la cohérence
-	derivedPub := privKey.Public().(ed25519.PublicKey)
-	if len(derivedPub) == ed25519.PublicKeySize {
-		// Si on peut dériver, on vérifie optionnellement la cohérence
-		// pour les clés qui nous appartiennent
-	}
-
 	return nil
 }
 
@@ -246,11 +239,11 @@ func (c *ClientKeyExchanger) performSingleExchange(conn io.ReadWriter, privKey e
 
 	// Validation que le secret partagé n'est pas nul
 	if isAllZeros(sharedSecret) {
-		secureZeroResistant(sharedSecret)
+		secureZeroMemory(sharedSecret)
 		return nil, NewCryptographicError("Zero shared secret generated", nil)
 	}
 
-	defer secureZeroResistant(sharedSecret)
+	defer secureZeroMemory(sharedSecret)
 
 	// Dérivation de la clé de session
 	sessionKey := DeriveSessionKey(sharedSecret)
@@ -310,11 +303,11 @@ func (s *ServerKeyExchanger) PerformExchange(conn io.ReadWriter, privKey ed25519
 
 	// Validation que le secret partagé n'est pas nul
 	if isAllZeros(sharedSecret) {
-		secureZeroResistant(sharedSecret)
+		secureZeroMemory(sharedSecret)
 		return &KeyExchangeResult{Err: NewCryptographicError("Zero shared secret generated", nil), Timestamp: time.Now()}, nil
 	}
 
-	defer secureZeroResistant(sharedSecret)
+	defer secureZeroMemory(sharedSecret)
 
 	// Validation de la taille du ciphertext
 	if len(ciphertext) != kyber768.CiphertextSize {
@@ -483,7 +476,7 @@ func receiveBytes(conn io.Reader) ([]byte, error) {
 	return buf, nil
 }
 
-// DeriveSessionKey dérive une clé de session sécurisée - CORRIGÉ
+// DeriveSessionKey dérive une clé de session sécurisée - VERSION CORRIGÉE
 func DeriveSessionKey(sharedSecret []byte) [32]byte {
 	if len(sharedSecret) == 0 {
 		panic("empty shared secret")
@@ -493,43 +486,27 @@ func DeriveSessionKey(sharedSecret []byte) [32]byte {
 		panic("zero shared secret")
 	}
 
-	// CORRECTION CRITIQUE : Utiliser directement le secret partagé comme base
-	// au lieu de s'appuyer uniquement sur HKDF qui peut échouer silencieusement
-
-	// Si le secret est déjà de 32 bytes et non-nul, l'utiliser directement avec un hash
-	h := sha256.New()
-	h.Write([]byte("protectora-rocher-session-key-v2"))
-	h.Write(sharedSecret)
-
-	// Utiliser HKDF comme couche supplémentaire
+	// Utilisation correcte de HKDF-SHA256 pour dériver une clé de 32 octets
 	salt := []byte("protectora-rocher-salt-v2")
 	info := []byte("protectora-rocher-session-v2")
 
-	hkdfReader := hkdf.New(sha256.New, h.Sum(nil), salt, info)
-	key := [32]byte{}
-	if _, err := io.ReadFull(hkdfReader, key[:]); err != nil {
-		// FALLBACK : Si HKDF échoue, utiliser le hash direct
-		copy(key[:], h.Sum(nil))
+	// HKDF avec SHA256
+	hkdfReader := hkdf.New(sha256.New, sharedSecret, salt, info)
+
+	var sessionKey [32]byte
+	if _, err := io.ReadFull(hkdfReader, sessionKey[:]); err != nil {
+		// En cas d'erreur HKDF (très improbable), utiliser SHA256 direct comme fallback
+		h := sha256.Sum256(append(sharedSecret, salt...))
+		copy(sessionKey[:], h[:])
 	}
 
-	// Validation finale RENFORCÉE
-	if isAllZeros(key[:]) {
-		// FALLBACK d'urgence : XOR avec le secret original
-		h2 := sha256.New()
-		h2.Write([]byte("emergency-fallback-protectora-rocher"))
-		h2.Write(sharedSecret)
-		h2.Write([]byte{0x42, 0x84, 0xC6}) // Constantes fixes
-
-		fallbackKey := h2.Sum(nil)
-		copy(key[:], fallbackKey)
-
-		// Si même le fallback donne zéro, c'est un problème critique
-		if isAllZeros(key[:]) {
-			panic("critical error: unable to derive non-zero session key")
-		}
+	// Double vérification que la clé n'est pas nulle
+	if isAllZeros(sessionKey[:]) {
+		// Ceci ne devrait jamais arriver avec une implémentation correcte
+		panic("CRITICAL: derived session key is all zeros")
 	}
 
-	return key
+	return sessionKey
 }
 
 // Fonctions de commodité simplifiées
@@ -631,34 +608,11 @@ func GenerateEd25519KeyPair() (ed25519.PublicKey, ed25519.PrivateKey, error) {
 
 	// Validation post-génération
 	if err := validateEd25519Keys(privKey, pubKey); err != nil {
-		secureZeroResistant(privKey)
+		secureZeroMemory(privKey)
 		return nil, nil, err
 	}
 
 	return pubKey, privKey, nil
-}
-
-// TestKeyExchange teste la fonctionnalité d'échange de clés
-func TestKeyExchange() error {
-	// Générer les paires de clés pour le test
-	clientPub, clientPriv, err := GenerateEd25519KeyPair()
-	if err != nil {
-		return fmt.Errorf("failed to generate client keys: %w", err)
-	}
-	defer secureZeroResistant(clientPriv)
-
-	serverPub, serverPriv, err := GenerateEd25519KeyPair()
-	if err != nil {
-		return fmt.Errorf("failed to generate server keys: %w", err)
-	}
-	defer secureZeroResistant(serverPriv)
-
-	// Valider que les clés sont différentes
-	if subtle.ConstantTimeCompare(clientPub, serverPub) == 1 {
-		return fmt.Errorf("client and server public keys are identical")
-	}
-
-	return nil
 }
 
 // GetKeyExchangeStats retourne les statistiques d'un échangeur

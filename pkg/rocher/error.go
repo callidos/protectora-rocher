@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-// Erreurs de base - normalisées
+// Base errors - normalized to prevent information leakage
 var (
 	ErrEmptyInput     = errors.New("invalid input")
 	ErrInvalidKey     = errors.New("invalid key")
@@ -26,7 +26,7 @@ var (
 	ErrProcessing     = errors.New("processing failed")
 )
 
-// ErrorSeverity définit la sévérité d'une erreur
+// ErrorSeverity defines error severity levels
 type ErrorSeverity int
 
 const (
@@ -36,7 +36,7 @@ const (
 	SeverityCritical
 )
 
-// CommunicationError structure d'erreur avec contexte minimal
+// CommunicationError provides structured error information
 type CommunicationError struct {
 	Code      string
 	Message   string
@@ -68,7 +68,7 @@ func (e *CommunicationError) GetSeverity() ErrorSeverity {
 	return e.Severity
 }
 
-// Codes d'erreur standardisés
+// Standard error codes
 const (
 	ErrorCodeInvalidInput      = "INVALID_INPUT"
 	ErrorCodeCryptographicFail = "CRYPTO_FAIL"
@@ -82,7 +82,7 @@ const (
 	ErrorCodeInternal          = "INTERNAL_ERROR"
 )
 
-// NewCommunicationError crée une nouvelle erreur
+// NewCommunicationError creates a new structured error
 func NewCommunicationError(code, message string, cause error) *CommunicationError {
 	severity := determineSeverity(code)
 	return &CommunicationError{
@@ -114,7 +114,7 @@ func sanitizeMessage(message string) string {
 	return message
 }
 
-// Fonctions helper pour créer des erreurs typées
+// Helper functions for creating typed errors
 func NewInvalidInputError(message string, cause error) *CommunicationError {
 	return NewCommunicationError(ErrorCodeInvalidInput, message, cause)
 }
@@ -151,7 +151,7 @@ func NewProtocolError(message string, cause error) *CommunicationError {
 	return NewCommunicationError(ErrorCodeProtocolError, message, cause)
 }
 
-// Fonctions utilitaires pour l'analyse d'erreurs
+// Error analysis utilities
 func IsErrorCode(err error, code string) bool {
 	if commErr, ok := err.(*CommunicationError); ok {
 		return commErr.Code == code
@@ -171,7 +171,7 @@ func GetErrorSeverity(err error) ErrorSeverity {
 		return commErr.GetSeverity()
 	}
 
-	// Détermination basique pour les erreurs standard
+	// Basic severity determination for standard errors
 	switch err {
 	case ErrAuthentication, ErrDecryption, ErrCorruptedFile:
 		return SeverityCritical
@@ -205,70 +205,70 @@ func IsCriticalError(err error) bool {
 	return severity == SeverityCritical
 }
 
-// WrapError encapsule une erreur existante
+// WrapError encapsulates an existing error
 func WrapError(err error, code, message string) *CommunicationError {
 	return NewCommunicationError(code, message, err)
 }
 
-// FormatUserError formate une erreur pour l'affichage utilisateur
+// FormatUserError formats an error for user display
 func FormatUserError(err error) string {
 	if commErr, ok := err.(*CommunicationError); ok {
 		switch commErr.Code {
 		case ErrorCodeInvalidInput:
-			return "Les données fournies ne sont pas valides"
+			return "Invalid data provided"
 		case ErrorCodeCryptographicFail:
-			return "Erreur de sécurité lors du traitement"
+			return "Security error occurred"
 		case ErrorCodeNetworkError:
-			return "Problème de connexion réseau"
+			return "Network connection problem"
 		case ErrorCodeFileError:
-			return "Erreur lors du traitement du fichier"
+			return "File processing error"
 		case ErrorCodeAuthError:
-			return "Erreur d'authentification"
+			return "Authentication failed"
 		case ErrorCodeTimeout:
-			return "L'opération a pris trop de temps"
+			return "Operation timed out"
 		case ErrorCodeRateLimit:
-			return "Trop de requêtes, veuillez patienter"
+			return "Too many requests, please wait"
 		case ErrorCodeResourceLimit:
-			return "Ressources insuffisantes"
+			return "Insufficient resources"
 		case ErrorCodeProtocolError:
-			return "Erreur de communication"
+			return "Communication error"
 		default:
-			return "Une erreur s'est produite"
+			return "An error occurred"
 		}
 	}
 
-	// Messages pour les erreurs standard
+	// Messages for standard errors
 	switch err {
 	case ErrEmptyInput, ErrInvalidInput:
-		return "Données invalides"
+		return "Invalid data"
 	case ErrInvalidKey:
-		return "Clé de sécurité invalide"
+		return "Invalid security key"
 	case ErrInvalidFormat:
-		return "Format incorrect"
+		return "Incorrect format"
 	case ErrDataTooLarge:
-		return "Données trop volumineuses"
+		return "Data too large"
 	case ErrDecryption, ErrEncryption:
-		return "Erreur de sécurité"
+		return "Security error"
 	case ErrFileNotFound:
-		return "Fichier introuvable"
+		return "File not found"
 	case ErrFileCreation:
-		return "Création de fichier impossible"
+		return "Cannot create file"
 	case ErrCorruptedFile:
-		return "Fichier corrompu"
+		return "File corrupted"
 	case ErrConnection:
-		return "Erreur de connexion"
+		return "Connection error"
 	case ErrTimeout:
-		return "Délai d'attente dépassé"
+		return "Timeout exceeded"
 	case ErrAuthentication:
-		return "Échec d'authentification"
+		return "Authentication failed"
 	case ErrProcessing:
-		return "Erreur de traitement"
+		return "Processing error"
 	default:
-		return "Erreur inconnue"
+		return "Unknown error"
 	}
 }
 
-// ErrorMetrics pour collecter des statistiques d'erreurs
+// ErrorMetrics for collecting error statistics
 type ErrorMetrics struct {
 	mu         sync.RWMutex
 	counts     map[string]int64
@@ -315,7 +315,7 @@ func ResetErrorMetrics() {
 	globalMetrics.lastErrors = make(map[string]time.Time)
 }
 
-// isSensitiveKey vérifie si une clé contient des informations sensibles
+// isSensitiveKey checks if a key contains sensitive information
 func isSensitiveKey(key string) bool {
 	sensitiveKeys := []string{
 		"key", "password", "token", "secret", "auth", "credential",

@@ -19,9 +19,9 @@ const (
 	encNonceSize     = 24
 )
 
-// secureZeroResistant efface de manière sécurisée un slice de bytes
+// secureZeroMemory efface de manière sécurisée un slice de bytes
 // résistant aux optimisations du compilateur
-func secureZeroResistant(data []byte) {
+func secureZeroMemory(data []byte) {
 	if len(data) == 0 {
 		return
 	}
@@ -45,7 +45,6 @@ func secureZeroResistant(data []byte) {
 }
 
 // EncryptNaClBox chiffre avec NaCl secretbox (XSalsa20 + Poly1305)
-// Nom corrigé pour refléter l'algorithme réellement utilisé
 func EncryptNaClBox(plaintext, masterKey []byte) (string, error) {
 	if len(plaintext) == 0 {
 		return "", ErrEmptyInput
@@ -62,7 +61,7 @@ func EncryptNaClBox(plaintext, masterKey []byte) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer secureZeroResistant(encKey)
+	defer secureZeroMemory(encKey)
 
 	// Conversion en format NaCl
 	var key [encKeySize]byte
@@ -86,15 +85,14 @@ func EncryptNaClBox(plaintext, masterKey []byte) (string, error) {
 	encoded := base64.StdEncoding.EncodeToString(result)
 
 	// Nettoyage sécurisé résistant aux optimisations
-	secureZeroResistant(result)
-	secureZeroResistant(key[:])
-	secureZeroResistant(nonce[:])
+	secureZeroMemory(result)
+	secureZeroMemory(key[:])
+	secureZeroMemory(nonce[:])
 
 	return encoded, nil
 }
 
 // DecryptNaClBox déchiffre avec NaCl secretbox
-// Nom corrigé pour refléter l'algorithme réellement utilisé
 func DecryptNaClBox(ciphertextBase64 string, masterKey []byte) ([]byte, error) {
 	if ciphertextBase64 == "" {
 		return nil, ErrEmptyInput
@@ -108,7 +106,7 @@ func DecryptNaClBox(ciphertextBase64 string, masterKey []byte) ([]byte, error) {
 	if err != nil {
 		return nil, ErrInvalidFormat
 	}
-	defer secureZeroResistant(data)
+	defer secureZeroMemory(data)
 
 	// Validation de la taille minimale (version + nonce + secretbox overhead minimum)
 	if len(data) < 1+encNonceSize+secretbox.Overhead {
@@ -125,7 +123,7 @@ func DecryptNaClBox(ciphertextBase64 string, masterKey []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer secureZeroResistant(encKey)
+	defer secureZeroMemory(encKey)
 
 	var key [encKeySize]byte
 	copy(key[:], encKey[:encKeySize])
@@ -142,8 +140,8 @@ func DecryptNaClBox(ciphertextBase64 string, masterKey []byte) ([]byte, error) {
 	}
 
 	// Nettoyage sécurisé
-	secureZeroResistant(key[:])
-	secureZeroResistant(nonce[:])
+	secureZeroMemory(key[:])
+	secureZeroMemory(nonce[:])
 
 	return plaintext, nil
 }
@@ -164,14 +162,14 @@ func EncryptWithAdditionalData(plaintext, masterKey, additionalData []byte) (str
 	combined := make([]byte, len(additionalData)+len(plaintext))
 	copy(combined[:len(additionalData)], additionalData)
 	copy(combined[len(additionalData):], plaintext)
-	defer secureZeroResistant(combined)
+	defer secureZeroMemory(combined)
 
 	// Dérivation de clé avec contexte additional data
 	encKey, err := deriveKeyWithContext(masterKey, "with-ad", encKeySize)
 	if err != nil {
 		return "", err
 	}
-	defer secureZeroResistant(encKey)
+	defer secureZeroMemory(encKey)
 
 	var key [encKeySize]byte
 	copy(key[:], encKey)
@@ -193,9 +191,9 @@ func EncryptWithAdditionalData(plaintext, masterKey, additionalData []byte) (str
 	copy(result[5+encNonceSize:], encrypted)
 
 	encoded := base64.StdEncoding.EncodeToString(result)
-	secureZeroResistant(result)
-	secureZeroResistant(key[:])
-	secureZeroResistant(nonce[:])
+	secureZeroMemory(result)
+	secureZeroMemory(key[:])
+	secureZeroMemory(nonce[:])
 
 	return encoded, nil
 }
@@ -214,7 +212,7 @@ func DecryptWithAdditionalData(ciphertextBase64 string, masterKey, expectedAddit
 	if err != nil {
 		return nil, ErrInvalidFormat
 	}
-	defer secureZeroResistant(data)
+	defer secureZeroMemory(data)
 
 	// Validation de la taille minimale
 	if len(data) < 5+encNonceSize+secretbox.Overhead {
@@ -237,7 +235,7 @@ func DecryptWithAdditionalData(ciphertextBase64 string, masterKey, expectedAddit
 	if err != nil {
 		return nil, err
 	}
-	defer secureZeroResistant(encKey)
+	defer secureZeroMemory(encKey)
 
 	var key [encKeySize]byte
 	copy(key[:], encKey)
@@ -252,7 +250,7 @@ func DecryptWithAdditionalData(ciphertextBase64 string, masterKey, expectedAddit
 	if !ok {
 		return nil, ErrDecryption
 	}
-	defer secureZeroResistant(combined)
+	defer secureZeroMemory(combined)
 
 	// Validation de la longueur
 	if len(combined) < int(adLength) {
@@ -270,8 +268,8 @@ func DecryptWithAdditionalData(ciphertextBase64 string, masterKey, expectedAddit
 	copy(plaintext, combined[adLength:])
 
 	// Nettoyage sécurisé
-	secureZeroResistant(key[:])
-	secureZeroResistant(nonce[:])
+	secureZeroMemory(key[:])
+	secureZeroMemory(nonce[:])
 
 	return plaintext, nil
 }
@@ -283,7 +281,7 @@ func deriveEncryptionKey(masterKey []byte) ([]byte, error) {
 	}
 
 	salt := []byte("protectora-rocher-salt-v2")
-	info := []byte("protectora-rocher-nacl-encryption-v2") // Nom corrigé
+	info := []byte("protectora-rocher-nacl-encryption-v2")
 
 	h := hkdf.New(sha256.New, masterKey, salt, info)
 	key := make([]byte, encKeySize)
@@ -325,7 +323,7 @@ func ValidateEncryptedData(ciphertextBase64 string) error {
 	if err != nil {
 		return ErrInvalidFormat
 	}
-	defer secureZeroResistant(data)
+	defer secureZeroMemory(data)
 
 	// Vérification de la taille minimale
 	if len(data) < 1+encNonceSize+secretbox.Overhead {
