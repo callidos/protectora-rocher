@@ -22,5 +22,4 @@ require (
 	github.com/go-playground/validator/v10 v10.26.0
 	github.com/google/uuid v1.6.0
 	golang.org/x/sys v0.33.0 // indirect
-	golang.org/x/time v0.12.0
 )

@@ -28,44 +28,37 @@ var (
 	ErrMessageTooLarge       = errors.New("message too large for secure channel")
 )
 
-// SecureChannel gère une communication chiffrée bidirectionnelle avec NaCl secretbox
+// SecureChannel manages bidirectional encrypted communication with NaCl secretbox
 type SecureChannel struct {
-	// Clés de chiffrement séparées pour chaque direction
 	sendKey [channelKeySize]byte
 	recvKey [channelKeySize]byte
 
-	// Nonces séquentiels pour éviter la réutilisation
 	sendNonce uint64
 	recvNonce uint64
 
-	// Connexion sous-jacente
 	conn io.ReadWriter
 
-	// État et protection concurrentielle
 	isInitialized bool
 	isClosed      bool
 	mu            sync.RWMutex
 
-	// Métadonnées
 	isClient   bool
 	sessionID  string
 	startTime  time.Time
 	lastActive time.Time
 
-	// Compteurs de messages
 	messagesSent     uint64
 	messagesReceived uint64
 	bytesSent        uint64
 	bytesReceived    uint64
 }
 
-// NewSecureChannel crée un nouveau canal sécurisé à partir d'un secret partagé
+// NewSecureChannel creates a new secure channel from shared secret
 func NewSecureChannel(conn io.ReadWriter, sharedSecret [32]byte, isClient bool) (*SecureChannel, error) {
 	if conn == nil {
 		return nil, errors.New("connection cannot be nil")
 	}
 
-	// Générer un ID de session unique
 	sessionID := generateSessionID()
 
 	sc := &SecureChannel{
@@ -78,7 +71,6 @@ func NewSecureChannel(conn io.ReadWriter, sharedSecret [32]byte, isClient bool) 
 		isClosed:      false,
 	}
 
-	// Dériver des clés séparées pour l'envoi et la réception
 	if err := sc.deriveChannelKeys(sharedSecret); err != nil {
 		return nil, fmt.Errorf("key derivation failed: %w", err)
 	}
@@ -87,11 +79,10 @@ func NewSecureChannel(conn io.ReadWriter, sharedSecret [32]byte, isClient bool) 
 	return sc, nil
 }
 
-// deriveChannelKeys dérive les clés d'envoi et de réception séparées
+// deriveChannelKeys derives separate send and receive keys
 func (sc *SecureChannel) deriveChannelKeys(sharedSecret [32]byte) error {
 	salt := []byte("protectora-rocher-channel-salt-v2")
 
-	// Dériver clés différentes selon le rôle (client/serveur)
 	var sendInfo, recvInfo []byte
 	if sc.isClient {
 		sendInfo = []byte("protectora-rocher-client-send-v2")
@@ -101,19 +92,19 @@ func (sc *SecureChannel) deriveChannelKeys(sharedSecret [32]byte) error {
 		recvInfo = []byte("protectora-rocher-server-recv-v2")
 	}
 
-	// Dérivation clé d'envoi
+	// Derive send key
 	hkdfSend := hkdf.New(sha256.New, sharedSecret[:], salt, sendInfo)
 	if _, err := io.ReadFull(hkdfSend, sc.sendKey[:]); err != nil {
 		return fmt.Errorf("send key derivation failed: %w", err)
 	}
 
-	// Dérivation clé de réception
+	// Derive receive key
 	hkdfRecv := hkdf.New(sha256.New, sharedSecret[:], salt, recvInfo)
 	if _, err := io.ReadFull(hkdfRecv, sc.recvKey[:]); err != nil {
 		return fmt.Errorf("recv key derivation failed: %w", err)
 	}
 
-	// Vérifier que les clés ne sont pas nulles
+	// Verify keys are not zero
 	if isAllZeros(sc.sendKey[:]) || isAllZeros(sc.recvKey[:]) {
 		return errors.New("derived keys are zero")
 	}
@@ -121,7 +112,7 @@ func (sc *SecureChannel) deriveChannelKeys(sharedSecret [32]byte) error {
 	return nil
 }
 
-// SendMessage chiffre et envoie un message de manière thread-safe
+// SendMessage encrypts and sends a message thread-safely
 func (sc *SecureChannel) SendMessage(plaintext []byte) error {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
@@ -138,29 +129,28 @@ func (sc *SecureChannel) SendMessage(plaintext []byte) error {
 		return ErrMessageTooLarge
 	}
 
-	// Préparer le nonce avec le compteur séquentiel
+	// Prepare nonce with sequential counter
 	var nonce [channelNonceSize]byte
 	binary.LittleEndian.PutUint64(nonce[:8], sc.sendNonce)
 
-	// Ajouter de l'entropie supplémentaire dans le nonce
+	// Add entropy in remaining nonce bytes
 	if _, err := rand.Read(nonce[8:16]); err != nil {
 		return fmt.Errorf("nonce generation failed: %w", err)
 	}
 
-	// Chiffrer avec NaCl secretbox
+	// Encrypt with NaCl secretbox
 	ciphertext := secretbox.Seal(nil, plaintext, &nonce, &sc.sendKey)
 
-	// Format du message: nonce (24 bytes) + ciphertext
+	// Message format: nonce (24 bytes) + ciphertext
 	message := make([]byte, channelNonceSize+len(ciphertext))
 	copy(message[:channelNonceSize], nonce[:])
 	copy(message[channelNonceSize:], ciphertext)
 
-	// Envoyer le message
 	if err := sc.sendRawMessage(message); err != nil {
 		return fmt.Errorf("send failed: %w", err)
 	}
 
-	// Mettre à jour les statistiques
+	// Update statistics
 	sc.sendNonce++
 	sc.messagesSent++
 	sc.bytesSent += uint64(len(plaintext))
@@ -169,7 +159,7 @@ func (sc *SecureChannel) SendMessage(plaintext []byte) error {
 	return nil
 }
 
-// ReceiveMessage reçoit et déchiffre un message de manière thread-safe
+// ReceiveMessage receives and decrypts a message thread-safely
 func (sc *SecureChannel) ReceiveMessage() ([]byte, error) {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
@@ -182,35 +172,33 @@ func (sc *SecureChannel) ReceiveMessage() ([]byte, error) {
 		return nil, ErrChannelClosed
 	}
 
-	// Recevoir le message brut
 	message, err := sc.receiveRawMessage()
 	if err != nil {
 		return nil, fmt.Errorf("receive failed: %w", err)
 	}
 
-	// Vérifier la taille minimale
 	if len(message) < channelNonceSize+channelOverhead {
 		return nil, ErrInvalidMessage
 	}
 
-	// Extraire le nonce et le ciphertext
+	// Extract nonce and ciphertext
 	var nonce [channelNonceSize]byte
 	copy(nonce[:], message[:channelNonceSize])
 	ciphertext := message[channelNonceSize:]
 
-	// Vérifier la séquence des nonces
+	// Verify nonce sequence
 	receivedSeq := binary.LittleEndian.Uint64(nonce[:8])
 	if receivedSeq != sc.recvNonce {
 		return nil, ErrInvalidNonce
 	}
 
-	// Déchiffrer avec NaCl secretbox
+	// Decrypt with NaCl secretbox
 	plaintext, ok := secretbox.Open(nil, ciphertext, &nonce, &sc.recvKey)
 	if !ok {
 		return nil, ErrInvalidMessage
 	}
 
-	// Mettre à jour les statistiques
+	// Update statistics
 	sc.recvNonce++
 	sc.messagesReceived++
 	sc.bytesReceived += uint64(len(plaintext))
@@ -219,7 +207,7 @@ func (sc *SecureChannel) ReceiveMessage() ([]byte, error) {
 	return plaintext, nil
 }
 
-// SendMessageWithTimeout envoie un message avec timeout
+// SendMessageWithTimeout sends a message with timeout
 func (sc *SecureChannel) SendMessageWithTimeout(plaintext []byte, timeout time.Duration) error {
 	if timeout <= 0 {
 		return sc.SendMessage(plaintext)
@@ -238,7 +226,7 @@ func (sc *SecureChannel) SendMessageWithTimeout(plaintext []byte, timeout time.D
 	}
 }
 
-// ReceiveMessageWithTimeout reçoit un message avec timeout
+// ReceiveMessageWithTimeout receives a message with timeout
 func (sc *SecureChannel) ReceiveMessageWithTimeout(timeout time.Duration) ([]byte, error) {
 	if timeout <= 0 {
 		return sc.ReceiveMessage()
@@ -263,13 +251,12 @@ func (sc *SecureChannel) ReceiveMessageWithTimeout(timeout time.Duration) ([]byt
 	}
 }
 
-// sendRawMessage envoie un message brut avec préfixe de longueur
+// sendRawMessage sends raw message with length prefix
 func (sc *SecureChannel) sendRawMessage(data []byte) error {
-	// Format: longueur (4 bytes) + données
+	// Format: length (4 bytes) + data
 	lengthBytes := make([]byte, 4)
 	binary.BigEndian.PutUint32(lengthBytes, uint32(len(data)))
 
-	// Envoyer longueur puis données
 	if _, err := sc.conn.Write(lengthBytes); err != nil {
 		return err
 	}
@@ -286,9 +273,9 @@ func (sc *SecureChannel) sendRawMessage(data []byte) error {
 	return nil
 }
 
-// receiveRawMessage reçoit un message brut avec préfixe de longueur
+// receiveRawMessage receives raw message with length prefix
 func (sc *SecureChannel) receiveRawMessage() ([]byte, error) {
-	// Lire la longueur
+	// Read length
 	lengthBytes := make([]byte, 4)
 	if _, err := io.ReadFull(sc.conn, lengthBytes); err != nil {
 		return nil, err
@@ -296,7 +283,7 @@ func (sc *SecureChannel) receiveRawMessage() ([]byte, error) {
 
 	length := binary.BigEndian.Uint32(lengthBytes)
 
-	// Valider la longueur
+	// Validate length
 	if length == 0 {
 		return nil, ErrInvalidMessage
 	}
@@ -304,7 +291,7 @@ func (sc *SecureChannel) receiveRawMessage() ([]byte, error) {
 		return nil, ErrMessageTooLarge
 	}
 
-	// Lire les données
+	// Read data
 	data := make([]byte, length)
 	if _, err := io.ReadFull(sc.conn, data); err != nil {
 		return nil, err
@@ -313,7 +300,7 @@ func (sc *SecureChannel) receiveRawMessage() ([]byte, error) {
 	return data, nil
 }
 
-// Close ferme le canal sécurisé et nettoie les ressources
+// Close closes secure channel and cleans up resources
 func (sc *SecureChannel) Close() error {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
@@ -322,14 +309,13 @@ func (sc *SecureChannel) Close() error {
 		return nil
 	}
 
-	// Nettoyer les clés de manière sécurisée
+	// Securely clean keys
 	secureZeroMemory(sc.sendKey[:])
 	secureZeroMemory(sc.recvKey[:])
 
 	sc.isClosed = true
 	sc.isInitialized = false
 
-	// Fermer la connexion si possible
 	if closer, ok := sc.conn.(io.Closer); ok {
 		return closer.Close()
 	}
@@ -337,28 +323,28 @@ func (sc *SecureChannel) Close() error {
 	return nil
 }
 
-// IsActive retourne l'état du canal
+// IsActive returns channel state
 func (sc *SecureChannel) IsActive() bool {
 	sc.mu.RLock()
 	defer sc.mu.RUnlock()
 	return sc.isInitialized && !sc.isClosed
 }
 
-// IsIdle vérifie si le canal est inactif depuis un certain temps
+// IsIdle checks if channel is idle for given time
 func (sc *SecureChannel) IsIdle(maxIdleTime time.Duration) bool {
 	sc.mu.RLock()
 	defer sc.mu.RUnlock()
 	return time.Since(sc.lastActive) > maxIdleTime
 }
 
-// GetSessionID retourne l'identifiant de session
+// GetSessionID returns session identifier
 func (sc *SecureChannel) GetSessionID() string {
 	sc.mu.RLock()
 	defer sc.mu.RUnlock()
 	return sc.sessionID
 }
 
-// GetStats retourne les statistiques du canal
+// GetStats returns channel statistics
 func (sc *SecureChannel) GetStats() map[string]interface{} {
 	sc.mu.RLock()
 	defer sc.mu.RUnlock()
@@ -382,7 +368,7 @@ func (sc *SecureChannel) GetStats() map[string]interface{} {
 	}
 }
 
-// RekeyChannel effectue un re-keying du canal (pour une sécurité renforcée)
+// RekeyChannel performs channel re-keying for enhanced security
 func (sc *SecureChannel) RekeyChannel(newSharedSecret [32]byte) error {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
@@ -391,16 +377,16 @@ func (sc *SecureChannel) RekeyChannel(newSharedSecret [32]byte) error {
 		return ErrChannelNotInitialized
 	}
 
-	// Nettoyer les anciennes clés
+	// Clean old keys
 	secureZeroMemory(sc.sendKey[:])
 	secureZeroMemory(sc.recvKey[:])
 
-	// Dériver de nouvelles clés
+	// Derive new keys
 	if err := sc.deriveChannelKeys(newSharedSecret); err != nil {
 		return fmt.Errorf("rekey failed: %w", err)
 	}
 
-	// Réinitialiser les nonces
+	// Reset nonces
 	sc.sendNonce = 0
 	sc.recvNonce = 0
 	sc.lastActive = time.Now()
@@ -408,18 +394,7 @@ func (sc *SecureChannel) RekeyChannel(newSharedSecret [32]byte) error {
 	return nil
 }
 
-// generateSessionID génère un identifiant de session unique
-func generateSessionID() string {
-	randomBytes := make([]byte, 16)
-	if _, err := rand.Read(randomBytes); err != nil {
-		// Fallback en cas d'erreur
-		return fmt.Sprintf("channel_%d", time.Now().UnixNano())
-	}
-
-	return fmt.Sprintf("channel_%x", randomBytes)
-}
-
-// EstimateChannelOverhead estime l'overhead du canal sécurisé
+// EstimateChannelOverhead estimates secure channel overhead
 func EstimateChannelOverhead() map[string]int {
 	return map[string]int{
 		"nonce_size":         channelNonceSize,
@@ -431,57 +406,7 @@ func EstimateChannelOverhead() map[string]int {
 	}
 }
 
-// CreateSecureChannelPair crée une paire de canaux sécurisés connectés (pour tests)
-func CreateSecureChannelPair(sharedSecret [32]byte) (*SecureChannel, *SecureChannel, error) {
-	// Créer une paire de pipes connectées
-	clientConn, serverConn := createConnectedPair()
-
-	// Créer les canaux
-	clientChannel, err := NewSecureChannel(clientConn, sharedSecret, true)
-	if err != nil {
-		return nil, nil, fmt.Errorf("client channel creation failed: %w", err)
-	}
-
-	serverChannel, err := NewSecureChannel(serverConn, sharedSecret, false)
-	if err != nil {
-		clientChannel.Close()
-		return nil, nil, fmt.Errorf("server channel creation failed: %w", err)
-	}
-
-	return clientChannel, serverChannel, nil
-}
-
-// connectedPair implémente une paire de connexions connectées pour les tests
-type connectedPair struct {
-	reader *io.PipeReader
-	writer *io.PipeWriter
-}
-
-func (cp *connectedPair) Read(p []byte) (n int, err error) {
-	return cp.reader.Read(p)
-}
-
-func (cp *connectedPair) Write(p []byte) (n int, err error) {
-	return cp.writer.Write(p)
-}
-
-func (cp *connectedPair) Close() error {
-	cp.reader.Close()
-	return cp.writer.Close()
-}
-
-// createConnectedPair crée une paire de connexions bidirectionnelles
-func createConnectedPair() (io.ReadWriteCloser, io.ReadWriteCloser) {
-	r1, w1 := io.Pipe()
-	r2, w2 := io.Pipe()
-
-	conn1 := &connectedPair{reader: r1, writer: w2}
-	conn2 := &connectedPair{reader: r2, writer: w1}
-
-	return conn1, conn2
-}
-
-// ValidateSecureChannel valide l'état d'un canal sécurisé
+// ValidateSecureChannel validates secure channel state
 func ValidateSecureChannel(sc *SecureChannel) error {
 	if sc == nil {
 		return errors.New("secure channel is nil")
