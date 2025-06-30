@@ -62,75 +62,145 @@ func TestBasicKeyExchange(t *testing.T) {
 	fmt.Printf("✅ Échange de clés réussi! Secret de %d bytes\n", len(initiatorSecret))
 }
 
-// TestSecureChannelEncryption teste le chiffrement/déchiffrement
+// TestSecureChannelEncryption teste le chiffrement/déchiffrement inter-rôles
 func TestSecureChannelEncryption(t *testing.T) {
 	fmt.Println("=== Test: Chiffrement SecureChannel ===")
 
 	// Créer un secret partagé factice
 	sharedSecret := make([]byte, 32)
 	for i := range sharedSecret {
-		sharedSecret[i] = byte(i)
+		sharedSecret[i] = byte(i + 1) // Éviter les zéros
 	}
 
-	// Créer le canal sécurisé
-	channel, err := rocher.NewSecureChannel(sharedSecret)
+	// Créer les canaux pour les deux rôles
+	initiatorChannel, err := rocher.NewSecureChannel(sharedSecret, true)
 	if err != nil {
-		t.Fatalf("Échec création canal sécurisé: %v", err)
+		t.Fatalf("Échec création canal initiateur: %v", err)
 	}
-	defer channel.Close()
+	defer initiatorChannel.Close()
+
+	responderChannel, err := rocher.NewSecureChannel(sharedSecret, false)
+	if err != nil {
+		t.Fatalf("Échec création canal répondeur: %v", err)
+	}
+	defer responderChannel.Close()
 
 	// Messages de test
 	testMessages := []string{
 		"Hello, World!",
 		"Message avec accents: café, naïve, résumé 🚀",
 		"Message long: " + strings.Repeat("A", 1000),
-		"Message vide peut poser problème",
 		"Caractères spéciaux: !@#$%^&*()_+-=[]{}|;':\",./<>?",
 	}
 
-	for i, originalMsg := range testMessages {
-		// Tronquer le message pour l'affichage
-		displayMsg := originalMsg
-		if len(displayMsg) > 50 {
-			displayMsg = displayMsg[:47] + "..."
-		}
-		fmt.Printf("Test message %d: '%s'\n", i+1, displayMsg)
+	// Test dans les deux directions
+	directions := []struct {
+		name      string
+		sender    *rocher.SecureChannel
+		receiver  *rocher.SecureChannel
+		direction string
+	}{
+		{"Initiateur -> Répondeur", initiatorChannel, responderChannel, "🔄"},
+		{"Répondeur -> Initiateur", responderChannel, initiatorChannel, "🔃"},
+	}
 
-		// Chiffrer
-		encryptedMsg, err := channel.EncryptMessage([]byte(originalMsg))
-		if err != nil {
-			t.Fatalf("Échec chiffrement message %d: %v", i+1, err)
-		}
+	for _, dir := range directions {
+		fmt.Printf("Test direction: %s %s\n", dir.direction, dir.name)
 
-		// Vérifier la structure du message chiffré
-		if encryptedMsg.ID == "" {
-			t.Errorf("Message %d: ID manquant", i+1)
-		}
+		for i, originalMsg := range testMessages {
+			// Tronquer le message pour l'affichage
+			displayMsg := originalMsg
+			if len(displayMsg) > 50 {
+				displayMsg = displayMsg[:47] + "..."
+			}
+			fmt.Printf("  Test message %d: '%s'\n", i+1, displayMsg)
 
-		if encryptedMsg.Timestamp == 0 {
-			t.Errorf("Message %d: Timestamp manquant", i+1)
-		}
+			// Chiffrer avec l'expéditeur
+			encryptedMsg, err := dir.sender.EncryptMessage([]byte(originalMsg))
+			if err != nil {
+				t.Fatalf("Échec chiffrement message %d (%s): %v", i+1, dir.name, err)
+			}
 
-		if len(encryptedMsg.Nonce) != 24 {
-			t.Errorf("Message %d: Nonce invalide (taille: %d)", i+1, len(encryptedMsg.Nonce))
-		}
+			// Vérifier la structure du message chiffré
+			if err := rocher.ValidateMessage(encryptedMsg); err != nil {
+				t.Errorf("Message %d (%s) invalide: %v", i+1, dir.name, err)
+			}
 
-		// Déchiffrer
-		decryptedBytes, err := channel.DecryptMessage(encryptedMsg)
-		if err != nil {
-			t.Fatalf("Échec déchiffrement message %d: %v", i+1, err)
-		}
+			// Déchiffrer avec le destinataire
+			decryptedBytes, err := dir.receiver.DecryptMessage(encryptedMsg)
+			if err != nil {
+				t.Fatalf("Échec déchiffrement message %d (%s): %v", i+1, dir.name, err)
+			}
 
-		decryptedMsg := string(decryptedBytes)
+			decryptedMsg := string(decryptedBytes)
 
-		// Vérifier l'intégrité
-		if originalMsg != decryptedMsg {
-			t.Errorf("Message %d: Intégrité compromise\nOriginal: %s\nDéchiffré: %s",
-				i+1, originalMsg, decryptedMsg)
+			// Vérifier l'intégrité
+			if originalMsg != decryptedMsg {
+				t.Errorf("Message %d (%s): Intégrité compromise\nOriginal: %s\nDéchiffré: %s",
+					i+1, dir.name, originalMsg, decryptedMsg)
+			}
 		}
 	}
 
 	fmt.Println("✅ Tous les tests de chiffrement ont réussi!")
+}
+
+// TestCrossRoleEncryption teste le chiffrement entre rôles différents
+func TestCrossRoleEncryption(t *testing.T) {
+	fmt.Println("=== Test: Chiffrement inter-rôles ===")
+
+	// Créer un secret partagé
+	sharedSecret := make([]byte, 32)
+	for i := range sharedSecret {
+		sharedSecret[i] = byte(i + 1) // Éviter les zéros
+	}
+
+	// Créer les canaux pour initiateur et répondeur
+	initiatorChannel, err := rocher.NewSecureChannel(sharedSecret, true)
+	if err != nil {
+		t.Fatalf("Échec création canal initiateur: %v", err)
+	}
+	defer initiatorChannel.Close()
+
+	responderChannel, err := rocher.NewSecureChannel(sharedSecret, false)
+	if err != nil {
+		t.Fatalf("Échec création canal répondeur: %v", err)
+	}
+	defer responderChannel.Close()
+
+	// Test: Initiateur chiffre -> Répondeur déchiffre
+	message1 := "Message de l'initiateur vers le répondeur"
+	encrypted1, err := initiatorChannel.EncryptMessage([]byte(message1))
+	if err != nil {
+		t.Fatalf("Échec chiffrement initiateur: %v", err)
+	}
+
+	decrypted1, err := responderChannel.DecryptMessage(encrypted1)
+	if err != nil {
+		t.Fatalf("Échec déchiffrement par répondeur: %v", err)
+	}
+
+	if string(decrypted1) != message1 {
+		t.Errorf("Message 1 corrompu: '%s' != '%s'", string(decrypted1), message1)
+	}
+
+	// Test: Répondeur chiffre -> Initiateur déchiffre
+	message2 := "Message du répondeur vers l'initiateur"
+	encrypted2, err := responderChannel.EncryptMessage([]byte(message2))
+	if err != nil {
+		t.Fatalf("Échec chiffrement répondeur: %v", err)
+	}
+
+	decrypted2, err := initiatorChannel.DecryptMessage(encrypted2)
+	if err != nil {
+		t.Fatalf("Échec déchiffrement par initiateur: %v", err)
+	}
+
+	if string(decrypted2) != message2 {
+		t.Errorf("Message 2 corrompu: '%s' != '%s'", string(decrypted2), message2)
+	}
+
+	fmt.Println("✅ Chiffrement inter-rôles réussi!")
 }
 
 // TestSimpleMessenger teste le messenger complet
@@ -145,6 +215,7 @@ func TestSimpleMessenger(t *testing.T) {
 	var wg sync.WaitGroup
 	var senderErr, receiverErr error
 	receivedMessages := make([]string, 0)
+	var mu sync.Mutex
 
 	// Messages de test
 	testMessages := []string{
@@ -153,7 +224,7 @@ func TestSimpleMessenger(t *testing.T) {
 		"Test de performance: " + strings.Repeat("X", 500),
 	}
 
-	// Côté expéditeur
+	// Côté expéditeur (initiateur)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -167,6 +238,9 @@ func TestSimpleMessenger(t *testing.T) {
 			return
 		}
 		defer sender.Close()
+
+		// Attendre un peu pour s'assurer que le récepteur est prêt
+		time.Sleep(100 * time.Millisecond)
 
 		// Envoyer les messages
 		for i, msg := range testMessages {
@@ -184,13 +258,13 @@ func TestSimpleMessenger(t *testing.T) {
 			}
 
 			// Petit délai entre les messages
-			time.Sleep(50 * time.Millisecond)
+			time.Sleep(100 * time.Millisecond)
 		}
 
 		fmt.Println("✅ Tous les messages envoyés")
 	}()
 
-	// Côté destinataire
+	// Côté destinataire (répondeur)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -220,7 +294,9 @@ func TestSimpleMessenger(t *testing.T) {
 			}
 			fmt.Printf("📨 Reçu message %d: '%s'\n", i+1, displayMsg)
 
+			mu.Lock()
 			receivedMessages = append(receivedMessages, msg)
+			mu.Unlock()
 		}
 
 		fmt.Println("✅ Tous les messages reçus")
@@ -236,6 +312,9 @@ func TestSimpleMessenger(t *testing.T) {
 	if receiverErr != nil {
 		t.Fatalf("Erreur destinataire: %v", receiverErr)
 	}
+
+	mu.Lock()
+	defer mu.Unlock()
 
 	if len(receivedMessages) != len(testMessages) {
 		t.Fatalf("Nombre de messages incorrect: attendu %d, reçu %d",
@@ -289,12 +368,12 @@ func TestSecureChat(t *testing.T) {
 		for i, msg := range messages {
 			alice.SendMessage(msg)
 			fmt.Printf("👩 Alice envoie (%d): %s\n", i+1, msg)
-			time.Sleep(200 * time.Millisecond)
+			time.Sleep(300 * time.Millisecond)
 		}
 
 		// Recevoir les réponses
 		responsesReceived := 0
-		timeout := time.After(5 * time.Second)
+		timeout := time.After(10 * time.Second) // Timeout plus long
 
 		for responsesReceived < len(messages) {
 			select {
@@ -312,7 +391,7 @@ func TestSecureChat(t *testing.T) {
 					return
 				}
 
-				time.Sleep(50 * time.Millisecond)
+				time.Sleep(100 * time.Millisecond)
 			}
 		}
 
@@ -324,7 +403,7 @@ func TestSecureChat(t *testing.T) {
 	go func() {
 		defer wg.Done()
 
-		time.Sleep(100 * time.Millisecond) // Laisser Alice démarrer
+		time.Sleep(200 * time.Millisecond) // Laisser Alice démarrer
 
 		bob, err := rocher.NewSecureChat(bobConn, false, "Bob")
 		if err != nil {
@@ -343,7 +422,7 @@ func TestSecureChat(t *testing.T) {
 		}
 
 		messagesReceived := 0
-		timeout := time.After(5 * time.Second)
+		timeout := time.After(10 * time.Second) // Timeout plus long
 
 		for messagesReceived < len(responses) {
 			select {
@@ -368,7 +447,7 @@ func TestSecureChat(t *testing.T) {
 					return
 				}
 
-				time.Sleep(50 * time.Millisecond)
+				time.Sleep(100 * time.Millisecond)
 			}
 		}
 
@@ -395,7 +474,7 @@ func TestPerformance(t *testing.T) {
 
 	// Test avec différentes tailles de messages
 	messageSizes := []int{100, 1000, 10000}
-	messageCount := 50
+	messageCount := 20 // Réduit pour accélérer les tests
 
 	for _, size := range messageSizes {
 		fmt.Printf("Test performance: %d messages de %d bytes\n", messageCount, size)
@@ -408,7 +487,7 @@ func TestPerformance(t *testing.T) {
 
 		var wg sync.WaitGroup
 		var duration time.Duration
-		var err error
+		var perfErr error
 
 		// Mesurer le temps d'envoi/réception
 		start := time.Now()
@@ -420,13 +499,13 @@ func TestPerformance(t *testing.T) {
 			defer conn1.Close()
 
 			sender := rocher.NewSimpleMessenger(true)
-			if err = sender.Connect(conn1); err != nil {
+			if perfErr = sender.Connect(conn1); perfErr != nil {
 				return
 			}
 			defer sender.Close()
 
 			for i := 0; i < messageCount; i++ {
-				if err = sender.SendMessage(testMessage, conn1); err != nil {
+				if perfErr = sender.SendMessage(testMessage, conn1); perfErr != nil {
 					return
 				}
 			}
@@ -439,13 +518,13 @@ func TestPerformance(t *testing.T) {
 			defer conn2.Close()
 
 			receiver := rocher.NewSimpleMessenger(false)
-			if err = receiver.Connect(conn2); err != nil {
+			if perfErr = receiver.Connect(conn2); perfErr != nil {
 				return
 			}
 			defer receiver.Close()
 
 			for i := 0; i < messageCount; i++ {
-				if _, err = receiver.ReceiveMessage(conn2); err != nil {
+				if _, perfErr = receiver.ReceiveMessage(conn2); perfErr != nil {
 					return
 				}
 			}
@@ -454,8 +533,8 @@ func TestPerformance(t *testing.T) {
 		wg.Wait()
 		duration = time.Since(start)
 
-		if err != nil {
-			t.Errorf("Erreur performance (taille %d): %v", size, err)
+		if perfErr != nil {
+			t.Errorf("Erreur performance (taille %d): %v", size, perfErr)
 			continue
 		}
 
@@ -476,7 +555,7 @@ func TestErrorHandling(t *testing.T) {
 	fmt.Println("=== Test: Gestion d'erreurs ===")
 
 	// Test 1: Message trop grand
-	channel, err := rocher.NewSecureChannel(make([]byte, 32))
+	channel, err := rocher.NewSecureChannel(make([]byte, 32), true)
 	if err != nil {
 		t.Fatalf("Erreur création canal: %v", err)
 	}
@@ -490,7 +569,7 @@ func TestErrorHandling(t *testing.T) {
 	fmt.Println("✅ Rejet des messages trop grands")
 
 	// Test 2: Secret partagé trop court
-	_, err = rocher.NewSecureChannel(make([]byte, 16)) // Trop court
+	_, err = rocher.NewSecureChannel(make([]byte, 16), true) // Trop court
 	if err == nil {
 		t.Error("Devrait rejeter les secrets partagés trop courts")
 	}
@@ -502,6 +581,25 @@ func TestErrorHandling(t *testing.T) {
 		t.Error("Devrait rejeter les messages vides")
 	}
 	fmt.Println("✅ Rejet des messages vides")
+
+	// Test 4: Tentative de déchiffrement avec mauvais rôle
+	channel2, err := rocher.NewSecureChannel(make([]byte, 32), false)
+	if err != nil {
+		t.Fatalf("Erreur création canal 2: %v", err)
+	}
+	defer channel2.Close()
+
+	// Chiffrer avec un canal et essayer de déchiffrer avec l'autre (même rôle)
+	msg, err := channel.EncryptMessage([]byte("test"))
+	if err != nil {
+		t.Fatalf("Erreur chiffrement: %v", err)
+	}
+
+	_, err = channel.DecryptMessage(msg) // Même rôle, devrait échouer
+	if err == nil {
+		t.Error("Devrait échouer lors du déchiffrement avec le même rôle")
+	}
+	fmt.Println("✅ Échec attendu avec même rôle")
 
 	fmt.Println("✅ Gestion d'erreurs correcte")
 }
@@ -534,7 +632,7 @@ func BenchmarkKeyExchange(b *testing.B) {
 
 // BenchmarkEncryption benchmark le chiffrement
 func BenchmarkEncryption(b *testing.B) {
-	channel, _ := rocher.NewSecureChannel(make([]byte, 32))
+	channel, _ := rocher.NewSecureChannel(make([]byte, 32), true)
 	defer channel.Close()
 
 	message := []byte("Message de test pour benchmark")

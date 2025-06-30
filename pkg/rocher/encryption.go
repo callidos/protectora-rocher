@@ -38,12 +38,12 @@ type Message struct {
 
 // SecureChannel gère le chiffrement/déchiffrement des messages
 type SecureChannel struct {
-	encryptKey [KeySize]byte
-	decryptKey [KeySize]byte
+	sendKey    [KeySize]byte // Clé pour envoyer des messages
+	receiveKey [KeySize]byte // Clé pour recevoir des messages
 }
 
 // NewSecureChannel crée un nouveau canal sécurisé à partir d'un secret partagé
-func NewSecureChannel(sharedSecret []byte) (*SecureChannel, error) {
+func NewSecureChannel(sharedSecret []byte, isInitiator bool) (*SecureChannel, error) {
 	if len(sharedSecret) < KeySize {
 		return nil, errors.New("shared secret too short")
 	}
@@ -51,7 +51,7 @@ func NewSecureChannel(sharedSecret []byte) (*SecureChannel, error) {
 	sc := &SecureChannel{}
 
 	// Dérivation des clés de chiffrement et déchiffrement
-	if err := sc.deriveKeys(sharedSecret); err != nil {
+	if err := sc.deriveKeys(sharedSecret, isInitiator); err != nil {
 		return nil, fmt.Errorf("key derivation failed: %w", err)
 	}
 
@@ -59,26 +59,40 @@ func NewSecureChannel(sharedSecret []byte) (*SecureChannel, error) {
 }
 
 // deriveKeys dérive les clés de chiffrement/déchiffrement avec HKDF
-func (sc *SecureChannel) deriveKeys(secret []byte) error {
+// Les clés sont inversées entre initiateur et répondeur pour permettre la communication
+func (sc *SecureChannel) deriveKeys(secret []byte, isInitiator bool) error {
 	salt := []byte("rocher-simple-salt-v1")
 
-	// Clé de chiffrement
-	encInfo := []byte("rocher-encrypt-key-v1")
-	hkdfEnc := hkdf.New(sha256.New, secret, salt, encInfo)
-	if _, err := io.ReadFull(hkdfEnc, sc.encryptKey[:]); err != nil {
-		return err
+	// Définir les contextes pour les clés directionnelles
+	var sendInfo, receiveInfo []byte
+	if isInitiator {
+		sendInfo = []byte("rocher-initiator-to-responder-v1")
+		receiveInfo = []byte("rocher-responder-to-initiator-v1")
+	} else {
+		sendInfo = []byte("rocher-responder-to-initiator-v1")
+		receiveInfo = []byte("rocher-initiator-to-responder-v1")
 	}
 
-	// Clé de déchiffrement (pour éviter la réutilisation de clé)
-	decInfo := []byte("rocher-decrypt-key-v1")
-	hkdfDec := hkdf.New(sha256.New, secret, salt, decInfo)
-	if _, err := io.ReadFull(hkdfDec, sc.decryptKey[:]); err != nil {
-		return err
+	// Clé pour envoyer des messages
+	hkdfSend := hkdf.New(sha256.New, secret, salt, sendInfo)
+	if _, err := io.ReadFull(hkdfSend, sc.sendKey[:]); err != nil {
+		return fmt.Errorf("failed to derive send key: %w", err)
+	}
+
+	// Clé pour recevoir des messages
+	hkdfReceive := hkdf.New(sha256.New, secret, salt, receiveInfo)
+	if _, err := io.ReadFull(hkdfReceive, sc.receiveKey[:]); err != nil {
+		return fmt.Errorf("failed to derive receive key: %w", err)
 	}
 
 	// Vérifier que les clés ne sont pas nulles
-	if isAllZeros(sc.encryptKey[:]) || isAllZeros(sc.decryptKey[:]) {
+	if isAllZeros(sc.sendKey[:]) || isAllZeros(sc.receiveKey[:]) {
 		return errors.New("derived keys are zero")
+	}
+
+	// Vérifier que les clés sont différentes (sécurité supplémentaire)
+	if ConstantTimeCompare(sc.sendKey[:], sc.receiveKey[:]) {
+		return errors.New("send and receive keys are identical")
 	}
 
 	return nil
@@ -100,8 +114,8 @@ func (sc *SecureChannel) EncryptMessage(plaintext []byte) (*Message, error) {
 		return nil, fmt.Errorf("nonce generation failed: %w", err)
 	}
 
-	// Chiffrement avec NaCl secretbox
-	encrypted := secretbox.Seal(nil, plaintext, &nonce, &sc.encryptKey)
+	// Chiffrement avec NaCl secretbox en utilisant la clé d'envoi
+	encrypted := secretbox.Seal(nil, plaintext, &nonce, &sc.sendKey)
 
 	message := &Message{
 		ID:        generateMessageID(),
@@ -131,8 +145,8 @@ func (sc *SecureChannel) DecryptMessage(msg *Message) ([]byte, error) {
 	var nonce [NonceSize]byte
 	copy(nonce[:], msg.Nonce)
 
-	// Déchiffrement avec NaCl secretbox
-	plaintext, ok := secretbox.Open(nil, msg.Data, &nonce, &sc.decryptKey)
+	// Déchiffrement avec NaCl secretbox en utilisant la clé de réception
+	plaintext, ok := secretbox.Open(nil, msg.Data, &nonce, &sc.receiveKey)
 	if !ok {
 		return nil, ErrDecryptionFailed
 	}
@@ -152,6 +166,11 @@ func (sc *SecureChannel) SendMessage(plaintext []byte, writer io.Writer) error {
 	data, err := json.Marshal(msg)
 	if err != nil {
 		return fmt.Errorf("serialization failed: %w", err)
+	}
+
+	// Vérifier la taille finale
+	if len(data) > MaxMsgSize*2 {
+		return fmt.Errorf("serialized message too large: %d bytes", len(data))
 	}
 
 	// Envoyer la taille puis les données
@@ -181,7 +200,7 @@ func (sc *SecureChannel) ReceiveMessage(reader io.Reader) ([]byte, error) {
 	}
 
 	if size > MaxMsgSize*2 { // Marge pour les métadonnées JSON
-		return nil, ErrMessageTooLarge
+		return nil, fmt.Errorf("message too large: %d bytes", size)
 	}
 
 	// Lire les données
@@ -196,6 +215,11 @@ func (sc *SecureChannel) ReceiveMessage(reader io.Reader) ([]byte, error) {
 		return nil, fmt.Errorf("deserialization failed: %w", err)
 	}
 
+	// Valider le message avant déchiffrement
+	if err := ValidateMessage(&msg); err != nil {
+		return nil, fmt.Errorf("invalid message: %w", err)
+	}
+
 	// Déchiffrer le message
 	plaintext, err := sc.DecryptMessage(&msg)
 	if err != nil {
@@ -207,9 +231,9 @@ func (sc *SecureChannel) ReceiveMessage(reader io.Reader) ([]byte, error) {
 
 // Close nettoie le canal sécurisé
 func (sc *SecureChannel) Close() {
-	// Effacer les clés de la mémoire
-	secureZeroMemory(sc.encryptKey[:])
-	secureZeroMemory(sc.decryptKey[:])
+	// Effacer les clés de la mémoire de manière sécurisée
+	secureZeroMemory(sc.sendKey[:])
+	secureZeroMemory(sc.receiveKey[:])
 }
 
 // GetOverhead retourne la taille de l'overhead par message
@@ -232,12 +256,27 @@ func ValidateMessage(msg *Message) error {
 		return errors.New("invalid timestamp")
 	}
 
+	// Vérifier que le timestamp n'est pas trop ancien ou futur
+	now := time.Now().Unix()
+	if msg.Timestamp < now-3600 || msg.Timestamp > now+300 { // 1h passé, 5min futur
+		return fmt.Errorf("timestamp out of range: %d (now: %d)", msg.Timestamp, now)
+	}
+
 	if len(msg.Data) == 0 {
 		return errors.New("empty message data")
 	}
 
+	if len(msg.Data) < secretbox.Overhead {
+		return errors.New("message data too short for secretbox")
+	}
+
 	if len(msg.Nonce) != NonceSize {
-		return errors.New("invalid nonce size")
+		return fmt.Errorf("invalid nonce size: got %d, expected %d", len(msg.Nonce), NonceSize)
+	}
+
+	// Vérifier que le nonce n'est pas entièrement à zéro
+	if isAllZeros(msg.Nonce) {
+		return errors.New("nonce is all zeros")
 	}
 
 	return nil
@@ -247,7 +286,7 @@ func ValidateMessage(msg *Message) error {
 func generateMessageID() string {
 	bytes := make([]byte, 16)
 	if _, err := rand.Read(bytes); err != nil {
-		// Fallback en cas d'erreur
+		// Fallback en cas d'erreur avec timestamp seul
 		return fmt.Sprintf("msg_%d", time.Now().UnixNano())
 	}
 	return fmt.Sprintf("%x", bytes)

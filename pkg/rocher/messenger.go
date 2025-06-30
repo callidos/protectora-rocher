@@ -60,8 +60,8 @@ func (sm *SimpleMessenger) Connect(conn io.ReadWriter) error {
 		return fmt.Errorf("key exchange failed: %w", err)
 	}
 
-	// Créer le canal sécurisé avec le secret partagé
-	sm.channel, err = NewSecureChannel(sharedSecret)
+	// Créer le canal sécurisé avec le secret partagé ET le rôle
+	sm.channel, err = NewSecureChannel(sharedSecret, sm.isInitiator)
 	if err != nil {
 		// Nettoyer le secret en cas d'erreur
 		secureZeroMemory(sharedSecret)
@@ -315,7 +315,7 @@ func (sc *SecureChat) receiveLoop() {
 		case <-sc.stopChan:
 			return
 		default:
-			message, err := sc.messenger.ReceiveWithTimeout(sc.conn, 5*time.Second)
+			message, err := sc.messenger.ReceiveWithTimeout(sc.conn, 10*time.Second) // Timeout plus long
 			if err != nil {
 				// Si c'est un timeout, continuer
 				if err.Error() == "receive timeout" {
@@ -341,7 +341,7 @@ func (sc *SecureChat) sendLoop() {
 		case <-sc.stopChan:
 			return
 		case message := <-sc.outgoingMessages:
-			err := sc.messenger.SendWithTimeout(message, sc.conn, 5*time.Second)
+			err := sc.messenger.SendWithTimeout(message, sc.conn, 10*time.Second) // Timeout plus long
 			if err != nil {
 				sc.errors <- fmt.Errorf("send error: %w", err)
 			}
