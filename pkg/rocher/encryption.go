@@ -32,10 +32,11 @@ var (
 type Message struct {
 	ID           string `json:"id"`
 	Timestamp    int64  `json:"timestamp"`
-	Recipient    string `json:"recipient"`     // CHAMP EXISTANT
-	SessionToken string `json:"session_token"` // NOUVEAU CHAMP AJOUTÉ
-	Data         []byte `json:"data"`          // Données chiffrées
-	Nonce        []byte `json:"nonce"`         // Nonce pour le chiffrement
+	Type         string `json:"type"` // NOUVEAU CHAMP AJOUTÉ
+	Recipient    string `json:"recipient"`
+	SessionToken string `json:"session_token"`
+	Data         []byte `json:"data"`  // Données chiffrées
+	Nonce        []byte `json:"nonce"` // Nonce pour le chiffrement
 }
 
 // SecureChannel gère le chiffrement/déchiffrement des messages
@@ -101,7 +102,7 @@ func (sc *SecureChannel) deriveKeys(secret []byte, isInitiator bool) error {
 }
 
 // EncryptMessage chiffre un message avec NaCl secretbox
-func (sc *SecureChannel) EncryptMessage(plaintext []byte, recipient, sessionToken string) (*Message, error) {
+func (sc *SecureChannel) EncryptMessage(plaintext []byte, messageType, recipient, sessionToken string) (*Message, error) {
 	if len(plaintext) == 0 {
 		return nil, ErrEmptyMessage
 	}
@@ -111,6 +112,10 @@ func (sc *SecureChannel) EncryptMessage(plaintext []byte, recipient, sessionToke
 	}
 
 	// Validation côté envoi
+	if messageType == "" {
+		return nil, errors.New("empty message type")
+	}
+
 	if recipient == "" {
 		return nil, errors.New("empty recipient")
 	}
@@ -131,8 +136,9 @@ func (sc *SecureChannel) EncryptMessage(plaintext []byte, recipient, sessionToke
 	message := &Message{
 		ID:           generateMessageID(),
 		Timestamp:    time.Now().Unix(),
+		Type:         messageType, // NOUVEAU CHAMP UTILISÉ
 		Recipient:    recipient,
-		SessionToken: sessionToken, // NOUVEAU CHAMP UTILISÉ
+		SessionToken: sessionToken,
 		Data:         encrypted,
 		Nonce:        nonce[:],
 	}
@@ -168,9 +174,9 @@ func (sc *SecureChannel) DecryptMessage(msg *Message) ([]byte, error) {
 }
 
 // SendMessage sérialise et envoie un message chiffré
-func (sc *SecureChannel) SendMessage(plaintext []byte, recipient, sessionToken string, writer io.Writer) error {
+func (sc *SecureChannel) SendMessage(plaintext []byte, messageType, recipient, sessionToken string, writer io.Writer) error {
 	// Chiffrer le message
-	msg, err := sc.EncryptMessage(plaintext, recipient, sessionToken)
+	msg, err := sc.EncryptMessage(plaintext, messageType, recipient, sessionToken)
 	if err != nil {
 		return fmt.Errorf("encryption failed: %w", err)
 	}
@@ -200,46 +206,46 @@ func (sc *SecureChannel) SendMessage(plaintext []byte, recipient, sessionToken s
 }
 
 // ReceiveMessage reçoit et déchiffre un message
-func (sc *SecureChannel) ReceiveMessage(reader io.Reader) ([]byte, string, string, error) {
+func (sc *SecureChannel) ReceiveMessage(reader io.Reader) ([]byte, string, string, string, error) {
 	// Lire la taille du message
 	var size uint32
 	if err := binary.Read(reader, binary.BigEndian, &size); err != nil {
-		return nil, "", "", fmt.Errorf("failed to read size: %w", err)
+		return nil, "", "", "", fmt.Errorf("failed to read size: %w", err)
 	}
 
 	// Vérifier la taille
 	if size == 0 {
-		return nil, "", "", ErrEmptyMessage
+		return nil, "", "", "", ErrEmptyMessage
 	}
 
 	if size > MaxMsgSize*2 { // Marge pour les métadonnées JSON
-		return nil, "", "", fmt.Errorf("message too large: %d bytes", size)
+		return nil, "", "", "", fmt.Errorf("message too large: %d bytes", size)
 	}
 
 	// Lire les données
 	data := make([]byte, size)
 	if _, err := io.ReadFull(reader, data); err != nil {
-		return nil, "", "", fmt.Errorf("failed to read data: %w", err)
+		return nil, "", "", "", fmt.Errorf("failed to read data: %w", err)
 	}
 
 	// Désérialiser le message
 	var msg Message
 	if err := json.Unmarshal(data, &msg); err != nil {
-		return nil, "", "", fmt.Errorf("deserialization failed: %w", err)
+		return nil, "", "", "", fmt.Errorf("deserialization failed: %w", err)
 	}
 
 	// Valider le message avant déchiffrement
 	if err := ValidateMessage(&msg); err != nil {
-		return nil, "", "", fmt.Errorf("invalid message: %w", err)
+		return nil, "", "", "", fmt.Errorf("invalid message: %w", err)
 	}
 
 	// Déchiffrer le message
 	plaintext, err := sc.DecryptMessage(&msg)
 	if err != nil {
-		return nil, "", "", fmt.Errorf("decryption failed: %w", err)
+		return nil, "", "", "", fmt.Errorf("decryption failed: %w", err)
 	}
 
-	return plaintext, msg.Recipient, msg.SessionToken, nil // RETOURNE AUSSI LE SESSION TOKEN
+	return plaintext, msg.Type, msg.Recipient, msg.SessionToken, nil // RETOURNE AUSSI LE TYPE
 }
 
 // Close nettoie le canal sécurisé
@@ -252,7 +258,7 @@ func (sc *SecureChannel) Close() {
 // GetOverhead retourne la taille de l'overhead par message
 func (sc *SecureChannel) GetOverhead() int {
 	// secretbox.Overhead + nonce + métadonnées JSON approximatives
-	return secretbox.Overhead + NonceSize + 150 // Augmenté pour le champ session_token
+	return secretbox.Overhead + NonceSize + 200 // Augmenté pour le champ type et session_token
 }
 
 // ValidateMessage valide qu'un message est bien formé
@@ -267,6 +273,11 @@ func ValidateMessage(msg *Message) error {
 
 	if msg.Timestamp == 0 {
 		return errors.New("invalid timestamp")
+	}
+
+	// Validation du type de message - OBLIGATOIRE ET NON-VIDE
+	if msg.Type == "" {
+		return errors.New("empty message type")
 	}
 
 	// Validation du destinataire

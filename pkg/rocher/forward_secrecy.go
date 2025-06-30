@@ -85,14 +85,15 @@ type SecureChannelWithFS struct {
 type MessageWithFS struct {
 	ID           string `json:"id"`
 	Timestamp    int64  `json:"timestamp"`
+	Type         string `json:"type"` // NOUVEAU CHAMP AJOUTÉ
 	Recipient    string `json:"recipient"`
-	SessionToken string `json:"session_token"` // NOUVEAU CHAMP AJOUTÉ
+	SessionToken string `json:"session_token"`
 	Data         []byte `json:"data"`
 	Nonce        []byte `json:"nonce"`
 
 	// Métadonnées Forward Secrecy
 	RotationID     uint64 `json:"rotation_id"`      // ID de rotation de l'expéditeur
-	PeerRotationID uint64 `json:"peer_rotation_id"` // ID de rotation du destinataire (NOUVEAU)
+	PeerRotationID uint64 `json:"peer_rotation_id"` // ID de rotation du destinataire
 	FSVersion      int    `json:"fs_version"`       // Version du protocole FS
 }
 
@@ -116,7 +117,7 @@ func NewSecureChannelWithFS(sharedSecret []byte, isInitiator bool) (*SecureChann
 		maxOldChannels:   5, // Garder 5 générations de clés
 		masterSecret:     copyBytes(sharedSecret),
 		isInitiator:      isInitiator,
-		peerRotationID:   0, // NOUVEAU: ID du pair initialisé à 0
+		peerRotationID:   0,
 	}
 
 	return sc, nil
@@ -229,7 +230,7 @@ func (sc *SecureChannelWithFS) RotateKeys() error {
 	return nil
 }
 
-// NOUVEAU: UpdatePeerRotationID met à jour l'ID de rotation du pair
+// UpdatePeerRotationID met à jour l'ID de rotation du pair
 func (sc *SecureChannelWithFS) UpdatePeerRotationID(peerRotationID uint64) {
 	sc.rotationSync.Lock()
 	defer sc.rotationSync.Unlock()
@@ -239,7 +240,7 @@ func (sc *SecureChannelWithFS) UpdatePeerRotationID(peerRotationID uint64) {
 	}
 }
 
-// NOUVEAU: GetPeerRotationID retourne l'ID de rotation du pair
+// GetPeerRotationID retourne l'ID de rotation du pair
 func (sc *SecureChannelWithFS) GetPeerRotationID() uint64 {
 	sc.rotationSync.RLock()
 	defer sc.rotationSync.RUnlock()
@@ -285,8 +286,12 @@ func (sc *SecureChannelWithFS) cleanupOldChannels() {
 }
 
 // EncryptMessage avec rotation automatique
-func (sc *SecureChannelWithFS) EncryptMessage(plaintext []byte, recipient, sessionToken string) (*MessageWithFS, error) {
+func (sc *SecureChannelWithFS) EncryptMessage(plaintext []byte, messageType, recipient, sessionToken string) (*MessageWithFS, error) {
 	// Validation côté envoi
+	if messageType == "" {
+		return nil, errors.New("empty message type")
+	}
+
 	if recipient == "" {
 		return nil, errors.New("empty recipient")
 	}
@@ -303,7 +308,7 @@ func (sc *SecureChannelWithFS) EncryptMessage(plaintext []byte, recipient, sessi
 	}
 
 	// Chiffrer avec les clés actuelles
-	baseMsg, err := sc.currentChannel.EncryptMessage(plaintext, recipient, sessionToken)
+	baseMsg, err := sc.currentChannel.EncryptMessage(plaintext, messageType, recipient, sessionToken)
 	if err != nil {
 		return nil, err
 	}
@@ -315,18 +320,19 @@ func (sc *SecureChannelWithFS) EncryptMessage(plaintext []byte, recipient, sessi
 	sc.rotationState.byteCount += uint64(len(plaintext))
 	sc.rotationState.mu.Unlock()
 
-	// NOUVEAU: Inclure l'ID de rotation du pair
+	// Inclure l'ID de rotation du pair
 	peerRotationID := sc.GetPeerRotationID()
 
 	msg := &MessageWithFS{
 		ID:             baseMsg.ID,
 		Timestamp:      baseMsg.Timestamp,
+		Type:           baseMsg.Type, // NOUVEAU CHAMP INCLUS
 		Recipient:      baseMsg.Recipient,
-		SessionToken:   baseMsg.SessionToken, // NOUVEAU CHAMP INCLUS
+		SessionToken:   baseMsg.SessionToken,
 		Data:           baseMsg.Data,
 		Nonce:          baseMsg.Nonce,
 		RotationID:     rotationID,
-		PeerRotationID: peerRotationID, // NOUVEAU
+		PeerRotationID: peerRotationID,
 		FSVersion:      1,
 	}
 
@@ -338,15 +344,16 @@ func (sc *SecureChannelWithFS) DecryptMessage(msg *MessageWithFS) ([]byte, error
 	sc.mu.RLock()
 	defer sc.mu.RUnlock()
 
-	// NOUVEAU: Mettre à jour l'ID de rotation du pair
+	// Mettre à jour l'ID de rotation du pair
 	sc.UpdatePeerRotationID(msg.RotationID)
 
 	// Créer un Message de base pour la compatibilité
 	baseMsg := &Message{
 		ID:           msg.ID,
 		Timestamp:    msg.Timestamp,
+		Type:         msg.Type, // NOUVEAU CHAMP INCLUS
 		Recipient:    msg.Recipient,
-		SessionToken: msg.SessionToken, // NOUVEAU CHAMP INCLUS
+		SessionToken: msg.SessionToken,
 		Data:         msg.Data,
 		Nonce:        msg.Nonce,
 	}
@@ -369,9 +376,9 @@ func (sc *SecureChannelWithFS) DecryptMessage(msg *MessageWithFS) ([]byte, error
 }
 
 // SendMessage sérialise et envoie un message chiffré avec FS
-func (sc *SecureChannelWithFS) SendMessage(plaintext []byte, recipient, sessionToken string, writer io.Writer) error {
+func (sc *SecureChannelWithFS) SendMessage(plaintext []byte, messageType, recipient, sessionToken string, writer io.Writer) error {
 	// Chiffrer le message
-	msg, err := sc.EncryptMessage(plaintext, recipient, sessionToken)
+	msg, err := sc.EncryptMessage(plaintext, messageType, recipient, sessionToken)
 	if err != nil {
 		return fmt.Errorf("encryption failed: %w", err)
 	}
@@ -401,46 +408,46 @@ func (sc *SecureChannelWithFS) SendMessage(plaintext []byte, recipient, sessionT
 }
 
 // ReceiveMessage reçoit et déchiffre un message avec support FS
-func (sc *SecureChannelWithFS) ReceiveMessage(reader io.Reader) ([]byte, string, string, error) {
+func (sc *SecureChannelWithFS) ReceiveMessage(reader io.Reader) ([]byte, string, string, string, error) {
 	// Lire la taille du message (même format que SecureChannel)
 	var size uint32
 	if err := binary.Read(reader, binary.BigEndian, &size); err != nil {
-		return nil, "", "", fmt.Errorf("failed to read size: %w", err)
+		return nil, "", "", "", fmt.Errorf("failed to read size: %w", err)
 	}
 
 	// Vérifier la taille
 	if size == 0 {
-		return nil, "", "", ErrEmptyMessage
+		return nil, "", "", "", ErrEmptyMessage
 	}
 
 	if size > MaxMsgSize*2 {
-		return nil, "", "", fmt.Errorf("message too large: %d bytes", size)
+		return nil, "", "", "", fmt.Errorf("message too large: %d bytes", size)
 	}
 
 	// Lire les données
 	data := make([]byte, size)
 	if _, err := io.ReadFull(reader, data); err != nil {
-		return nil, "", "", fmt.Errorf("failed to read data: %w", err)
+		return nil, "", "", "", fmt.Errorf("failed to read data: %w", err)
 	}
 
 	// Désérialiser le message
 	var msg MessageWithFS
 	if err := json.Unmarshal(data, &msg); err != nil {
-		return nil, "", "", fmt.Errorf("deserialization failed: %w", err)
+		return nil, "", "", "", fmt.Errorf("deserialization failed: %w", err)
 	}
 
 	// Valider le message avant déchiffrement
 	if err := sc.ValidateMessageWithFS(&msg); err != nil {
-		return nil, "", "", fmt.Errorf("invalid message: %w", err)
+		return nil, "", "", "", fmt.Errorf("invalid message: %w", err)
 	}
 
 	// Déchiffrer le message
 	plaintext, err := sc.DecryptMessage(&msg)
 	if err != nil {
-		return nil, "", "", fmt.Errorf("decryption failed: %w", err)
+		return nil, "", "", "", fmt.Errorf("decryption failed: %w", err)
 	}
 
-	return plaintext, msg.Recipient, msg.SessionToken, nil // RETOURNE AUSSI LE SESSION TOKEN
+	return plaintext, msg.Type, msg.Recipient, msg.SessionToken, nil // RETOURNE AUSSI LE TYPE
 }
 
 // ValidateMessageWithFS valide un message avec métadonnées FS
@@ -455,6 +462,11 @@ func (sc *SecureChannelWithFS) ValidateMessageWithFS(msg *MessageWithFS) error {
 
 	if msg.Timestamp == 0 {
 		return errors.New("invalid timestamp")
+	}
+
+	// VALIDATION : Type de message obligatoire et non-vide
+	if msg.Type == "" {
+		return errors.New("empty message type")
 	}
 
 	if msg.Recipient == "" {
@@ -490,7 +502,7 @@ func (sc *SecureChannelWithFS) ValidateMessageWithFS(msg *MessageWithFS) error {
 		return fmt.Errorf("unsupported FS version: %d", msg.FSVersion)
 	}
 
-	// MODIFIÉ: Validation plus permissive pour les IDs de rotation
+	// Validation plus permissive pour les IDs de rotation
 	sc.rotationState.mu.RLock()
 	currentRotationID := sc.rotationState.rotationID
 	sc.rotationState.mu.RUnlock()
@@ -539,7 +551,7 @@ func (sc *SecureChannelWithFS) Close() {
 func (sc *SecureChannelWithFS) GetOverhead() int {
 	// Overhead de base + métadonnées FS
 	baseOverhead := sc.currentChannel.GetOverhead()
-	return baseOverhead + 120 // JSON overhead pour rotation_id, peer_rotation_id, fs_version et session_token
+	return baseOverhead + 150 // JSON overhead pour rotation_id, peer_rotation_id, fs_version, type et session_token
 }
 
 // GetRotationStats retourne les statistiques de rotation
@@ -551,7 +563,7 @@ func (sc *SecureChannelWithFS) GetRotationStats() map[string]interface{} {
 
 	return map[string]interface{}{
 		"current_rotation_id":     sc.rotationState.rotationID,
-		"peer_rotation_id":        peerRotationID, // NOUVEAU
+		"peer_rotation_id":        peerRotationID,
 		"last_rotation":           sc.rotationState.lastRotation,
 		"messages_since_rotation": sc.rotationState.messageCount,
 		"bytes_since_rotation":    sc.rotationState.byteCount,
@@ -564,7 +576,7 @@ func (sc *SecureChannelWithFS) GetRotationStats() map[string]interface{} {
 		"time_until_rotation":     sc.rotationConfig.TimeInterval - time.Since(sc.rotationState.lastRotation),
 		"messages_until_rotation": sc.rotationConfig.MaxMessages - sc.rotationState.messageCount,
 		"bytes_until_rotation":    sc.rotationConfig.MaxBytes - sc.rotationState.byteCount,
-		"synchronized":            peerRotationID == sc.rotationState.rotationID, // NOUVEAU
+		"synchronized":            peerRotationID == sc.rotationState.rotationID,
 	}
 }
 

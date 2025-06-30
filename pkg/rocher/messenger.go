@@ -89,7 +89,7 @@ type ConnectorFunc func() (io.ReadWriter, error)
 type SimpleMessenger struct {
 	// Composants de base
 	keyExchange *KyberKeyExchange
-	channel     *SecureChannelWithFS // MODIFIÉ: utilise maintenant SecureChannelWithFS
+	channel     *SecureChannelWithFS // Utilise SecureChannelWithFS
 
 	// État
 	isInitiator bool
@@ -104,7 +104,7 @@ type SimpleMessenger struct {
 	reconnectPolicy   *ReconnectPolicy
 	keepAliveConfig   *KeepAliveConfig
 	compressionConfig *CompressionConfig
-	keyRotationConfig *KeyRotationConfig // NOUVEAU: configuration Forward Secrecy
+	keyRotationConfig *KeyRotationConfig
 
 	// État de reconnexion
 	isReconnecting  bool
@@ -143,7 +143,7 @@ func NewSimpleMessenger(isInitiator bool) *SimpleMessenger {
 		reconnectPolicy:   DefaultReconnectPolicy(),
 		keepAliveConfig:   DefaultKeepAliveConfig(),
 		compressionConfig: DefaultCompressionConfig(),
-		keyRotationConfig: DefaultKeyRotationConfig(), // NOUVEAU: configuration FS par défaut
+		keyRotationConfig: DefaultKeyRotationConfig(),
 		stopChan:          make(chan struct{}),
 		stopPing:          make(chan struct{}),
 	}
@@ -170,7 +170,7 @@ func (sm *SimpleMessenger) SetCompressionConfig(config *CompressionConfig) {
 	sm.compressionConfig = config
 }
 
-// SetKeyRotationConfig configure la rotation des clés (NOUVEAU)
+// SetKeyRotationConfig configure la rotation des clés
 func (sm *SimpleMessenger) SetKeyRotationConfig(config *KeyRotationConfig) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
@@ -231,7 +231,7 @@ func (sm *SimpleMessenger) connectInternal(conn io.ReadWriter) error {
 		return fmt.Errorf("key exchange failed: %w", err)
 	}
 
-	// MODIFIÉ: Créer le canal sécurisé avec Forward Secrecy
+	// Créer le canal sécurisé avec Forward Secrecy
 	sm.channel, err = NewSecureChannelWithFS(sharedSecret, sm.isInitiator)
 	if err != nil {
 		// Nettoyer le secret en cas d'erreur
@@ -239,10 +239,10 @@ func (sm *SimpleMessenger) connectInternal(conn io.ReadWriter) error {
 		return fmt.Errorf("secure channel creation failed: %w", err)
 	}
 
-	// NOUVEAU: Appliquer la configuration de rotation des clés
+	// Appliquer la configuration de rotation des clés
 	sm.channel.SetKeyRotationConfig(sm.keyRotationConfig)
 
-	// NOUVEAU: Définir le callback de rotation
+	// Définir le callback de rotation
 	sm.channel.SetOnKeyRotation(func(rotationID uint64) error {
 		// Log ou autres actions lors de la rotation
 		if sm.keyRotationConfig.Enabled {
@@ -310,7 +310,7 @@ func (sm *SimpleMessenger) sendPing() error {
 	sm.mu.Unlock()
 
 	pingMsg := fmt.Sprintf("PING:%d", time.Now().UnixNano())
-	err := sm.SendMessage(pingMsg, "system", "ping-session", conn.(io.Writer))
+	err := sm.SendMessage(pingMsg, "ping", "system", "ping-session", conn.(io.Writer))
 	if err == nil {
 		sm.mu.Lock()
 		sm.lastPing = time.Now()
@@ -455,8 +455,8 @@ func (sm *SimpleMessenger) decompressMessage(data []byte, compressed bool) ([]by
 	return data, nil
 }
 
-// SendMessage envoie un message sécurisé avec compression - MODIFIÉ pour FS et session token
-func (sm *SimpleMessenger) SendMessage(message string, recipient string, sessionToken string, conn io.Writer) error {
+// SendMessage envoie un message sécurisé avec compression - MODIFIÉ pour type
+func (sm *SimpleMessenger) SendMessage(message string, messageType string, recipient string, sessionToken string, conn io.Writer) error {
 	sm.mu.RLock()
 	if !sm.isConnected || sm.channel == nil {
 		sm.mu.RUnlock()
@@ -488,8 +488,8 @@ func (sm *SimpleMessenger) SendMessage(message string, recipient string, session
 		return fmt.Errorf("serialization failed: %w", err)
 	}
 
-	// MODIFIÉ: Envoyer via le canal sécurisé avec FS et session token
-	err = channel.SendMessage(finalData, recipient, sessionToken, conn)
+	// Envoyer via le canal sécurisé avec FS et type de message
+	err = channel.SendMessage(finalData, messageType, recipient, sessionToken, conn)
 
 	if err == nil {
 		// Mettre à jour les statistiques
@@ -502,45 +502,45 @@ func (sm *SimpleMessenger) SendMessage(message string, recipient string, session
 	return err
 }
 
-// ReceiveMessage reçoit un message sécurisé avec décompression - MODIFIÉ pour FS et session token
-func (sm *SimpleMessenger) ReceiveMessage(conn io.Reader) (string, string, string, error) {
+// ReceiveMessage reçoit un message sécurisé avec décompression - MODIFIÉ pour type
+func (sm *SimpleMessenger) ReceiveMessage(conn io.Reader) (string, string, string, string, error) {
 	sm.mu.RLock()
 	if !sm.isConnected || sm.channel == nil {
 		sm.mu.RUnlock()
-		return "", "", "", ErrNotConnected
+		return "", "", "", "", ErrNotConnected
 	}
 
 	channel := sm.channel
 	sm.mu.RUnlock()
 
-	// MODIFIÉ: Recevoir via le canal sécurisé avec FS et session token
-	finalData, recipient, sessionToken, err := channel.ReceiveMessage(conn)
+	// Recevoir via le canal sécurisé avec FS et type de message
+	finalData, messageType, recipient, sessionToken, err := channel.ReceiveMessage(conn)
 	if err != nil {
 		// Vérifier si c'est un ping
 		if err.Error() == "receive timeout" {
-			return "", "", "", err
+			return "", "", "", "", err
 		}
-		return "", "", "", err
+		return "", "", "", "", err
 	}
 
 	// Désérialiser métadonnées + données
 	messageBytes, metadata, err := sm.deserializeWithMetadata(finalData)
 	if err != nil {
-		return "", "", "", fmt.Errorf("deserialization failed: %w", err)
+		return "", "", "", "", fmt.Errorf("deserialization failed: %w", err)
 	}
 
 	// Décompression si nécessaire
 	isCompressed, _ := metadata["compressed"].(bool)
 	decompressedData, err := sm.decompressMessage(messageBytes, isCompressed)
 	if err != nil {
-		return "", "", "", fmt.Errorf("decompression failed: %w", err)
+		return "", "", "", "", fmt.Errorf("decompression failed: %w", err)
 	}
 
 	message := string(decompressedData)
 
 	// Gérer les messages de keep-alive
 	if sm.isKeepAliveMessage(message) {
-		sm.handleKeepAliveMessage(message, recipient, sessionToken)
+		sm.handleKeepAliveMessage(message, messageType, recipient, sessionToken)
 		// Recevoir le message suivant
 		return sm.ReceiveMessage(conn)
 	}
@@ -551,7 +551,7 @@ func (sm *SimpleMessenger) ReceiveMessage(conn io.Reader) (string, string, strin
 	sm.bytesReceived += uint64(len(decompressedData))
 	sm.mu.Unlock()
 
-	return message, recipient, sessionToken, nil
+	return message, messageType, recipient, sessionToken, nil
 }
 
 // isKeepAliveMessage vérifie si c'est un message de keep-alive
@@ -559,13 +559,13 @@ func (sm *SimpleMessenger) isKeepAliveMessage(message string) bool {
 	return len(message) > 5 && (message[:5] == "PING:" || message[:5] == "PONG:")
 }
 
-// handleKeepAliveMessage traite les messages de keep-alive - MODIFIÉ pour session token
-func (sm *SimpleMessenger) handleKeepAliveMessage(message string, recipient string, sessionToken string) {
+// handleKeepAliveMessage traite les messages de keep-alive - MODIFIÉ pour type
+func (sm *SimpleMessenger) handleKeepAliveMessage(message string, messageType string, recipient string, sessionToken string) {
 	if len(message) > 5 && message[:5] == "PING:" {
 		// Répondre au ping
 		pongMsg := "PONG:" + message[5:]
 		if sm.conn != nil {
-			sm.SendMessage(pongMsg, "system", "pong-session", sm.conn.(io.Writer))
+			sm.SendMessage(pongMsg, "pong", "system", "pong-session", sm.conn.(io.Writer))
 		}
 	} else if len(message) > 5 && message[:5] == "PONG:" {
 		// Marquer le pong reçu
@@ -654,7 +654,7 @@ func (sm *SimpleMessenger) Close() error {
 	return nil
 }
 
-// GetStats retourne les statistiques du messenger avec nouvelles métriques - MODIFIÉ pour FS
+// GetStats retourne les statistiques du messenger avec nouvelles métriques
 func (sm *SimpleMessenger) GetStats() map[string]interface{} {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
@@ -680,13 +680,13 @@ func (sm *SimpleMessenger) GetStats() map[string]interface{} {
 			"key_exchange":    "Kyber768",
 			"encryption":      "NaCl-secretbox",
 			"kdf":             "HKDF-SHA256",
-			"forward_secrecy": "Enabled", // NOUVEAU
+			"forward_secrecy": "Enabled",
 		},
 		"features": map[string]bool{
 			"reconnect_enabled":       sm.reconnectPolicy.Enabled,
 			"keepalive_enabled":       sm.keepAliveConfig.Enabled,
 			"compression_enabled":     sm.compressionConfig.Enabled,
-			"forward_secrecy_enabled": sm.keyRotationConfig.Enabled, // NOUVEAU
+			"forward_secrecy_enabled": sm.keyRotationConfig.Enabled,
 		},
 	}
 
@@ -696,19 +696,18 @@ func (sm *SimpleMessenger) GetStats() map[string]interface{} {
 
 	if sm.channel != nil {
 		stats["message_overhead"] = sm.channel.GetOverhead()
-		// NOUVEAU: Ajouter les statistiques de rotation des clés
 		stats["key_rotation"] = sm.channel.GetRotationStats()
 	}
 
 	return stats
 }
 
-// SendWithTimeout envoie un message avec timeout - MODIFIÉ pour session token
-func (sm *SimpleMessenger) SendWithTimeout(message string, recipient string, sessionToken string, conn io.Writer, timeout time.Duration) error {
+// SendWithTimeout envoie un message avec timeout - MODIFIÉ pour type
+func (sm *SimpleMessenger) SendWithTimeout(message string, messageType string, recipient string, sessionToken string, conn io.Writer, timeout time.Duration) error {
 	done := make(chan error, 1)
 
 	go func() {
-		done <- sm.SendMessage(message, recipient, sessionToken, conn)
+		done <- sm.SendMessage(message, messageType, recipient, sessionToken, conn)
 	}()
 
 	select {
@@ -719,10 +718,11 @@ func (sm *SimpleMessenger) SendWithTimeout(message string, recipient string, ses
 	}
 }
 
-// ReceiveWithTimeout reçoit un message avec timeout - MODIFIÉ pour session token
-func (sm *SimpleMessenger) ReceiveWithTimeout(conn io.Reader, timeout time.Duration) (string, string, string, error) {
+// ReceiveWithTimeout reçoit un message avec timeout - MODIFIÉ pour type
+func (sm *SimpleMessenger) ReceiveWithTimeout(conn io.Reader, timeout time.Duration) (string, string, string, string, error) {
 	type result struct {
 		message      string
+		messageType  string
 		recipient    string
 		sessionToken string
 		err          error
@@ -731,15 +731,15 @@ func (sm *SimpleMessenger) ReceiveWithTimeout(conn io.Reader, timeout time.Durat
 	done := make(chan result, 1)
 
 	go func() {
-		msg, recipient, sessionToken, err := sm.ReceiveMessage(conn)
-		done <- result{message: msg, recipient: recipient, sessionToken: sessionToken, err: err}
+		msg, msgType, recipient, sessionToken, err := sm.ReceiveMessage(conn)
+		done <- result{message: msg, messageType: msgType, recipient: recipient, sessionToken: sessionToken, err: err}
 	}()
 
 	select {
 	case res := <-done:
-		return res.message, res.recipient, res.sessionToken, res.err
+		return res.message, res.messageType, res.recipient, res.sessionToken, res.err
 	case <-time.After(timeout):
-		return "", "", "", errors.New("receive timeout")
+		return "", "", "", "", errors.New("receive timeout")
 	}
 }
 
@@ -783,7 +783,7 @@ func (sm *SimpleMessenger) SetMaxOldKeys(max int) {
 	sm.mu.RUnlock()
 }
 
-// CreateSecureConnection fonction utilitaire pour créer une connexion complète - MODIFIÉ pour FS
+// CreateSecureConnection fonction utilitaire pour créer une connexion complète
 func CreateSecureConnection(conn io.ReadWriter, isInitiator bool) (*SimpleMessenger, error) {
 	messenger := NewSimpleMessenger(isInitiator)
 
@@ -805,7 +805,7 @@ func CreateSecureConnectionWithReconnect(connector ConnectorFunc, isInitiator bo
 	return messenger, nil
 }
 
-// CreateSecureConnectionWithFS crée une connexion avec Forward Secrecy personnalisé (NOUVEAU)
+// CreateSecureConnectionWithFS crée une connexion avec Forward Secrecy personnalisé
 func CreateSecureConnectionWithFS(conn io.ReadWriter, isInitiator bool, fsConfig *KeyRotationConfig) (*SimpleMessenger, error) {
 	messenger := NewSimpleMessenger(isInitiator)
 

@@ -17,8 +17,8 @@ type Client struct {
 	isServer  bool
 	userID    string // CHAMP POUR IDENTIFIER L'UTILISATEUR
 
-	// Callback pour les messages reçus
-	onMessage func(message, recipient, sessionToken string) // SIGNATURE MODIFIÉE
+	// Callback pour les messages reçus - SIGNATURE MODIFIÉE POUR TYPE
+	onMessage func(message, messageType, recipient, sessionToken string)
 	onError   func(error)
 
 	// Contrôle
@@ -48,11 +48,11 @@ type ClientOptions struct {
 	// Configuration Forward Secrecy
 	KeyRotation *KeyRotationConfig
 
-	// Callback pour les messages reçus (client simple) - SIGNATURE MODIFIÉE
-	OnMessage func(message, recipient, sessionToken string)
+	// Callback pour les messages reçus (client simple) - SIGNATURE MODIFIÉE POUR TYPE
+	OnMessage func(message, messageType, recipient, sessionToken string)
 
-	// Callback pour les messages reçus (serveur avec ID client) - SIGNATURE MODIFIÉE
-	OnServerMessage func(clientID, message, recipient, sessionToken string)
+	// Callback pour les messages reçus (serveur avec ID client) - SIGNATURE MODIFIÉE POUR TYPE
+	OnServerMessage func(clientID, message, messageType, recipient, sessionToken string)
 
 	// Callback pour les erreurs
 	OnError func(error)
@@ -68,9 +68,9 @@ func DefaultClientOptions() *ClientOptions {
 		SendTimeout:       5 * time.Second,
 		MessageBufferSize: 100,
 		UserID:            "anonymous",
-		KeyRotation:       DefaultKeyRotationConfig(),              // NOUVEAU
-		OnMessage:         func(string, string, string) {},         // SIGNATURE MODIFIÉE
-		OnServerMessage:   func(string, string, string, string) {}, // SIGNATURE MODIFIÉE
+		KeyRotation:       DefaultKeyRotationConfig(),
+		OnMessage:         func(string, string, string, string) {},         // SIGNATURE MODIFIÉE
+		OnServerMessage:   func(string, string, string, string, string) {}, // SIGNATURE MODIFIÉE
 		OnError:           func(error) {},
 		Debug:             false,
 	}
@@ -105,14 +105,14 @@ func NewClient(address string, opts *ClientOptions) (*Client, error) {
 		messenger: NewSimpleMessenger(true), // Client = initiateur
 		conn:      conn,
 		isServer:  false,
-		userID:    opts.UserID, // NOUVEAU CHAMP INITIALISÉ
+		userID:    opts.UserID,
 		onMessage: opts.OnMessage,
 		onError:   opts.OnError,
 		ctx:       ctx,
 		cancel:    cancel,
 	}
 
-	// NOUVEAU: Configurer Forward Secrecy avant la connexion
+	// Configurer Forward Secrecy avant la connexion
 	if opts.KeyRotation != nil {
 		client.messenger.SetKeyRotationConfig(opts.KeyRotation)
 	}
@@ -165,7 +165,7 @@ func NewServer(address string, opts *ClientOptions) (*Server, error) {
 		ctx:               ctx,
 		cancel:            cancel,
 		debug:             opts.Debug,
-		keyRotationConfig: opts.KeyRotation, // NOUVEAU
+		keyRotationConfig: opts.KeyRotation,
 	}
 
 	if opts.Debug {
@@ -181,7 +181,7 @@ type Server struct {
 	clients  map[string]*Client
 	mu       sync.RWMutex
 
-	onMessage func(clientID, message, recipient, sessionToken string) // SIGNATURE MODIFIÉE
+	onMessage func(clientID, message, messageType, recipient, sessionToken string) // SIGNATURE MODIFIÉE
 	onError   func(error)
 
 	ctx    context.Context
@@ -189,11 +189,11 @@ type Server struct {
 	wg     sync.WaitGroup
 
 	debug             bool
-	keyRotationConfig *KeyRotationConfig // NOUVEAU
+	keyRotationConfig *KeyRotationConfig
 }
 
 // SetOnMessage change le callback des messages (utile pour les tests) - SIGNATURE MODIFIÉE
-func (s *Server) SetOnMessage(fn func(string, string, string, string)) {
+func (s *Server) SetOnMessage(fn func(string, string, string, string, string)) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.onMessage = fn
@@ -245,16 +245,16 @@ func (s *Server) handleConnection(conn net.Conn) {
 		messenger: NewSimpleMessenger(false), // Serveur = répondeur
 		conn:      conn,
 		isServer:  true,
-		userID:    clientID, // UTILISER L'ID DE CONNEXION COMME USERID
-		onMessage: func(msg, recipient, sessionToken string) { // SIGNATURE MODIFIÉE
-			s.onMessage(clientID, msg, recipient, sessionToken)
+		userID:    clientID,
+		onMessage: func(msg, msgType, recipient, sessionToken string) { // SIGNATURE MODIFIÉE
+			s.onMessage(clientID, msg, msgType, recipient, sessionToken)
 		},
 		onError: s.onError,
 		ctx:     ctx,
 		cancel:  cancel,
 	}
 
-	// NOUVEAU: Configurer Forward Secrecy pour le client serveur
+	// Configurer Forward Secrecy pour le client serveur
 	if s.keyRotationConfig != nil {
 		client.messenger.SetKeyRotationConfig(s.keyRotationConfig)
 	}
@@ -291,14 +291,14 @@ func (s *Server) handleConnection(conn net.Conn) {
 	}
 }
 
-// Send envoie un message à tous les clients connectés - SIGNATURE MODIFIÉE
-func (s *Server) Send(message, recipient, sessionToken string) error {
+// Send envoie un message à tous les clients connectés - SIGNATURE MODIFIÉE POUR TYPE
+func (s *Server) Send(message, messageType, recipient, sessionToken string) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	var errors []string
 	for clientID, client := range s.clients {
-		if err := client.Send(message, recipient, sessionToken); err != nil {
+		if err := client.Send(message, messageType, recipient, sessionToken); err != nil {
 			errors = append(errors, fmt.Sprintf("%s: %v", clientID, err))
 		}
 	}
@@ -310,8 +310,8 @@ func (s *Server) Send(message, recipient, sessionToken string) error {
 	return nil
 }
 
-// SendTo envoie un message à un client spécifique - SIGNATURE MODIFIÉE
-func (s *Server) SendTo(clientID, message, recipient, sessionToken string) error {
+// SendTo envoie un message à un client spécifique - SIGNATURE MODIFIÉE POUR TYPE
+func (s *Server) SendTo(clientID, message, messageType, recipient, sessionToken string) error {
 	s.mu.RLock()
 	client, exists := s.clients[clientID]
 	s.mu.RUnlock()
@@ -320,7 +320,7 @@ func (s *Server) SendTo(clientID, message, recipient, sessionToken string) error
 		return fmt.Errorf("client %s non trouvé", clientID)
 	}
 
-	return client.Send(message, recipient, sessionToken)
+	return client.Send(message, messageType, recipient, sessionToken)
 }
 
 // GetClients retourne la liste des clients connectés
@@ -356,8 +356,8 @@ func (s *Server) Close() error {
 	return err
 }
 
-// Send envoie un message de manière synchrone - SIGNATURE MODIFIÉE
-func (c *Client) Send(message, recipient, sessionToken string) error {
+// Send envoie un message de manière synchrone - SIGNATURE MODIFIÉE POUR TYPE
+func (c *Client) Send(message, messageType, recipient, sessionToken string) error {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
@@ -365,7 +365,7 @@ func (c *Client) Send(message, recipient, sessionToken string) error {
 		return fmt.Errorf("client non connecté")
 	}
 
-	return c.messenger.SendWithTimeout(message, recipient, sessionToken, c.conn, 5*time.Second)
+	return c.messenger.SendWithTimeout(message, messageType, recipient, sessionToken, c.conn, 5*time.Second)
 }
 
 // IsConnected retourne l'état de la connexion
@@ -382,7 +382,7 @@ func (c *Client) GetUserID() string {
 	return c.userID
 }
 
-// GetKeyRotationStats retourne les statistiques de rotation des clés - NOUVEAU
+// GetKeyRotationStats retourne les statistiques de rotation des clés
 func (c *Client) GetKeyRotationStats() map[string]interface{} {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -397,7 +397,7 @@ func (c *Client) GetKeyRotationStats() map[string]interface{} {
 	return c.messenger.GetKeyRotationStats()
 }
 
-// ForceKeyRotation force une rotation des clés immédiate - NOUVEAU
+// ForceKeyRotation force une rotation des clés immédiate
 func (c *Client) ForceKeyRotation() error {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -409,7 +409,7 @@ func (c *Client) ForceKeyRotation() error {
 	return c.messenger.ForceKeyRotation()
 }
 
-// SetMaxOldKeys configure le nombre maximum d'anciennes clés à conserver - NOUVEAU
+// SetMaxOldKeys configure le nombre maximum d'anciennes clés à conserver
 func (c *Client) SetMaxOldKeys(max int) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -419,7 +419,7 @@ func (c *Client) SetMaxOldKeys(max int) {
 	}
 }
 
-// SetKeyRotationConfig configure la rotation des clés - NOUVEAU
+// SetKeyRotationConfig configure la rotation des clés
 func (c *Client) SetKeyRotationConfig(config *KeyRotationConfig) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -429,7 +429,7 @@ func (c *Client) SetKeyRotationConfig(config *KeyRotationConfig) {
 	}
 }
 
-// receiveLoop boucle de réception des messages - LOGIQUE MODIFIÉE
+// receiveLoop boucle de réception des messages - LOGIQUE MODIFIÉE POUR TYPE
 func (c *Client) receiveLoop(opts *ClientOptions) {
 	defer c.wg.Done()
 	defer func() {
@@ -443,7 +443,7 @@ func (c *Client) receiveLoop(opts *ClientOptions) {
 		case <-c.ctx.Done():
 			return
 		default:
-			message, recipient, sessionToken, err := c.messenger.ReceiveWithTimeout(c.conn, 10*time.Second) // SIGNATURE MODIFIÉE
+			message, messageType, recipient, sessionToken, err := c.messenger.ReceiveWithTimeout(c.conn, 10*time.Second) // SIGNATURE MODIFIÉE
 			if err != nil {
 				if c.ctx.Err() != nil {
 					return // Fermeture normale
@@ -458,8 +458,8 @@ func (c *Client) receiveLoop(opts *ClientOptions) {
 				return
 			}
 
-			// Appeler le callback avec le destinataire et session token
-			c.onMessage(message, recipient, sessionToken) // SIGNATURE MODIFIÉE
+			// Appeler le callback avec le type de message, destinataire et session token
+			c.onMessage(message, messageType, recipient, sessionToken) // SIGNATURE MODIFIÉE
 		}
 	}
 }
@@ -538,26 +538,26 @@ func parseAddress(address string) (network, addr string, err error) {
 	return network, addr, nil
 }
 
-// Fonctions utilitaires pour une utilisation encore plus simple - SIGNATURES MODIFIÉES
+// Fonctions utilitaires pour une utilisation encore plus simple - SIGNATURES MODIFIÉES POUR TYPE
 
-// QuickClient crée un client avec configuration minimale - SIGNATURE MODIFIÉE
-func QuickClient(address, userID string, onMessage func(string, string, string)) (*Client, error) {
+// QuickClient crée un client avec configuration minimale - SIGNATURE MODIFIÉE POUR TYPE
+func QuickClient(address, userID string, onMessage func(string, string, string, string)) (*Client, error) {
 	opts := DefaultClientOptions()
 	opts.UserID = userID
 	opts.OnMessage = onMessage
 	return NewClient(address, opts)
 }
 
-// QuickServer crée un serveur avec configuration minimale - SIGNATURE MODIFIÉE
-func QuickServer(address string, onMessage func(string, string, string, string)) (*Server, error) {
+// QuickServer crée un serveur avec configuration minimale - SIGNATURE MODIFIÉE POUR TYPE
+func QuickServer(address string, onMessage func(string, string, string, string, string)) (*Server, error) {
 	opts := DefaultClientOptions()
 	opts.OnServerMessage = onMessage
 
 	return NewServer(address, opts)
 }
 
-// QuickClientWithFS crée un client avec Forward Secrecy personnalisé - NOUVEAU
-func QuickClientWithFS(address, userID string, onMessage func(string, string, string), fsConfig *KeyRotationConfig) (*Client, error) {
+// QuickClientWithFS crée un client avec Forward Secrecy personnalisé - SIGNATURE MODIFIÉE POUR TYPE
+func QuickClientWithFS(address, userID string, onMessage func(string, string, string, string), fsConfig *KeyRotationConfig) (*Client, error) {
 	opts := DefaultClientOptions()
 	opts.UserID = userID
 	opts.OnMessage = onMessage
@@ -567,8 +567,8 @@ func QuickClientWithFS(address, userID string, onMessage func(string, string, st
 	return NewClient(address, opts)
 }
 
-// QuickServerWithFS crée un serveur avec Forward Secrecy personnalisé - NOUVEAU
-func QuickServerWithFS(address string, onMessage func(string, string, string, string), fsConfig *KeyRotationConfig) (*Server, error) {
+// QuickServerWithFS crée un serveur avec Forward Secrecy personnalisé - SIGNATURE MODIFIÉE POUR TYPE
+func QuickServerWithFS(address string, onMessage func(string, string, string, string, string), fsConfig *KeyRotationConfig) (*Server, error) {
 	opts := DefaultClientOptions()
 	opts.OnServerMessage = onMessage
 	if fsConfig != nil {
