@@ -284,7 +284,7 @@ func (sm *SimpleMessenger) sendPing() error {
 	sm.mu.Unlock()
 
 	pingMsg := fmt.Sprintf("PING:%d", time.Now().UnixNano())
-	err := sm.SendMessage(pingMsg, conn.(io.Writer))
+	err := sm.SendMessage(pingMsg, "system", conn.(io.Writer)) // RECIPIENT AJOUTÉ
 	if err == nil {
 		sm.mu.Lock()
 		sm.lastPing = time.Now()
@@ -429,8 +429,8 @@ func (sm *SimpleMessenger) decompressMessage(data []byte, compressed bool) ([]by
 	return data, nil
 }
 
-// SendMessage envoie un message sécurisé avec compression
-func (sm *SimpleMessenger) SendMessage(message string, conn io.Writer) error {
+// SendMessage envoie un message sécurisé avec compression - SIGNATURE MODIFIÉE
+func (sm *SimpleMessenger) SendMessage(message string, recipient string, conn io.Writer) error {
 	sm.mu.RLock()
 	if !sm.isConnected || sm.channel == nil {
 		sm.mu.RUnlock()
@@ -462,8 +462,8 @@ func (sm *SimpleMessenger) SendMessage(message string, conn io.Writer) error {
 		return fmt.Errorf("serialization failed: %w", err)
 	}
 
-	// Envoyer via le canal sécurisé
-	err = channel.SendMessage(finalData, conn)
+	// Envoyer via le canal sécurisé - RECIPIENT AJOUTÉ
+	err = channel.SendMessage(finalData, recipient, conn)
 
 	if err == nil {
 		// Mettre à jour les statistiques
@@ -476,45 +476,45 @@ func (sm *SimpleMessenger) SendMessage(message string, conn io.Writer) error {
 	return err
 }
 
-// ReceiveMessage reçoit un message sécurisé avec décompression
-func (sm *SimpleMessenger) ReceiveMessage(conn io.Reader) (string, error) {
+// ReceiveMessage reçoit un message sécurisé avec décompression - SIGNATURE MODIFIÉE
+func (sm *SimpleMessenger) ReceiveMessage(conn io.Reader) (string, string, error) {
 	sm.mu.RLock()
 	if !sm.isConnected || sm.channel == nil {
 		sm.mu.RUnlock()
-		return "", ErrNotConnected
+		return "", "", ErrNotConnected
 	}
 
 	channel := sm.channel
 	sm.mu.RUnlock()
 
-	// Recevoir via le canal sécurisé
-	finalData, err := channel.ReceiveMessage(conn)
+	// Recevoir via le canal sécurisé - RECIPIENT RÉCUPÉRÉ
+	finalData, recipient, err := channel.ReceiveMessage(conn)
 	if err != nil {
 		// Vérifier si c'est un ping
 		if err.Error() == "receive timeout" {
-			return "", err
+			return "", "", err
 		}
-		return "", err
+		return "", "", err
 	}
 
 	// Désérialiser métadonnées + données
 	messageBytes, metadata, err := sm.deserializeWithMetadata(finalData)
 	if err != nil {
-		return "", fmt.Errorf("deserialization failed: %w", err)
+		return "", "", fmt.Errorf("deserialization failed: %w", err)
 	}
 
 	// Décompression si nécessaire
 	isCompressed, _ := metadata["compressed"].(bool)
 	decompressedData, err := sm.decompressMessage(messageBytes, isCompressed)
 	if err != nil {
-		return "", fmt.Errorf("decompression failed: %w", err)
+		return "", "", fmt.Errorf("decompression failed: %w", err)
 	}
 
 	message := string(decompressedData)
 
 	// Gérer les messages de keep-alive
 	if sm.isKeepAliveMessage(message) {
-		sm.handleKeepAliveMessage(message)
+		sm.handleKeepAliveMessage(message, recipient)
 		// Recevoir le message suivant
 		return sm.ReceiveMessage(conn)
 	}
@@ -525,7 +525,7 @@ func (sm *SimpleMessenger) ReceiveMessage(conn io.Reader) (string, error) {
 	sm.bytesReceived += uint64(len(decompressedData))
 	sm.mu.Unlock()
 
-	return message, nil
+	return message, recipient, nil // RETOURNE AUSSI LE RECIPIENT
 }
 
 // isKeepAliveMessage vérifie si c'est un message de keep-alive
@@ -533,13 +533,13 @@ func (sm *SimpleMessenger) isKeepAliveMessage(message string) bool {
 	return len(message) > 5 && (message[:5] == "PING:" || message[:5] == "PONG:")
 }
 
-// handleKeepAliveMessage traite les messages de keep-alive
-func (sm *SimpleMessenger) handleKeepAliveMessage(message string) {
+// handleKeepAliveMessage traite les messages de keep-alive - SIGNATURE MODIFIÉE
+func (sm *SimpleMessenger) handleKeepAliveMessage(message string, recipient string) {
 	if len(message) > 5 && message[:5] == "PING:" {
 		// Répondre au ping
 		pongMsg := "PONG:" + message[5:]
 		if sm.conn != nil {
-			sm.SendMessage(pongMsg, sm.conn.(io.Writer))
+			sm.SendMessage(pongMsg, "system", sm.conn.(io.Writer)) // RECIPIENT AJOUTÉ
 		}
 	} else if len(message) > 5 && message[:5] == "PONG:" {
 		// Marquer le pong reçu
@@ -673,12 +673,12 @@ func (sm *SimpleMessenger) GetStats() map[string]interface{} {
 	return stats
 }
 
-// SendWithTimeout envoie un message avec timeout (inchangé)
-func (sm *SimpleMessenger) SendWithTimeout(message string, conn io.Writer, timeout time.Duration) error {
+// SendWithTimeout envoie un message avec timeout - SIGNATURE MODIFIÉE
+func (sm *SimpleMessenger) SendWithTimeout(message string, recipient string, conn io.Writer, timeout time.Duration) error {
 	done := make(chan error, 1)
 
 	go func() {
-		done <- sm.SendMessage(message, conn)
+		done <- sm.SendMessage(message, recipient, conn)
 	}()
 
 	select {
@@ -689,29 +689,30 @@ func (sm *SimpleMessenger) SendWithTimeout(message string, conn io.Writer, timeo
 	}
 }
 
-// ReceiveWithTimeout reçoit un message avec timeout (inchangé)
-func (sm *SimpleMessenger) ReceiveWithTimeout(conn io.Reader, timeout time.Duration) (string, error) {
+// ReceiveWithTimeout reçoit un message avec timeout - SIGNATURE MODIFIÉE
+func (sm *SimpleMessenger) ReceiveWithTimeout(conn io.Reader, timeout time.Duration) (string, string, error) {
 	type result struct {
-		message string
-		err     error
+		message   string
+		recipient string
+		err       error
 	}
 
 	done := make(chan result, 1)
 
 	go func() {
-		msg, err := sm.ReceiveMessage(conn)
-		done <- result{message: msg, err: err}
+		msg, recipient, err := sm.ReceiveMessage(conn)
+		done <- result{message: msg, recipient: recipient, err: err}
 	}()
 
 	select {
 	case res := <-done:
-		return res.message, res.err
+		return res.message, res.recipient, res.err
 	case <-time.After(timeout):
-		return "", errors.New("receive timeout")
+		return "", "", errors.New("receive timeout")
 	}
 }
 
-// CreateSecureConnection fonction utilitaire pour créer une connexion complète (modifiée)
+// CreateSecureConnection fonction utilitaire pour créer une connexion complète (inchangée)
 func CreateSecureConnection(conn io.ReadWriter, isInitiator bool) (*SimpleMessenger, error) {
 	messenger := NewSimpleMessenger(isInitiator)
 

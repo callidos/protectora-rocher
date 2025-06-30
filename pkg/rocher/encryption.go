@@ -32,8 +32,9 @@ var (
 type Message struct {
 	ID        string `json:"id"`
 	Timestamp int64  `json:"timestamp"`
-	Data      []byte `json:"data"`  // Données chiffrées
-	Nonce     []byte `json:"nonce"` // Nonce pour le chiffrement
+	Recipient string `json:"recipient"` // NOUVEAU CHAMP AJOUTÉ
+	Data      []byte `json:"data"`      // Données chiffrées
+	Nonce     []byte `json:"nonce"`     // Nonce pour le chiffrement
 }
 
 // SecureChannel gère le chiffrement/déchiffrement des messages
@@ -99,7 +100,7 @@ func (sc *SecureChannel) deriveKeys(secret []byte, isInitiator bool) error {
 }
 
 // EncryptMessage chiffre un message avec NaCl secretbox
-func (sc *SecureChannel) EncryptMessage(plaintext []byte) (*Message, error) {
+func (sc *SecureChannel) EncryptMessage(plaintext []byte, recipient string) (*Message, error) {
 	if len(plaintext) == 0 {
 		return nil, ErrEmptyMessage
 	}
@@ -120,6 +121,7 @@ func (sc *SecureChannel) EncryptMessage(plaintext []byte) (*Message, error) {
 	message := &Message{
 		ID:        generateMessageID(),
 		Timestamp: time.Now().Unix(),
+		Recipient: recipient, // NOUVEAU CHAMP UTILISÉ
 		Data:      encrypted,
 		Nonce:     nonce[:],
 	}
@@ -155,9 +157,9 @@ func (sc *SecureChannel) DecryptMessage(msg *Message) ([]byte, error) {
 }
 
 // SendMessage sérialise et envoie un message chiffré
-func (sc *SecureChannel) SendMessage(plaintext []byte, writer io.Writer) error {
+func (sc *SecureChannel) SendMessage(plaintext []byte, recipient string, writer io.Writer) error {
 	// Chiffrer le message
-	msg, err := sc.EncryptMessage(plaintext)
+	msg, err := sc.EncryptMessage(plaintext, recipient)
 	if err != nil {
 		return fmt.Errorf("encryption failed: %w", err)
 	}
@@ -187,46 +189,46 @@ func (sc *SecureChannel) SendMessage(plaintext []byte, writer io.Writer) error {
 }
 
 // ReceiveMessage reçoit et déchiffre un message
-func (sc *SecureChannel) ReceiveMessage(reader io.Reader) ([]byte, error) {
+func (sc *SecureChannel) ReceiveMessage(reader io.Reader) ([]byte, string, error) {
 	// Lire la taille du message
 	var size uint32
 	if err := binary.Read(reader, binary.BigEndian, &size); err != nil {
-		return nil, fmt.Errorf("failed to read size: %w", err)
+		return nil, "", fmt.Errorf("failed to read size: %w", err)
 	}
 
 	// Vérifier la taille
 	if size == 0 {
-		return nil, ErrEmptyMessage
+		return nil, "", ErrEmptyMessage
 	}
 
 	if size > MaxMsgSize*2 { // Marge pour les métadonnées JSON
-		return nil, fmt.Errorf("message too large: %d bytes", size)
+		return nil, "", fmt.Errorf("message too large: %d bytes", size)
 	}
 
 	// Lire les données
 	data := make([]byte, size)
 	if _, err := io.ReadFull(reader, data); err != nil {
-		return nil, fmt.Errorf("failed to read data: %w", err)
+		return nil, "", fmt.Errorf("failed to read data: %w", err)
 	}
 
 	// Désérialiser le message
 	var msg Message
 	if err := json.Unmarshal(data, &msg); err != nil {
-		return nil, fmt.Errorf("deserialization failed: %w", err)
+		return nil, "", fmt.Errorf("deserialization failed: %w", err)
 	}
 
 	// Valider le message avant déchiffrement
 	if err := ValidateMessage(&msg); err != nil {
-		return nil, fmt.Errorf("invalid message: %w", err)
+		return nil, "", fmt.Errorf("invalid message: %w", err)
 	}
 
 	// Déchiffrer le message
 	plaintext, err := sc.DecryptMessage(&msg)
 	if err != nil {
-		return nil, fmt.Errorf("decryption failed: %w", err)
+		return nil, "", fmt.Errorf("decryption failed: %w", err)
 	}
 
-	return plaintext, nil
+	return plaintext, msg.Recipient, nil // RETOURNE AUSSI LE DESTINATAIRE
 }
 
 // Close nettoie le canal sécurisé
@@ -239,7 +241,7 @@ func (sc *SecureChannel) Close() {
 // GetOverhead retourne la taille de l'overhead par message
 func (sc *SecureChannel) GetOverhead() int {
 	// secretbox.Overhead + nonce + métadonnées JSON approximatives
-	return secretbox.Overhead + NonceSize + 100
+	return secretbox.Overhead + NonceSize + 120 // Augmenté pour le champ recipient
 }
 
 // ValidateMessage valide qu'un message est bien formé
@@ -254,6 +256,11 @@ func ValidateMessage(msg *Message) error {
 
 	if msg.Timestamp == 0 {
 		return errors.New("invalid timestamp")
+	}
+
+	// Validation du destinataire - NOUVELLE VALIDATION
+	if msg.Recipient == "" {
+		return errors.New("empty recipient")
 	}
 
 	// Vérifier que le timestamp n'est pas trop ancien ou futur
