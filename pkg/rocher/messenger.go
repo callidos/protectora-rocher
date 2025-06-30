@@ -2,6 +2,8 @@
 package rocher
 
 import (
+	"bytes"
+	"compress/gzip"
 	"errors"
 	"fmt"
 	"io"
@@ -13,11 +15,79 @@ var (
 	ErrNotConnected     = errors.New("not connected")
 	ErrAlreadyConnected = errors.New("already connected")
 	ErrConnectionFailed = errors.New("connection failed")
+	ErrReconnecting     = errors.New("reconnection in progress")
 )
 
-// SimpleMessenger combine l'échange de clés Kyber et le chiffrement NaCl
+// CompressionType définit les algorithmes de compression supportés
+type CompressionType int
+
+const (
+	NoCompression CompressionType = iota
+	GzipCompression
+)
+
+// ReconnectPolicy configure la politique de reconnexion
+type ReconnectPolicy struct {
+	MaxAttempts  int           // Nombre max de tentatives (-1 = infini)
+	InitialDelay time.Duration // Délai initial
+	MaxDelay     time.Duration // Délai maximum
+	Multiplier   float64       // Facteur d'augmentation du délai
+	Enabled      bool          // Activer la reconnexion auto
+}
+
+// DefaultReconnectPolicy retourne une politique par défaut
+func DefaultReconnectPolicy() *ReconnectPolicy {
+	return &ReconnectPolicy{
+		MaxAttempts:  5,
+		InitialDelay: 1 * time.Second,
+		MaxDelay:     30 * time.Second,
+		Multiplier:   2.0,
+		Enabled:      true,
+	}
+}
+
+// KeepAliveConfig configure le heartbeat
+type KeepAliveConfig struct {
+	Interval  time.Duration // Intervalle entre les pings
+	Timeout   time.Duration // Timeout pour la réponse
+	MaxMissed int           // Nombre max de pings ratés
+	Enabled   bool          // Activer le keep-alive
+}
+
+// DefaultKeepAliveConfig retourne une configuration par défaut
+func DefaultKeepAliveConfig() *KeepAliveConfig {
+	return &KeepAliveConfig{
+		Interval:  30 * time.Second,
+		Timeout:   10 * time.Second,
+		MaxMissed: 3,
+		Enabled:   true,
+	}
+}
+
+// CompressionConfig configure la compression
+type CompressionConfig struct {
+	Type      CompressionType // Algorithme de compression
+	Threshold int             // Taille min pour compresser (bytes)
+	Level     int             // Niveau de compression (1-9 pour gzip)
+	Enabled   bool            // Activer la compression
+}
+
+// DefaultCompressionConfig retourne une configuration par défaut
+func DefaultCompressionConfig() *CompressionConfig {
+	return &CompressionConfig{
+		Type:      GzipCompression,
+		Threshold: 1024, // Compresser si > 1KB
+		Level:     6,    // Compression moyenne
+		Enabled:   true,
+	}
+}
+
+// ConnectorFunc type pour la fonction de connexion
+type ConnectorFunc func() (io.ReadWriter, error)
+
+// SimpleMessenger combine l'échange de clés Kyber et le chiffrement NaCl avec fonctionnalités avancées
 type SimpleMessenger struct {
-	// Composants
+	// Composants de base
 	keyExchange *KyberKeyExchange
 	channel     *SecureChannel
 
@@ -26,23 +96,76 @@ type SimpleMessenger struct {
 	isConnected bool
 	startTime   time.Time
 
+	// Connexion
+	connector ConnectorFunc // Fonction pour se reconnecter
+	conn      io.ReadWriter
+
+	// Configurations
+	reconnectPolicy   *ReconnectPolicy
+	keepAliveConfig   *KeepAliveConfig
+	compressionConfig *CompressionConfig
+
+	// État de reconnexion
+	isReconnecting  bool
+	reconnectCount  int
+	lastConnectTime time.Time
+
+	// Keep-alive
+	lastPing    time.Time
+	lastPong    time.Time
+	missedPings int
+	pingTicker  *time.Ticker
+	stopPing    chan struct{}
+
 	// Statistiques
-	messagesSent     uint64
-	messagesReceived uint64
-	bytesSent        uint64
-	bytesReceived    uint64
+	messagesSent      uint64
+	messagesReceived  uint64
+	bytesSent         uint64
+	bytesReceived     uint64
+	reconnectAttempts uint64
+	compressionSaved  uint64
 
 	// Thread safety
 	mu sync.RWMutex
+
+	// Contrôle des goroutines
+	stopChan chan struct{}
+	wg       sync.WaitGroup
 }
 
-// NewSimpleMessenger crée un nouveau messenger
+// NewSimpleMessenger crée un nouveau messenger avec configurations par défaut
 func NewSimpleMessenger(isInitiator bool) *SimpleMessenger {
 	return &SimpleMessenger{
-		keyExchange: NewKyberKeyExchange(),
-		isInitiator: isInitiator,
-		startTime:   time.Now(),
+		keyExchange:       NewKyberKeyExchange(),
+		isInitiator:       isInitiator,
+		startTime:         time.Now(),
+		reconnectPolicy:   DefaultReconnectPolicy(),
+		keepAliveConfig:   DefaultKeepAliveConfig(),
+		compressionConfig: DefaultCompressionConfig(),
+		stopChan:          make(chan struct{}),
+		stopPing:          make(chan struct{}),
 	}
+}
+
+// SetReconnectPolicy configure la politique de reconnexion
+func (sm *SimpleMessenger) SetReconnectPolicy(policy *ReconnectPolicy) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.reconnectPolicy = policy
+}
+
+// SetKeepAliveConfig configure le heartbeat
+func (sm *SimpleMessenger) SetKeepAliveConfig(config *KeepAliveConfig) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.keepAliveConfig = config
+}
+
+// SetCompressionConfig configure la compression
+func (sm *SimpleMessenger) SetCompressionConfig(config *CompressionConfig) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.compressionConfig = config
 }
 
 // Connect établit une connexion sécurisée avec échange de clés Kyber
@@ -53,6 +176,40 @@ func (sm *SimpleMessenger) Connect(conn io.ReadWriter) error {
 	if sm.isConnected {
 		return ErrAlreadyConnected
 	}
+
+	if sm.isReconnecting {
+		return ErrReconnecting
+	}
+
+	return sm.connectInternal(conn)
+}
+
+// ConnectWithReconnect établit une connexion avec support de reconnexion automatique
+func (sm *SimpleMessenger) ConnectWithReconnect(connector ConnectorFunc) error {
+	sm.mu.Lock()
+	sm.connector = connector
+	sm.mu.Unlock()
+
+	// Première connexion
+	conn, err := connector()
+	if err != nil {
+		return fmt.Errorf("initial connection failed: %w", err)
+	}
+
+	if err := sm.Connect(conn); err != nil {
+		return err
+	}
+
+	// Démarrer les services
+	sm.startServices()
+
+	return nil
+}
+
+// connectInternal effectue la connexion sans verrouillage (appelé avec mutex acquis)
+func (sm *SimpleMessenger) connectInternal(conn io.ReadWriter) error {
+	sm.conn = conn
+	sm.lastConnectTime = time.Now()
 
 	// Effectuer l'échange de clés Kyber768
 	sharedSecret, err := sm.keyExchange.PerformKeyExchange(conn, sm.isInitiator)
@@ -72,10 +229,207 @@ func (sm *SimpleMessenger) Connect(conn io.ReadWriter) error {
 	secureZeroMemory(sharedSecret)
 
 	sm.isConnected = true
+	sm.isReconnecting = false
+	sm.reconnectCount = 0
+
 	return nil
 }
 
-// SendMessage envoie un message sécurisé
+// startServices démarre les services (keep-alive, etc.)
+func (sm *SimpleMessenger) startServices() {
+	if sm.keepAliveConfig.Enabled {
+		sm.startKeepAlive()
+	}
+}
+
+// startKeepAlive démarre le service de heartbeat
+func (sm *SimpleMessenger) startKeepAlive() {
+	sm.mu.Lock()
+	if sm.pingTicker != nil {
+		sm.pingTicker.Stop()
+	}
+	sm.pingTicker = time.NewTicker(sm.keepAliveConfig.Interval)
+	sm.mu.Unlock()
+
+	sm.wg.Add(1)
+	go sm.keepAliveLoop()
+}
+
+// keepAliveLoop boucle principale du keep-alive
+func (sm *SimpleMessenger) keepAliveLoop() {
+	defer sm.wg.Done()
+
+	for {
+		select {
+		case <-sm.stopChan:
+			return
+		case <-sm.stopPing:
+			return
+		case <-sm.pingTicker.C:
+			if err := sm.sendPing(); err != nil {
+				sm.handleKeepAliveFailure()
+			}
+		}
+	}
+}
+
+// sendPing envoie un message de ping
+func (sm *SimpleMessenger) sendPing() error {
+	sm.mu.Lock()
+	if !sm.isConnected {
+		sm.mu.Unlock()
+		return ErrNotConnected
+	}
+	conn := sm.conn
+	sm.mu.Unlock()
+
+	pingMsg := fmt.Sprintf("PING:%d", time.Now().UnixNano())
+	err := sm.SendMessage(pingMsg, conn.(io.Writer))
+	if err == nil {
+		sm.mu.Lock()
+		sm.lastPing = time.Now()
+		sm.mu.Unlock()
+	}
+
+	return err
+}
+
+// handleKeepAliveFailure gère les échecs de keep-alive
+func (sm *SimpleMessenger) handleKeepAliveFailure() {
+	sm.mu.Lock()
+	sm.missedPings++
+	maxMissed := sm.keepAliveConfig.MaxMissed
+	sm.mu.Unlock()
+
+	if sm.missedPings >= maxMissed {
+		sm.triggerReconnect()
+	}
+}
+
+// triggerReconnect déclenche une reconnexion
+func (sm *SimpleMessenger) triggerReconnect() {
+	sm.mu.Lock()
+	if sm.isReconnecting || !sm.reconnectPolicy.Enabled || sm.connector == nil {
+		sm.mu.Unlock()
+		return
+	}
+
+	sm.isReconnecting = true
+	sm.isConnected = false
+	sm.mu.Unlock()
+
+	sm.wg.Add(1)
+	go sm.reconnectLoop()
+}
+
+// reconnectLoop boucle de reconnexion avec backoff exponentiel
+func (sm *SimpleMessenger) reconnectLoop() {
+	defer sm.wg.Done()
+
+	delay := sm.reconnectPolicy.InitialDelay
+
+	for attempt := 1; attempt <= sm.reconnectPolicy.MaxAttempts || sm.reconnectPolicy.MaxAttempts == -1; attempt++ {
+		select {
+		case <-sm.stopChan:
+			return
+		case <-time.After(delay):
+			// Tentative de reconnexion
+			conn, err := sm.connector()
+			if err == nil {
+				sm.mu.Lock()
+				err = sm.connectInternal(conn)
+				sm.mu.Unlock()
+
+				if err == nil {
+					sm.mu.Lock()
+					sm.reconnectAttempts++
+					sm.missedPings = 0
+					sm.mu.Unlock()
+
+					sm.startServices()
+					return // Reconnexion réussie
+				}
+			}
+
+			// Augmenter le délai avec backoff exponentiel
+			delay = time.Duration(float64(delay) * sm.reconnectPolicy.Multiplier)
+			if delay > sm.reconnectPolicy.MaxDelay {
+				delay = sm.reconnectPolicy.MaxDelay
+			}
+
+			sm.mu.Lock()
+			sm.reconnectCount++
+			sm.mu.Unlock()
+		}
+	}
+
+	// Échec de toutes les tentatives
+	sm.mu.Lock()
+	sm.isReconnecting = false
+	sm.mu.Unlock()
+}
+
+// compressMessage compresse un message si nécessaire
+func (sm *SimpleMessenger) compressMessage(data []byte) ([]byte, bool, error) {
+	if !sm.compressionConfig.Enabled || len(data) < sm.compressionConfig.Threshold {
+		return data, false, nil
+	}
+
+	switch sm.compressionConfig.Type {
+	case GzipCompression:
+		var buf bytes.Buffer
+		writer, err := gzip.NewWriterLevel(&buf, sm.compressionConfig.Level)
+		if err != nil {
+			return data, false, err
+		}
+
+		if _, err := writer.Write(data); err != nil {
+			writer.Close()
+			return data, false, err
+		}
+
+		if err := writer.Close(); err != nil {
+			return data, false, err
+		}
+
+		compressed := buf.Bytes()
+		if len(compressed) < len(data) {
+			sm.mu.Lock()
+			sm.compressionSaved += uint64(len(data) - len(compressed))
+			sm.mu.Unlock()
+			return compressed, true, nil
+		}
+	}
+
+	return data, false, nil
+}
+
+// decompressMessage décompresse un message si nécessaire
+func (sm *SimpleMessenger) decompressMessage(data []byte, compressed bool) ([]byte, error) {
+	if !compressed {
+		return data, nil
+	}
+
+	switch sm.compressionConfig.Type {
+	case GzipCompression:
+		reader, err := gzip.NewReader(bytes.NewReader(data))
+		if err != nil {
+			return nil, err
+		}
+		defer reader.Close()
+
+		var buf bytes.Buffer
+		if _, err := io.Copy(&buf, reader); err != nil {
+			return nil, err
+		}
+
+		return buf.Bytes(), nil
+	}
+
+	return data, nil
+}
+
+// SendMessage envoie un message sécurisé avec compression
 func (sm *SimpleMessenger) SendMessage(message string, conn io.Writer) error {
 	sm.mu.RLock()
 	if !sm.isConnected || sm.channel == nil {
@@ -86,22 +440,43 @@ func (sm *SimpleMessenger) SendMessage(message string, conn io.Writer) error {
 	channel := sm.channel
 	sm.mu.RUnlock()
 
-	// Envoyer le message
+	// Préparer les données
 	messageBytes := []byte(message)
-	err := channel.SendMessage(messageBytes, conn)
+	originalSize := len(messageBytes)
+
+	// Compression si activée
+	compressedData, isCompressed, err := sm.compressMessage(messageBytes)
+	if err != nil {
+		return fmt.Errorf("compression failed: %w", err)
+	}
+
+	// Créer un message avec métadonnées
+	metadata := map[string]interface{}{
+		"compressed":    isCompressed,
+		"original_size": originalSize,
+	}
+
+	// Sérialiser métadonnées + données
+	finalData, err := sm.serializeWithMetadata(compressedData, metadata)
+	if err != nil {
+		return fmt.Errorf("serialization failed: %w", err)
+	}
+
+	// Envoyer via le canal sécurisé
+	err = channel.SendMessage(finalData, conn)
 
 	if err == nil {
 		// Mettre à jour les statistiques
 		sm.mu.Lock()
 		sm.messagesSent++
-		sm.bytesSent += uint64(len(messageBytes))
+		sm.bytesSent += uint64(originalSize)
 		sm.mu.Unlock()
 	}
 
 	return err
 }
 
-// ReceiveMessage reçoit un message sécurisé
+// ReceiveMessage reçoit un message sécurisé avec décompression
 func (sm *SimpleMessenger) ReceiveMessage(conn io.Reader) (string, error) {
 	sm.mu.RLock()
 	if !sm.isConnected || sm.channel == nil {
@@ -112,19 +487,98 @@ func (sm *SimpleMessenger) ReceiveMessage(conn io.Reader) (string, error) {
 	channel := sm.channel
 	sm.mu.RUnlock()
 
-	// Recevoir le message
-	messageBytes, err := channel.ReceiveMessage(conn)
+	// Recevoir via le canal sécurisé
+	finalData, err := channel.ReceiveMessage(conn)
 	if err != nil {
+		// Vérifier si c'est un ping
+		if err.Error() == "receive timeout" {
+			return "", err
+		}
 		return "", err
+	}
+
+	// Désérialiser métadonnées + données
+	messageBytes, metadata, err := sm.deserializeWithMetadata(finalData)
+	if err != nil {
+		return "", fmt.Errorf("deserialization failed: %w", err)
+	}
+
+	// Décompression si nécessaire
+	isCompressed, _ := metadata["compressed"].(bool)
+	decompressedData, err := sm.decompressMessage(messageBytes, isCompressed)
+	if err != nil {
+		return "", fmt.Errorf("decompression failed: %w", err)
+	}
+
+	message := string(decompressedData)
+
+	// Gérer les messages de keep-alive
+	if sm.isKeepAliveMessage(message) {
+		sm.handleKeepAliveMessage(message)
+		// Recevoir le message suivant
+		return sm.ReceiveMessage(conn)
 	}
 
 	// Mettre à jour les statistiques
 	sm.mu.Lock()
 	sm.messagesReceived++
-	sm.bytesReceived += uint64(len(messageBytes))
+	sm.bytesReceived += uint64(len(decompressedData))
 	sm.mu.Unlock()
 
-	return string(messageBytes), nil
+	return message, nil
+}
+
+// isKeepAliveMessage vérifie si c'est un message de keep-alive
+func (sm *SimpleMessenger) isKeepAliveMessage(message string) bool {
+	return len(message) > 5 && (message[:5] == "PING:" || message[:5] == "PONG:")
+}
+
+// handleKeepAliveMessage traite les messages de keep-alive
+func (sm *SimpleMessenger) handleKeepAliveMessage(message string) {
+	if len(message) > 5 && message[:5] == "PING:" {
+		// Répondre au ping
+		pongMsg := "PONG:" + message[5:]
+		if sm.conn != nil {
+			sm.SendMessage(pongMsg, sm.conn.(io.Writer))
+		}
+	} else if len(message) > 5 && message[:5] == "PONG:" {
+		// Marquer le pong reçu
+		sm.mu.Lock()
+		sm.lastPong = time.Now()
+		sm.missedPings = 0
+		sm.mu.Unlock()
+	}
+}
+
+// serializeWithMetadata sérialise données + métadonnées
+func (sm *SimpleMessenger) serializeWithMetadata(data []byte, metadata map[string]interface{}) ([]byte, error) {
+	// Format simple: [1 byte flags][data]
+	flags := byte(0)
+	if compressed, ok := metadata["compressed"].(bool); ok && compressed {
+		flags |= 0x01
+	}
+
+	result := make([]byte, 1+len(data))
+	result[0] = flags
+	copy(result[1:], data)
+
+	return result, nil
+}
+
+// deserializeWithMetadata désérialise données + métadonnées
+func (sm *SimpleMessenger) deserializeWithMetadata(data []byte) ([]byte, map[string]interface{}, error) {
+	if len(data) < 1 {
+		return nil, nil, errors.New("invalid data format")
+	}
+
+	flags := data[0]
+	messageData := data[1:]
+
+	metadata := map[string]interface{}{
+		"compressed": (flags & 0x01) != 0,
+	}
+
+	return messageData, metadata, nil
 }
 
 // IsConnected retourne l'état de la connexion
@@ -134,13 +588,28 @@ func (sm *SimpleMessenger) IsConnected() bool {
 	return sm.isConnected
 }
 
+// IsReconnecting retourne l'état de reconnexion
+func (sm *SimpleMessenger) IsReconnecting() bool {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return sm.isReconnecting
+}
+
 // Close ferme la connexion et nettoie les ressources
 func (sm *SimpleMessenger) Close() error {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
-	if !sm.isConnected {
+	if !sm.isConnected && !sm.isReconnecting {
 		return nil
+	}
+
+	// Arrêter tous les services
+	close(sm.stopChan)
+	close(sm.stopPing)
+
+	if sm.pingTicker != nil {
+		sm.pingTicker.Stop()
 	}
 
 	if sm.channel != nil {
@@ -149,27 +618,47 @@ func (sm *SimpleMessenger) Close() error {
 	}
 
 	sm.isConnected = false
+	sm.isReconnecting = false
+
+	// Attendre que toutes les goroutines se terminent
+	sm.mu.Unlock()
+	sm.wg.Wait()
+	sm.mu.Lock()
+
 	return nil
 }
 
-// GetStats retourne les statistiques du messenger
+// GetStats retourne les statistiques du messenger avec nouvelles métriques
 func (sm *SimpleMessenger) GetStats() map[string]interface{} {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
 
 	stats := map[string]interface{}{
-		"is_initiator":      sm.isInitiator,
-		"is_connected":      sm.isConnected,
-		"start_time":        sm.startTime,
-		"uptime":            time.Since(sm.startTime),
-		"messages_sent":     sm.messagesSent,
-		"messages_received": sm.messagesReceived,
-		"bytes_sent":        sm.bytesSent,
-		"bytes_received":    sm.bytesReceived,
+		"is_initiator":       sm.isInitiator,
+		"is_connected":       sm.isConnected,
+		"is_reconnecting":    sm.isReconnecting,
+		"start_time":         sm.startTime,
+		"uptime":             time.Since(sm.startTime),
+		"last_connect_time":  sm.lastConnectTime,
+		"messages_sent":      sm.messagesSent,
+		"messages_received":  sm.messagesReceived,
+		"bytes_sent":         sm.bytesSent,
+		"bytes_received":     sm.bytesReceived,
+		"reconnect_attempts": sm.reconnectAttempts,
+		"reconnect_count":    sm.reconnectCount,
+		"compression_saved":  sm.compressionSaved,
+		"missed_pings":       sm.missedPings,
+		"last_ping":          sm.lastPing,
+		"last_pong":          sm.lastPong,
 		"algorithms": map[string]string{
 			"key_exchange": "Kyber768",
 			"encryption":   "NaCl-secretbox",
 			"kdf":          "HKDF-SHA256",
+		},
+		"features": map[string]bool{
+			"reconnect_enabled":   sm.reconnectPolicy.Enabled,
+			"keepalive_enabled":   sm.keepAliveConfig.Enabled,
+			"compression_enabled": sm.compressionConfig.Enabled,
 		},
 	}
 
@@ -184,7 +673,7 @@ func (sm *SimpleMessenger) GetStats() map[string]interface{} {
 	return stats
 }
 
-// SendWithTimeout envoie un message avec timeout
+// SendWithTimeout envoie un message avec timeout (inchangé)
 func (sm *SimpleMessenger) SendWithTimeout(message string, conn io.Writer, timeout time.Duration) error {
 	done := make(chan error, 1)
 
@@ -200,7 +689,7 @@ func (sm *SimpleMessenger) SendWithTimeout(message string, conn io.Writer, timeo
 	}
 }
 
-// ReceiveWithTimeout reçoit un message avec timeout
+// ReceiveWithTimeout reçoit un message avec timeout (inchangé)
 func (sm *SimpleMessenger) ReceiveWithTimeout(conn io.Reader, timeout time.Duration) (string, error) {
 	type result struct {
 		message string
@@ -222,7 +711,7 @@ func (sm *SimpleMessenger) ReceiveWithTimeout(conn io.Reader, timeout time.Durat
 	}
 }
 
-// CreateSecureConnection fonction utilitaire pour créer une connexion complète
+// CreateSecureConnection fonction utilitaire pour créer une connexion complète (modifiée)
 func CreateSecureConnection(conn io.ReadWriter, isInitiator bool) (*SimpleMessenger, error) {
 	messenger := NewSimpleMessenger(isInitiator)
 
@@ -233,148 +722,13 @@ func CreateSecureConnection(conn io.ReadWriter, isInitiator bool) (*SimpleMessen
 	return messenger, nil
 }
 
-// SecureChat structure pour un chat simple entre deux parties
-type SecureChat struct {
-	messenger *SimpleMessenger
-	conn      io.ReadWriter
-	username  string
+// CreateSecureConnectionWithReconnect crée une connexion avec support de reconnexion
+func CreateSecureConnectionWithReconnect(connector ConnectorFunc, isInitiator bool) (*SimpleMessenger, error) {
+	messenger := NewSimpleMessenger(isInitiator)
 
-	// Canaux pour les messages
-	incomingMessages chan string
-	outgoingMessages chan string
-	errors           chan error
-
-	// Contrôle
-	stopChan chan struct{}
-	stopped  bool
-	mu       sync.RWMutex
-}
-
-// NewSecureChat crée un nouveau chat sécurisé
-func NewSecureChat(conn io.ReadWriter, isInitiator bool, username string) (*SecureChat, error) {
-	messenger, err := CreateSecureConnection(conn, isInitiator)
-	if err != nil {
-		return nil, err
+	if err := messenger.ConnectWithReconnect(connector); err != nil {
+		return nil, fmt.Errorf("failed to establish secure connection with reconnect: %w", err)
 	}
 
-	chat := &SecureChat{
-		messenger:        messenger,
-		conn:             conn,
-		username:         username,
-		incomingMessages: make(chan string, 10),
-		outgoingMessages: make(chan string, 10),
-		errors:           make(chan error, 10),
-		stopChan:         make(chan struct{}),
-	}
-
-	// Démarrer les goroutines de gestion des messages
-	go chat.receiveLoop()
-	go chat.sendLoop()
-
-	return chat, nil
-}
-
-// SendMessage envoie un message via le chat
-func (sc *SecureChat) SendMessage(message string) {
-	sc.mu.RLock()
-	defer sc.mu.RUnlock()
-
-	if !sc.stopped {
-		select {
-		case sc.outgoingMessages <- message:
-		default:
-			sc.errors <- errors.New("outgoing message buffer full")
-		}
-	}
-}
-
-// ReceiveMessage reçoit un message du chat (non-bloquant)
-func (sc *SecureChat) ReceiveMessage() (string, bool) {
-	select {
-	case msg := <-sc.incomingMessages:
-		return msg, true
-	default:
-		return "", false
-	}
-}
-
-// GetError récupère une erreur du chat (non-bloquant)
-func (sc *SecureChat) GetError() (error, bool) {
-	select {
-	case err := <-sc.errors:
-		return err, true
-	default:
-		return nil, false
-	}
-}
-
-// receiveLoop boucle de réception des messages
-func (sc *SecureChat) receiveLoop() {
-	for {
-		select {
-		case <-sc.stopChan:
-			return
-		default:
-			message, err := sc.messenger.ReceiveWithTimeout(sc.conn, 10*time.Second) // Timeout plus long
-			if err != nil {
-				// Si c'est un timeout, continuer
-				if err.Error() == "receive timeout" {
-					continue
-				}
-				sc.errors <- fmt.Errorf("receive error: %w", err)
-				continue
-			}
-
-			select {
-			case sc.incomingMessages <- message:
-			default:
-				sc.errors <- errors.New("incoming message buffer full")
-			}
-		}
-	}
-}
-
-// sendLoop boucle d'envoi des messages
-func (sc *SecureChat) sendLoop() {
-	for {
-		select {
-		case <-sc.stopChan:
-			return
-		case message := <-sc.outgoingMessages:
-			err := sc.messenger.SendWithTimeout(message, sc.conn, 10*time.Second) // Timeout plus long
-			if err != nil {
-				sc.errors <- fmt.Errorf("send error: %w", err)
-			}
-		}
-	}
-}
-
-// Close ferme le chat
-func (sc *SecureChat) Close() error {
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
-
-	if sc.stopped {
-		return nil
-	}
-
-	sc.stopped = true
-	close(sc.stopChan)
-
-	return sc.messenger.Close()
-}
-
-// GetStats retourne les statistiques du chat
-func (sc *SecureChat) GetStats() map[string]interface{} {
-	sc.mu.RLock()
-	defer sc.mu.RUnlock()
-
-	stats := sc.messenger.GetStats()
-	stats["username"] = sc.username
-	stats["incoming_buffer"] = len(sc.incomingMessages)
-	stats["outgoing_buffer"] = len(sc.outgoingMessages)
-	stats["error_buffer"] = len(sc.errors)
-	stats["is_stopped"] = sc.stopped
-
-	return stats
+	return messenger, nil
 }
