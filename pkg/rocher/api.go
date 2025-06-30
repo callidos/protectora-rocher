@@ -18,7 +18,7 @@ type Client struct {
 	userID    string // CHAMP POUR IDENTIFIER L'UTILISATEUR
 
 	// Callback pour les messages reçus
-	onMessage func(message, recipient string) // SIGNATURE MODIFIÉE
+	onMessage func(message, recipient, sessionToken string) // SIGNATURE MODIFIÉE
 	onError   func(error)
 
 	// Contrôle
@@ -49,10 +49,10 @@ type ClientOptions struct {
 	KeyRotation *KeyRotationConfig
 
 	// Callback pour les messages reçus (client simple) - SIGNATURE MODIFIÉE
-	OnMessage func(message, recipient string)
+	OnMessage func(message, recipient, sessionToken string)
 
 	// Callback pour les messages reçus (serveur avec ID client) - SIGNATURE MODIFIÉE
-	OnServerMessage func(clientID, message, recipient string)
+	OnServerMessage func(clientID, message, recipient, sessionToken string)
 
 	// Callback pour les erreurs
 	OnError func(error)
@@ -68,9 +68,9 @@ func DefaultClientOptions() *ClientOptions {
 		SendTimeout:       5 * time.Second,
 		MessageBufferSize: 100,
 		UserID:            "anonymous",
-		KeyRotation:       DefaultKeyRotationConfig(),      // NOUVEAU
-		OnMessage:         func(string, string) {},         // SIGNATURE MODIFIÉE
-		OnServerMessage:   func(string, string, string) {}, // SIGNATURE MODIFIÉE
+		KeyRotation:       DefaultKeyRotationConfig(),              // NOUVEAU
+		OnMessage:         func(string, string, string) {},         // SIGNATURE MODIFIÉE
+		OnServerMessage:   func(string, string, string, string) {}, // SIGNATURE MODIFIÉE
 		OnError:           func(error) {},
 		Debug:             false,
 	}
@@ -181,7 +181,7 @@ type Server struct {
 	clients  map[string]*Client
 	mu       sync.RWMutex
 
-	onMessage func(clientID, message, recipient string) // SIGNATURE MODIFIÉE
+	onMessage func(clientID, message, recipient, sessionToken string) // SIGNATURE MODIFIÉE
 	onError   func(error)
 
 	ctx    context.Context
@@ -193,7 +193,7 @@ type Server struct {
 }
 
 // SetOnMessage change le callback des messages (utile pour les tests) - SIGNATURE MODIFIÉE
-func (s *Server) SetOnMessage(fn func(string, string, string)) {
+func (s *Server) SetOnMessage(fn func(string, string, string, string)) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.onMessage = fn
@@ -246,8 +246,8 @@ func (s *Server) handleConnection(conn net.Conn) {
 		conn:      conn,
 		isServer:  true,
 		userID:    clientID, // UTILISER L'ID DE CONNEXION COMME USERID
-		onMessage: func(msg, recipient string) { // SIGNATURE MODIFIÉE
-			s.onMessage(clientID, msg, recipient)
+		onMessage: func(msg, recipient, sessionToken string) { // SIGNATURE MODIFIÉE
+			s.onMessage(clientID, msg, recipient, sessionToken)
 		},
 		onError: s.onError,
 		ctx:     ctx,
@@ -292,13 +292,13 @@ func (s *Server) handleConnection(conn net.Conn) {
 }
 
 // Send envoie un message à tous les clients connectés - SIGNATURE MODIFIÉE
-func (s *Server) Send(message, recipient string) error {
+func (s *Server) Send(message, recipient, sessionToken string) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	var errors []string
 	for clientID, client := range s.clients {
-		if err := client.Send(message, recipient); err != nil {
+		if err := client.Send(message, recipient, sessionToken); err != nil {
 			errors = append(errors, fmt.Sprintf("%s: %v", clientID, err))
 		}
 	}
@@ -311,7 +311,7 @@ func (s *Server) Send(message, recipient string) error {
 }
 
 // SendTo envoie un message à un client spécifique - SIGNATURE MODIFIÉE
-func (s *Server) SendTo(clientID, message, recipient string) error {
+func (s *Server) SendTo(clientID, message, recipient, sessionToken string) error {
 	s.mu.RLock()
 	client, exists := s.clients[clientID]
 	s.mu.RUnlock()
@@ -320,7 +320,7 @@ func (s *Server) SendTo(clientID, message, recipient string) error {
 		return fmt.Errorf("client %s non trouvé", clientID)
 	}
 
-	return client.Send(message, recipient)
+	return client.Send(message, recipient, sessionToken)
 }
 
 // GetClients retourne la liste des clients connectés
@@ -357,7 +357,7 @@ func (s *Server) Close() error {
 }
 
 // Send envoie un message de manière synchrone - SIGNATURE MODIFIÉE
-func (c *Client) Send(message, recipient string) error {
+func (c *Client) Send(message, recipient, sessionToken string) error {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
@@ -365,7 +365,7 @@ func (c *Client) Send(message, recipient string) error {
 		return fmt.Errorf("client non connecté")
 	}
 
-	return c.messenger.SendWithTimeout(message, recipient, c.conn, 5*time.Second)
+	return c.messenger.SendWithTimeout(message, recipient, sessionToken, c.conn, 5*time.Second)
 }
 
 // IsConnected retourne l'état de la connexion
@@ -443,7 +443,7 @@ func (c *Client) receiveLoop(opts *ClientOptions) {
 		case <-c.ctx.Done():
 			return
 		default:
-			message, recipient, err := c.messenger.ReceiveWithTimeout(c.conn, 10*time.Second) // SIGNATURE MODIFIÉE
+			message, recipient, sessionToken, err := c.messenger.ReceiveWithTimeout(c.conn, 10*time.Second) // SIGNATURE MODIFIÉE
 			if err != nil {
 				if c.ctx.Err() != nil {
 					return // Fermeture normale
@@ -458,8 +458,8 @@ func (c *Client) receiveLoop(opts *ClientOptions) {
 				return
 			}
 
-			// Appeler le callback avec le destinataire
-			c.onMessage(message, recipient) // SIGNATURE MODIFIÉE
+			// Appeler le callback avec le destinataire et session token
+			c.onMessage(message, recipient, sessionToken) // SIGNATURE MODIFIÉE
 		}
 	}
 }
@@ -541,7 +541,7 @@ func parseAddress(address string) (network, addr string, err error) {
 // Fonctions utilitaires pour une utilisation encore plus simple - SIGNATURES MODIFIÉES
 
 // QuickClient crée un client avec configuration minimale - SIGNATURE MODIFIÉE
-func QuickClient(address, userID string, onMessage func(string, string)) (*Client, error) {
+func QuickClient(address, userID string, onMessage func(string, string, string)) (*Client, error) {
 	opts := DefaultClientOptions()
 	opts.UserID = userID
 	opts.OnMessage = onMessage
@@ -549,7 +549,7 @@ func QuickClient(address, userID string, onMessage func(string, string)) (*Clien
 }
 
 // QuickServer crée un serveur avec configuration minimale - SIGNATURE MODIFIÉE
-func QuickServer(address string, onMessage func(string, string, string)) (*Server, error) {
+func QuickServer(address string, onMessage func(string, string, string, string)) (*Server, error) {
 	opts := DefaultClientOptions()
 	opts.OnServerMessage = onMessage
 
@@ -557,7 +557,7 @@ func QuickServer(address string, onMessage func(string, string, string)) (*Serve
 }
 
 // QuickClientWithFS crée un client avec Forward Secrecy personnalisé - NOUVEAU
-func QuickClientWithFS(address, userID string, onMessage func(string, string), fsConfig *KeyRotationConfig) (*Client, error) {
+func QuickClientWithFS(address, userID string, onMessage func(string, string, string), fsConfig *KeyRotationConfig) (*Client, error) {
 	opts := DefaultClientOptions()
 	opts.UserID = userID
 	opts.OnMessage = onMessage
@@ -568,7 +568,7 @@ func QuickClientWithFS(address, userID string, onMessage func(string, string), f
 }
 
 // QuickServerWithFS crée un serveur avec Forward Secrecy personnalisé - NOUVEAU
-func QuickServerWithFS(address string, onMessage func(string, string, string), fsConfig *KeyRotationConfig) (*Server, error) {
+func QuickServerWithFS(address string, onMessage func(string, string, string, string), fsConfig *KeyRotationConfig) (*Server, error) {
 	opts := DefaultClientOptions()
 	opts.OnServerMessage = onMessage
 	if fsConfig != nil {

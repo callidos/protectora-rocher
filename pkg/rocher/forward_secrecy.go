@@ -83,11 +83,12 @@ type SecureChannelWithFS struct {
 
 // MessageWithFS étend Message avec les métadonnées FS
 type MessageWithFS struct {
-	ID        string `json:"id"`
-	Timestamp int64  `json:"timestamp"`
-	Recipient string `json:"recipient"`
-	Data      []byte `json:"data"`
-	Nonce     []byte `json:"nonce"`
+	ID           string `json:"id"`
+	Timestamp    int64  `json:"timestamp"`
+	Recipient    string `json:"recipient"`
+	SessionToken string `json:"session_token"` // NOUVEAU CHAMP AJOUTÉ
+	Data         []byte `json:"data"`
+	Nonce        []byte `json:"nonce"`
 
 	// Métadonnées Forward Secrecy
 	RotationID     uint64 `json:"rotation_id"`      // ID de rotation de l'expéditeur
@@ -284,7 +285,16 @@ func (sc *SecureChannelWithFS) cleanupOldChannels() {
 }
 
 // EncryptMessage avec rotation automatique
-func (sc *SecureChannelWithFS) EncryptMessage(plaintext []byte, recipient string) (*MessageWithFS, error) {
+func (sc *SecureChannelWithFS) EncryptMessage(plaintext []byte, recipient, sessionToken string) (*MessageWithFS, error) {
+	// Validation côté envoi
+	if recipient == "" {
+		return nil, errors.New("empty recipient")
+	}
+
+	if sessionToken == "" {
+		return nil, errors.New("empty session token")
+	}
+
 	// Vérifier si rotation nécessaire
 	if sc.NeedsRotation() {
 		if err := sc.RotateKeys(); err != nil {
@@ -293,7 +303,7 @@ func (sc *SecureChannelWithFS) EncryptMessage(plaintext []byte, recipient string
 	}
 
 	// Chiffrer avec les clés actuelles
-	baseMsg, err := sc.currentChannel.EncryptMessage(plaintext, recipient)
+	baseMsg, err := sc.currentChannel.EncryptMessage(plaintext, recipient, sessionToken)
 	if err != nil {
 		return nil, err
 	}
@@ -312,6 +322,7 @@ func (sc *SecureChannelWithFS) EncryptMessage(plaintext []byte, recipient string
 		ID:             baseMsg.ID,
 		Timestamp:      baseMsg.Timestamp,
 		Recipient:      baseMsg.Recipient,
+		SessionToken:   baseMsg.SessionToken, // NOUVEAU CHAMP INCLUS
 		Data:           baseMsg.Data,
 		Nonce:          baseMsg.Nonce,
 		RotationID:     rotationID,
@@ -332,11 +343,12 @@ func (sc *SecureChannelWithFS) DecryptMessage(msg *MessageWithFS) ([]byte, error
 
 	// Créer un Message de base pour la compatibilité
 	baseMsg := &Message{
-		ID:        msg.ID,
-		Timestamp: msg.Timestamp,
-		Recipient: msg.Recipient,
-		Data:      msg.Data,
-		Nonce:     msg.Nonce,
+		ID:           msg.ID,
+		Timestamp:    msg.Timestamp,
+		Recipient:    msg.Recipient,
+		SessionToken: msg.SessionToken, // NOUVEAU CHAMP INCLUS
+		Data:         msg.Data,
+		Nonce:        msg.Nonce,
 	}
 
 	// Essayer avec le canal actuel d'abord
@@ -357,9 +369,9 @@ func (sc *SecureChannelWithFS) DecryptMessage(msg *MessageWithFS) ([]byte, error
 }
 
 // SendMessage sérialise et envoie un message chiffré avec FS
-func (sc *SecureChannelWithFS) SendMessage(plaintext []byte, recipient string, writer io.Writer) error {
+func (sc *SecureChannelWithFS) SendMessage(plaintext []byte, recipient, sessionToken string, writer io.Writer) error {
 	// Chiffrer le message
-	msg, err := sc.EncryptMessage(plaintext, recipient)
+	msg, err := sc.EncryptMessage(plaintext, recipient, sessionToken)
 	if err != nil {
 		return fmt.Errorf("encryption failed: %w", err)
 	}
@@ -389,46 +401,46 @@ func (sc *SecureChannelWithFS) SendMessage(plaintext []byte, recipient string, w
 }
 
 // ReceiveMessage reçoit et déchiffre un message avec support FS
-func (sc *SecureChannelWithFS) ReceiveMessage(reader io.Reader) ([]byte, string, error) {
+func (sc *SecureChannelWithFS) ReceiveMessage(reader io.Reader) ([]byte, string, string, error) {
 	// Lire la taille du message (même format que SecureChannel)
 	var size uint32
 	if err := binary.Read(reader, binary.BigEndian, &size); err != nil {
-		return nil, "", fmt.Errorf("failed to read size: %w", err)
+		return nil, "", "", fmt.Errorf("failed to read size: %w", err)
 	}
 
 	// Vérifier la taille
 	if size == 0 {
-		return nil, "", ErrEmptyMessage
+		return nil, "", "", ErrEmptyMessage
 	}
 
 	if size > MaxMsgSize*2 {
-		return nil, "", fmt.Errorf("message too large: %d bytes", size)
+		return nil, "", "", fmt.Errorf("message too large: %d bytes", size)
 	}
 
 	// Lire les données
 	data := make([]byte, size)
 	if _, err := io.ReadFull(reader, data); err != nil {
-		return nil, "", fmt.Errorf("failed to read data: %w", err)
+		return nil, "", "", fmt.Errorf("failed to read data: %w", err)
 	}
 
 	// Désérialiser le message
 	var msg MessageWithFS
 	if err := json.Unmarshal(data, &msg); err != nil {
-		return nil, "", fmt.Errorf("deserialization failed: %w", err)
+		return nil, "", "", fmt.Errorf("deserialization failed: %w", err)
 	}
 
 	// Valider le message avant déchiffrement
 	if err := sc.ValidateMessageWithFS(&msg); err != nil {
-		return nil, "", fmt.Errorf("invalid message: %w", err)
+		return nil, "", "", fmt.Errorf("invalid message: %w", err)
 	}
 
 	// Déchiffrer le message
 	plaintext, err := sc.DecryptMessage(&msg)
 	if err != nil {
-		return nil, "", fmt.Errorf("decryption failed: %w", err)
+		return nil, "", "", fmt.Errorf("decryption failed: %w", err)
 	}
 
-	return plaintext, msg.Recipient, nil
+	return plaintext, msg.Recipient, msg.SessionToken, nil // RETOURNE AUSSI LE SESSION TOKEN
 }
 
 // ValidateMessageWithFS valide un message avec métadonnées FS
@@ -447,6 +459,11 @@ func (sc *SecureChannelWithFS) ValidateMessageWithFS(msg *MessageWithFS) error {
 
 	if msg.Recipient == "" {
 		return errors.New("empty recipient")
+	}
+
+	// VALIDATION : Session token obligatoire et non-vide
+	if msg.SessionToken == "" {
+		return errors.New("empty session token")
 	}
 
 	// Vérifier que le timestamp n'est pas trop ancien ou futur
@@ -522,7 +539,7 @@ func (sc *SecureChannelWithFS) Close() {
 func (sc *SecureChannelWithFS) GetOverhead() int {
 	// Overhead de base + métadonnées FS
 	baseOverhead := sc.currentChannel.GetOverhead()
-	return baseOverhead + 80 // JSON overhead pour rotation_id, peer_rotation_id et fs_version
+	return baseOverhead + 120 // JSON overhead pour rotation_id, peer_rotation_id, fs_version et session_token
 }
 
 // GetRotationStats retourne les statistiques de rotation

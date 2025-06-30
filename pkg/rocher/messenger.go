@@ -310,7 +310,7 @@ func (sm *SimpleMessenger) sendPing() error {
 	sm.mu.Unlock()
 
 	pingMsg := fmt.Sprintf("PING:%d", time.Now().UnixNano())
-	err := sm.SendMessage(pingMsg, "system", conn.(io.Writer))
+	err := sm.SendMessage(pingMsg, "system", "ping-session", conn.(io.Writer))
 	if err == nil {
 		sm.mu.Lock()
 		sm.lastPing = time.Now()
@@ -455,8 +455,8 @@ func (sm *SimpleMessenger) decompressMessage(data []byte, compressed bool) ([]by
 	return data, nil
 }
 
-// SendMessage envoie un message sécurisé avec compression - MODIFIÉ pour FS
-func (sm *SimpleMessenger) SendMessage(message string, recipient string, conn io.Writer) error {
+// SendMessage envoie un message sécurisé avec compression - MODIFIÉ pour FS et session token
+func (sm *SimpleMessenger) SendMessage(message string, recipient string, sessionToken string, conn io.Writer) error {
 	sm.mu.RLock()
 	if !sm.isConnected || sm.channel == nil {
 		sm.mu.RUnlock()
@@ -488,8 +488,8 @@ func (sm *SimpleMessenger) SendMessage(message string, recipient string, conn io
 		return fmt.Errorf("serialization failed: %w", err)
 	}
 
-	// MODIFIÉ: Envoyer via le canal sécurisé avec FS
-	err = channel.SendMessage(finalData, recipient, conn)
+	// MODIFIÉ: Envoyer via le canal sécurisé avec FS et session token
+	err = channel.SendMessage(finalData, recipient, sessionToken, conn)
 
 	if err == nil {
 		// Mettre à jour les statistiques
@@ -502,45 +502,45 @@ func (sm *SimpleMessenger) SendMessage(message string, recipient string, conn io
 	return err
 }
 
-// ReceiveMessage reçoit un message sécurisé avec décompression - MODIFIÉ pour FS
-func (sm *SimpleMessenger) ReceiveMessage(conn io.Reader) (string, string, error) {
+// ReceiveMessage reçoit un message sécurisé avec décompression - MODIFIÉ pour FS et session token
+func (sm *SimpleMessenger) ReceiveMessage(conn io.Reader) (string, string, string, error) {
 	sm.mu.RLock()
 	if !sm.isConnected || sm.channel == nil {
 		sm.mu.RUnlock()
-		return "", "", ErrNotConnected
+		return "", "", "", ErrNotConnected
 	}
 
 	channel := sm.channel
 	sm.mu.RUnlock()
 
-	// MODIFIÉ: Recevoir via le canal sécurisé avec FS
-	finalData, recipient, err := channel.ReceiveMessage(conn)
+	// MODIFIÉ: Recevoir via le canal sécurisé avec FS et session token
+	finalData, recipient, sessionToken, err := channel.ReceiveMessage(conn)
 	if err != nil {
 		// Vérifier si c'est un ping
 		if err.Error() == "receive timeout" {
-			return "", "", err
+			return "", "", "", err
 		}
-		return "", "", err
+		return "", "", "", err
 	}
 
 	// Désérialiser métadonnées + données
 	messageBytes, metadata, err := sm.deserializeWithMetadata(finalData)
 	if err != nil {
-		return "", "", fmt.Errorf("deserialization failed: %w", err)
+		return "", "", "", fmt.Errorf("deserialization failed: %w", err)
 	}
 
 	// Décompression si nécessaire
 	isCompressed, _ := metadata["compressed"].(bool)
 	decompressedData, err := sm.decompressMessage(messageBytes, isCompressed)
 	if err != nil {
-		return "", "", fmt.Errorf("decompression failed: %w", err)
+		return "", "", "", fmt.Errorf("decompression failed: %w", err)
 	}
 
 	message := string(decompressedData)
 
 	// Gérer les messages de keep-alive
 	if sm.isKeepAliveMessage(message) {
-		sm.handleKeepAliveMessage(message, recipient)
+		sm.handleKeepAliveMessage(message, recipient, sessionToken)
 		// Recevoir le message suivant
 		return sm.ReceiveMessage(conn)
 	}
@@ -551,7 +551,7 @@ func (sm *SimpleMessenger) ReceiveMessage(conn io.Reader) (string, string, error
 	sm.bytesReceived += uint64(len(decompressedData))
 	sm.mu.Unlock()
 
-	return message, recipient, nil
+	return message, recipient, sessionToken, nil
 }
 
 // isKeepAliveMessage vérifie si c'est un message de keep-alive
@@ -559,13 +559,13 @@ func (sm *SimpleMessenger) isKeepAliveMessage(message string) bool {
 	return len(message) > 5 && (message[:5] == "PING:" || message[:5] == "PONG:")
 }
 
-// handleKeepAliveMessage traite les messages de keep-alive
-func (sm *SimpleMessenger) handleKeepAliveMessage(message string, recipient string) {
+// handleKeepAliveMessage traite les messages de keep-alive - MODIFIÉ pour session token
+func (sm *SimpleMessenger) handleKeepAliveMessage(message string, recipient string, sessionToken string) {
 	if len(message) > 5 && message[:5] == "PING:" {
 		// Répondre au ping
 		pongMsg := "PONG:" + message[5:]
 		if sm.conn != nil {
-			sm.SendMessage(pongMsg, "system", sm.conn.(io.Writer))
+			sm.SendMessage(pongMsg, "system", "pong-session", sm.conn.(io.Writer))
 		}
 	} else if len(message) > 5 && message[:5] == "PONG:" {
 		// Marquer le pong reçu
@@ -703,12 +703,12 @@ func (sm *SimpleMessenger) GetStats() map[string]interface{} {
 	return stats
 }
 
-// SendWithTimeout envoie un message avec timeout
-func (sm *SimpleMessenger) SendWithTimeout(message string, recipient string, conn io.Writer, timeout time.Duration) error {
+// SendWithTimeout envoie un message avec timeout - MODIFIÉ pour session token
+func (sm *SimpleMessenger) SendWithTimeout(message string, recipient string, sessionToken string, conn io.Writer, timeout time.Duration) error {
 	done := make(chan error, 1)
 
 	go func() {
-		done <- sm.SendMessage(message, recipient, conn)
+		done <- sm.SendMessage(message, recipient, sessionToken, conn)
 	}()
 
 	select {
@@ -719,26 +719,27 @@ func (sm *SimpleMessenger) SendWithTimeout(message string, recipient string, con
 	}
 }
 
-// ReceiveWithTimeout reçoit un message avec timeout
-func (sm *SimpleMessenger) ReceiveWithTimeout(conn io.Reader, timeout time.Duration) (string, string, error) {
+// ReceiveWithTimeout reçoit un message avec timeout - MODIFIÉ pour session token
+func (sm *SimpleMessenger) ReceiveWithTimeout(conn io.Reader, timeout time.Duration) (string, string, string, error) {
 	type result struct {
-		message   string
-		recipient string
-		err       error
+		message      string
+		recipient    string
+		sessionToken string
+		err          error
 	}
 
 	done := make(chan result, 1)
 
 	go func() {
-		msg, recipient, err := sm.ReceiveMessage(conn)
-		done <- result{message: msg, recipient: recipient, err: err}
+		msg, recipient, sessionToken, err := sm.ReceiveMessage(conn)
+		done <- result{message: msg, recipient: recipient, sessionToken: sessionToken, err: err}
 	}()
 
 	select {
 	case res := <-done:
-		return res.message, res.recipient, res.err
+		return res.message, res.recipient, res.sessionToken, res.err
 	case <-time.After(timeout):
-		return "", "", errors.New("receive timeout")
+		return "", "", "", errors.New("receive timeout")
 	}
 }
 

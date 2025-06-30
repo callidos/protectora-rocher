@@ -19,22 +19,24 @@ func TestBasicClientServer(t *testing.T) {
 
 	// Variables pour capturer les messages
 	var receivedMessages []struct {
-		clientID  string
-		message   string
-		recipient string
+		clientID     string
+		message      string
+		recipient    string
+		sessionToken string
 	}
 	var mu sync.Mutex
 
 	// Créer le serveur
-	server, err := rocher.QuickServer(address, func(clientID, message, recipient string) {
+	server, err := rocher.QuickServer(address, func(clientID, message, recipient, sessionToken string) {
 		mu.Lock()
 		receivedMessages = append(receivedMessages, struct {
-			clientID  string
-			message   string
-			recipient string
-		}{clientID, message, recipient})
+			clientID     string
+			message      string
+			recipient    string
+			sessionToken string
+		}{clientID, message, recipient, sessionToken})
 		mu.Unlock()
-		t.Logf("📥 Serveur reçu de %s: '%s' pour '%s'", clientID, message, recipient)
+		t.Logf("📥 Serveur reçu de %s: '%s' pour '%s' (session: %s)", clientID, message, recipient, sessionToken)
 	})
 	if err != nil {
 		t.Fatalf("Erreur création serveur: %v", err)
@@ -51,19 +53,21 @@ func TestBasicClientServer(t *testing.T) {
 
 	// Créer le client
 	var clientMessages []struct {
-		message   string
-		recipient string
+		message      string
+		recipient    string
+		sessionToken string
 	}
 	var clientMu sync.Mutex
 
-	client, err := rocher.QuickClient(address, "alice", func(message, recipient string) {
+	client, err := rocher.QuickClient(address, "alice", func(message, recipient, sessionToken string) {
 		clientMu.Lock()
 		clientMessages = append(clientMessages, struct {
-			message   string
-			recipient string
-		}{message, recipient})
+			message      string
+			recipient    string
+			sessionToken string
+		}{message, recipient, sessionToken})
 		clientMu.Unlock()
-		t.Logf("📥 Client reçu: '%s' pour '%s'", message, recipient)
+		t.Logf("📥 Client reçu: '%s' pour '%s' (session: %s)", message, recipient, sessionToken)
 	})
 	if err != nil {
 		t.Fatalf("Erreur création client: %v", err)
@@ -99,17 +103,18 @@ func TestBasicClientServer(t *testing.T) {
 
 	// Test d'envoi client → serveur
 	testMessages := []struct {
-		message   string
-		recipient string
+		message      string
+		recipient    string
+		sessionToken string
 	}{
-		{"Hello Server!", "server@example.com"},
-		{"Message avec émojis 🚀", "admin@example.com"},
-		{"Caractères spéciaux: àéîôù", "user@example.com"},
+		{"Hello Server!", "server@example.com", "session-001"},
+		{"Message avec émojis 🚀", "admin@example.com", "session-002"},
+		{"Caractères spéciaux: àéîôù", "user@example.com", "session-003"},
 	}
 
 	for i, tm := range testMessages {
 		t.Run(fmt.Sprintf("ClientToServer_%d", i+1), func(t *testing.T) {
-			err := client.Send(tm.message, tm.recipient)
+			err := client.Send(tm.message, tm.recipient, tm.sessionToken)
 			if err != nil {
 				t.Fatalf("Erreur envoi message: %v", err)
 			}
@@ -120,7 +125,7 @@ func TestBasicClientServer(t *testing.T) {
 			mu.Lock()
 			found := false
 			for _, received := range receivedMessages {
-				if received.message == tm.message && received.recipient == tm.recipient {
+				if received.message == tm.message && received.recipient == tm.recipient && received.sessionToken == tm.sessionToken {
 					found = true
 					break
 				}
@@ -128,9 +133,9 @@ func TestBasicClientServer(t *testing.T) {
 			mu.Unlock()
 
 			if !found {
-				t.Errorf("Message non reçu par le serveur: '%s' pour '%s'", tm.message, tm.recipient)
+				t.Errorf("Message non reçu par le serveur: '%s' pour '%s' (session: %s)", tm.message, tm.recipient, tm.sessionToken)
 			} else {
-				t.Logf("✅ Message transmis: '%s' pour '%s'", tm.message, tm.recipient)
+				t.Logf("✅ Message transmis: '%s' pour '%s' (session: %s)", tm.message, tm.recipient, tm.sessionToken)
 			}
 		})
 	}
@@ -139,8 +144,9 @@ func TestBasicClientServer(t *testing.T) {
 	t.Run("ServerToClient", func(t *testing.T) {
 		testMsg := "Hello Client from Server!"
 		testRecipient := "alice@client.com"
+		testSessionToken := "server-session-001"
 
-		err := server.Send(testMsg, testRecipient)
+		err := server.Send(testMsg, testRecipient, testSessionToken)
 		if err != nil {
 			t.Fatalf("Erreur envoi du serveur: %v", err)
 		}
@@ -151,7 +157,7 @@ func TestBasicClientServer(t *testing.T) {
 		clientMu.Lock()
 		found := false
 		for _, received := range clientMessages {
-			if received.message == testMsg && received.recipient == testRecipient {
+			if received.message == testMsg && received.recipient == testRecipient && received.sessionToken == testSessionToken {
 				found = true
 				break
 			}
@@ -159,9 +165,9 @@ func TestBasicClientServer(t *testing.T) {
 		clientMu.Unlock()
 
 		if !found {
-			t.Errorf("Message du serveur non reçu par le client: '%s' pour '%s'", testMsg, testRecipient)
+			t.Errorf("Message du serveur non reçu par le client: '%s' pour '%s' (session: %s)", testMsg, testRecipient, testSessionToken)
 		} else {
-			t.Logf("✅ Message serveur→client transmis: '%s' pour '%s'", testMsg, testRecipient)
+			t.Logf("✅ Message serveur→client transmis: '%s' pour '%s' (session: %s)", testMsg, testRecipient, testSessionToken)
 		}
 	})
 
@@ -177,24 +183,26 @@ func TestMultipleClients(t *testing.T) {
 
 	// Structure pour suivre les messages reçus par client
 	type ReceivedMessage struct {
-		ClientID  string
-		Message   string
-		Recipient string
+		ClientID     string
+		Message      string
+		Recipient    string
+		SessionToken string
 	}
 
 	var receivedMessages []ReceivedMessage
 	var mu sync.Mutex
 
 	// Créer le serveur
-	server, err := rocher.QuickServer(address, func(clientID, message, recipient string) {
+	server, err := rocher.QuickServer(address, func(clientID, message, recipient, sessionToken string) {
 		mu.Lock()
 		receivedMessages = append(receivedMessages, ReceivedMessage{
-			ClientID:  clientID,
-			Message:   message,
-			Recipient: recipient,
+			ClientID:     clientID,
+			Message:      message,
+			Recipient:    recipient,
+			SessionToken: sessionToken,
 		})
 		mu.Unlock()
-		t.Logf("📥 Serveur reçu de %s: '%s' pour '%s'", clientID, message, recipient)
+		t.Logf("📥 Serveur reçu de %s: '%s' pour '%s' (session: %s)", clientID, message, recipient, sessionToken)
 	})
 	if err != nil {
 		t.Fatalf("Erreur création serveur: %v", err)
@@ -212,8 +220,8 @@ func TestMultipleClients(t *testing.T) {
 	clients := make([]*rocher.Client, len(clientNames))
 
 	for i, name := range clientNames {
-		client, err := rocher.QuickClient(address, name, func(message, recipient string) {
-			t.Logf("📥 Client %s reçu: '%s' pour '%s'", name, message, recipient)
+		client, err := rocher.QuickClient(address, name, func(message, recipient, sessionToken string) {
+			t.Logf("📥 Client %s reçu: '%s' pour '%s' (session: %s)", name, message, recipient, sessionToken)
 		})
 		if err != nil {
 			t.Fatalf("Erreur création client %s: %v", name, err)
@@ -249,8 +257,9 @@ func TestMultipleClients(t *testing.T) {
 		clientName := clientNames[i]
 		message := fmt.Sprintf("Message from %s", clientName)
 		recipient := fmt.Sprintf("%s@example.com", clientName)
+		sessionToken := fmt.Sprintf("client-%s-session-001", clientName)
 
-		err := client.Send(message, recipient)
+		err := client.Send(message, recipient, sessionToken)
 		if err != nil {
 			t.Errorf("Erreur envoi depuis %s: %v", clientName, err)
 			continue
@@ -262,7 +271,7 @@ func TestMultipleClients(t *testing.T) {
 		mu.Lock()
 		found := false
 		for _, received := range receivedMessages {
-			if received.Message == message && received.Recipient == recipient {
+			if received.Message == message && received.Recipient == recipient && received.SessionToken == sessionToken {
 				found = true
 				break
 			}
@@ -280,8 +289,9 @@ func TestMultipleClients(t *testing.T) {
 	t.Run("ServerBroadcast", func(t *testing.T) {
 		broadcastMsg := "Message broadcast à tous!"
 		broadcastRecipient := "all@broadcast.com"
+		broadcastSessionToken := "broadcast-session-001"
 
-		err := server.Send(broadcastMsg, broadcastRecipient)
+		err := server.Send(broadcastMsg, broadcastRecipient, broadcastSessionToken)
 		if err != nil {
 			t.Fatalf("Erreur broadcast: %v", err)
 		}
@@ -307,10 +317,11 @@ func TestClientOptions(t *testing.T) {
 	opts.SendTimeout = 3 * time.Second
 	opts.Debug = true
 
-	var receivedMessage, receivedRecipient string
-	opts.OnMessage = func(message, recipient string) {
+	var receivedMessage, receivedRecipient, receivedSessionToken string
+	opts.OnMessage = func(message, recipient, sessionToken string) {
 		receivedMessage = message
 		receivedRecipient = recipient
+		receivedSessionToken = sessionToken
 	}
 
 	// Créer serveur avec options par défaut
@@ -340,8 +351,9 @@ func TestClientOptions(t *testing.T) {
 	// Test d'envoi pour vérifier le callback
 	testMsg := "Test message"
 	testRecipient := "callback@test.com"
+	testSessionToken := "callback-session-001"
 
-	err = server.Send(testMsg, testRecipient)
+	err = server.Send(testMsg, testRecipient, testSessionToken)
 	if err != nil {
 		t.Fatalf("Erreur envoi: %v", err)
 	}
@@ -353,6 +365,9 @@ func TestClientOptions(t *testing.T) {
 	}
 	if receivedRecipient != testRecipient {
 		t.Errorf("Recipient callback incorrect. Attendu: '%s', Reçu: '%s'", testRecipient, receivedRecipient)
+	}
+	if receivedSessionToken != testSessionToken {
+		t.Errorf("SessionToken callback incorrect. Attendu: '%s', Reçu: '%s'", testSessionToken, receivedSessionToken)
 	}
 	t.Log("✅ Test options de configuration réussi")
 }
@@ -368,11 +383,11 @@ func TestForwardSecrecy(t *testing.T) {
 	var mu sync.Mutex
 
 	// Créer le serveur
-	server, err := rocher.QuickServer(address, func(clientID, message, recipient string) {
+	server, err := rocher.QuickServer(address, func(clientID, message, recipient, sessionToken string) {
 		mu.Lock()
 		serverReceivedCount++
 		mu.Unlock()
-		t.Logf("📥 Serveur reçu (%d): '%s'", serverReceivedCount, message)
+		t.Logf("📥 Serveur reçu (%d): '%s' (session: %s)", serverReceivedCount, message, sessionToken)
 	})
 	if err != nil {
 		t.Fatalf("Erreur création serveur: %v", err)
@@ -385,8 +400,8 @@ func TestForwardSecrecy(t *testing.T) {
 	// Créer client avec rotation rapide pour les tests
 	opts := rocher.DefaultClientOptions()
 	opts.UserID = "test_user"
-	opts.OnMessage = func(message, recipient string) {
-		t.Logf("📥 Client reçu: '%s'", message)
+	opts.OnMessage = func(message, recipient, sessionToken string) {
+		t.Logf("📥 Client reçu: '%s' (session: %s)", message, sessionToken)
 	}
 	// Configurer une rotation rapide pour les tests
 	opts.KeyRotation = &rocher.KeyRotationConfig{
@@ -410,16 +425,19 @@ func TestForwardSecrecy(t *testing.T) {
 	t.Logf("🔐 Rotation ID initial: %d", initialRotationID)
 
 	// Envoyer plusieurs messages pour déclencher une rotation basée sur le nombre
-	testMessages := []string{
-		"Message 1 - avant rotation",
-		"Message 2 - avant rotation",
-		"Message 3 - devrait déclencher rotation",
-		"Message 4 - après rotation",
-		"Message 5 - après rotation",
+	testMessages := []struct {
+		message      string
+		sessionToken string
+	}{
+		{"Message 1 - avant rotation", "fs-test-001"},
+		{"Message 2 - avant rotation", "fs-test-002"},
+		{"Message 3 - devrait déclencher rotation", "fs-test-003"},
+		{"Message 4 - après rotation", "fs-test-004"},
+		{"Message 5 - après rotation", "fs-test-005"},
 	}
 
-	for i, msg := range testMessages {
-		err := client.Send(msg, fmt.Sprintf("recipient%d@test.com", i+1))
+	for i, tm := range testMessages {
+		err := client.Send(tm.message, fmt.Sprintf("recipient%d@test.com", i+1), tm.sessionToken)
 		if err != nil {
 			t.Errorf("Erreur envoi message %d: %v", i+1, err)
 		}
@@ -469,7 +487,7 @@ func TestForwardSecrecy(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 
 		// Envoyer un message pour déclencher la rotation
-		err = client.Send("Message après rotation forcée", "forced@test.com")
+		err = client.Send("Message après rotation forcée", "forced@test.com", "force-rotation-001")
 		if err != nil {
 			t.Fatalf("Erreur envoi après rotation forcée: %v", err)
 		}
@@ -520,8 +538,8 @@ func TestKeyRotationConfig(t *testing.T) {
 	address := "localhost" + port
 
 	// Créer serveur
-	server, err := rocher.QuickServer(address, func(clientID, message, recipient string) {
-		t.Logf("📥 Serveur reçu: '%s'", message)
+	server, err := rocher.QuickServer(address, func(clientID, message, recipient, sessionToken string) {
+		t.Logf("📥 Serveur reçu: '%s' (session: %s)", message, sessionToken)
 	})
 	if err != nil {
 		t.Fatalf("Erreur création serveur: %v", err)
@@ -531,8 +549,8 @@ func TestKeyRotationConfig(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// Créer client
-	client, err := rocher.QuickClient(address, "config_test", func(message, recipient string) {
-		t.Logf("📥 Client reçu: '%s'", message)
+	client, err := rocher.QuickClient(address, "config_test", func(message, recipient, sessionToken string) {
+		t.Logf("📥 Client reçu: '%s' (session: %s)", message, sessionToken)
 	})
 	if err != nil {
 		t.Fatalf("Erreur création client: %v", err)
@@ -551,7 +569,8 @@ func TestKeyRotationConfig(t *testing.T) {
 	// Envoyer quelques messages de test
 	for i := 0; i < 3; i++ {
 		err := client.Send(fmt.Sprintf("Config test message %d", i+1),
-			fmt.Sprintf("config%d@test.com", i+1))
+			fmt.Sprintf("config%d@test.com", i+1),
+			fmt.Sprintf("config-test-%03d", i+1))
 		if err != nil {
 			t.Errorf("Erreur envoi message config %d: %v", i+1, err)
 		}
@@ -565,4 +584,94 @@ func TestKeyRotationConfig(t *testing.T) {
 		finalStats["messages_since_rotation"].(uint64))
 
 	t.Log("✅ Test configuration personnalisée réussi")
+}
+
+// NOUVEAU TEST: TestSessionTokenValidation teste la validation du session token
+func TestSessionTokenValidation(t *testing.T) {
+	t.Log("Test validation du session token...")
+
+	port := ":18085"
+	address := "localhost" + port
+
+	var receivedSessionTokens []string
+	var mu sync.Mutex
+
+	// Créer serveur
+	server, err := rocher.QuickServer(address, func(clientID, message, recipient, sessionToken string) {
+		mu.Lock()
+		receivedSessionTokens = append(receivedSessionTokens, sessionToken)
+		mu.Unlock()
+		t.Logf("📥 Serveur reçu session token: '%s'", sessionToken)
+	})
+	if err != nil {
+		t.Fatalf("Erreur création serveur: %v", err)
+	}
+	defer server.Close()
+	server.Start()
+	time.Sleep(100 * time.Millisecond)
+
+	// Créer client
+	client, err := rocher.QuickClient(address, "token_test", func(message, recipient, sessionToken string) {
+		t.Logf("📥 Client reçu session token: '%s'", sessionToken)
+	})
+	if err != nil {
+		t.Fatalf("Erreur création client: %v", err)
+	}
+	defer client.Close()
+	time.Sleep(200 * time.Millisecond)
+
+	// Test avec différents types de session tokens
+	testTokens := []string{
+		"simple-token",
+		"token-with-numbers-123",
+		"token_with_underscores",
+		"token-with-special-chars-!@#",
+		"very-long-session-token-with-lots-of-characters-to-test-limits-123456789",
+		"", // Token vide - devrait échouer si validation stricte
+	}
+
+	for i, token := range testTokens {
+		t.Run(fmt.Sprintf("Token_%d", i+1), func(t *testing.T) {
+			message := fmt.Sprintf("Test message with token %d", i+1)
+			recipient := fmt.Sprintf("token%d@test.com", i+1)
+
+			err := client.Send(message, recipient, token)
+
+			// Pour le token vide, on s'attend à une erreur
+			if token == "" {
+				if err == nil {
+					t.Error("Envoi avec token vide devrait échouer")
+				} else {
+					t.Logf("✅ Token vide correctement rejeté: %v", err)
+				}
+				return
+			}
+
+			if err != nil {
+				t.Errorf("Erreur envoi avec token '%s': %v", token, err)
+				return
+			}
+
+			time.Sleep(100 * time.Millisecond)
+
+			// Vérifier que le token est bien reçu
+			mu.Lock()
+			found := false
+			for _, receivedToken := range receivedSessionTokens {
+				if receivedToken == token {
+					found = true
+					break
+				}
+			}
+			mu.Unlock()
+
+			if !found {
+				t.Errorf("Session token '%s' non reçu", token)
+			} else {
+				t.Logf("✅ Session token '%s' correctement transmis", token)
+			}
+		})
+	}
+
+	t.Log("✅ Test validation session token réussi")
 }
