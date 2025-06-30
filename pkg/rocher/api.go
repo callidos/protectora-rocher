@@ -15,7 +15,7 @@ type Client struct {
 	messenger *SimpleMessenger
 	conn      net.Conn
 	isServer  bool
-	userID    string // NOUVEAU CHAMP POUR IDENTIFIER L'UTILISATEUR
+	userID    string // CHAMP POUR IDENTIFIER L'UTILISATEUR
 
 	// Callback pour les messages reçus
 	onMessage func(message, recipient string) // SIGNATURE MODIFIÉE
@@ -43,7 +43,10 @@ type ClientOptions struct {
 	MessageBufferSize int
 
 	// ID utilisateur pour ce client
-	UserID string // NOUVEAU CHAMP
+	UserID string
+
+	// Configuration Forward Secrecy
+	KeyRotation *KeyRotationConfig
 
 	// Callback pour les messages reçus (client simple) - SIGNATURE MODIFIÉE
 	OnMessage func(message, recipient string)
@@ -64,7 +67,8 @@ func DefaultClientOptions() *ClientOptions {
 		ConnectTimeout:    10 * time.Second,
 		SendTimeout:       5 * time.Second,
 		MessageBufferSize: 100,
-		UserID:            "anonymous",                     // VALEUR PAR DÉFAUT
+		UserID:            "anonymous",
+		KeyRotation:       DefaultKeyRotationConfig(),      // NOUVEAU
 		OnMessage:         func(string, string) {},         // SIGNATURE MODIFIÉE
 		OnServerMessage:   func(string, string, string) {}, // SIGNATURE MODIFIÉE
 		OnError:           func(error) {},
@@ -108,6 +112,11 @@ func NewClient(address string, opts *ClientOptions) (*Client, error) {
 		cancel:    cancel,
 	}
 
+	// NOUVEAU: Configurer Forward Secrecy avant la connexion
+	if opts.KeyRotation != nil {
+		client.messenger.SetKeyRotationConfig(opts.KeyRotation)
+	}
+
 	// Établir la connexion sécurisée
 	if err := client.messenger.Connect(conn); err != nil {
 		conn.Close()
@@ -149,13 +158,14 @@ func NewServer(address string, opts *ClientOptions) (*Server, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	server := &Server{
-		listener:  listener,
-		clients:   make(map[string]*Client),
-		onMessage: opts.OnServerMessage,
-		onError:   opts.OnError,
-		ctx:       ctx,
-		cancel:    cancel,
-		debug:     opts.Debug,
+		listener:          listener,
+		clients:           make(map[string]*Client),
+		onMessage:         opts.OnServerMessage,
+		onError:           opts.OnError,
+		ctx:               ctx,
+		cancel:            cancel,
+		debug:             opts.Debug,
+		keyRotationConfig: opts.KeyRotation, // NOUVEAU
 	}
 
 	if opts.Debug {
@@ -178,7 +188,8 @@ type Server struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
-	debug bool
+	debug             bool
+	keyRotationConfig *KeyRotationConfig // NOUVEAU
 }
 
 // SetOnMessage change le callback des messages (utile pour les tests) - SIGNATURE MODIFIÉE
@@ -241,6 +252,11 @@ func (s *Server) handleConnection(conn net.Conn) {
 		onError: s.onError,
 		ctx:     ctx,
 		cancel:  cancel,
+	}
+
+	// NOUVEAU: Configurer Forward Secrecy pour le client serveur
+	if s.keyRotationConfig != nil {
+		client.messenger.SetKeyRotationConfig(s.keyRotationConfig)
 	}
 
 	// Établir la connexion sécurisée
@@ -359,11 +375,58 @@ func (c *Client) IsConnected() bool {
 	return c.connected
 }
 
-// GetUserID retourne l'ID utilisateur du client - NOUVELLE MÉTHODE
+// GetUserID retourne l'ID utilisateur du client
 func (c *Client) GetUserID() string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.userID
+}
+
+// GetKeyRotationStats retourne les statistiques de rotation des clés - NOUVEAU
+func (c *Client) GetKeyRotationStats() map[string]interface{} {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if c.messenger == nil {
+		return map[string]interface{}{
+			"forward_secrecy_enabled": false,
+			"error":                   "messenger not initialized",
+		}
+	}
+
+	return c.messenger.GetKeyRotationStats()
+}
+
+// ForceKeyRotation force une rotation des clés immédiate - NOUVEAU
+func (c *Client) ForceKeyRotation() error {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if c.messenger == nil {
+		return fmt.Errorf("messenger not initialized")
+	}
+
+	return c.messenger.ForceKeyRotation()
+}
+
+// SetMaxOldKeys configure le nombre maximum d'anciennes clés à conserver - NOUVEAU
+func (c *Client) SetMaxOldKeys(max int) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if c.messenger != nil {
+		c.messenger.SetMaxOldKeys(max)
+	}
+}
+
+// SetKeyRotationConfig configure la rotation des clés - NOUVEAU
+func (c *Client) SetKeyRotationConfig(config *KeyRotationConfig) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if c.messenger != nil {
+		c.messenger.SetKeyRotationConfig(config)
+	}
 }
 
 // receiveLoop boucle de réception des messages - LOGIQUE MODIFIÉE
@@ -429,14 +492,14 @@ func (c *Client) GetStats() map[string]interface{} {
 	if c.messenger == nil {
 		return map[string]interface{}{
 			"connected": false,
-			"user_id":   c.userID, // AJOUT DU USER_ID
+			"user_id":   c.userID,
 		}
 	}
 
 	stats := c.messenger.GetStats()
 	stats["connected"] = c.connected
 	stats["is_server"] = c.isServer
-	stats["user_id"] = c.userID // AJOUT DU USER_ID
+	stats["user_id"] = c.userID
 
 	return stats
 }
@@ -490,5 +553,26 @@ func QuickServer(address string, onMessage func(string, string, string)) (*Serve
 	opts := DefaultClientOptions()
 	opts.OnServerMessage = onMessage
 
+	return NewServer(address, opts)
+}
+
+// QuickClientWithFS crée un client avec Forward Secrecy personnalisé - NOUVEAU
+func QuickClientWithFS(address, userID string, onMessage func(string, string), fsConfig *KeyRotationConfig) (*Client, error) {
+	opts := DefaultClientOptions()
+	opts.UserID = userID
+	opts.OnMessage = onMessage
+	if fsConfig != nil {
+		opts.KeyRotation = fsConfig
+	}
+	return NewClient(address, opts)
+}
+
+// QuickServerWithFS crée un serveur avec Forward Secrecy personnalisé - NOUVEAU
+func QuickServerWithFS(address string, onMessage func(string, string, string), fsConfig *KeyRotationConfig) (*Server, error) {
+	opts := DefaultClientOptions()
+	opts.OnServerMessage = onMessage
+	if fsConfig != nil {
+		opts.KeyRotation = fsConfig
+	}
 	return NewServer(address, opts)
 }
