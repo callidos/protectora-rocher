@@ -3,11 +3,19 @@ package rocher
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/crypto/hkdf"
+	"golang.org/x/crypto/nacl/secretbox"
 )
 
 // Client représente un client sécurisé simplifié
@@ -575,4 +583,279 @@ func QuickServerWithFS(address string, onMessage func(string, string, string, st
 		opts.KeyRotation = fsConfig
 	}
 	return NewServer(address, opts)
+}
+
+// MessageRequest représente une demande de messages du client
+type MessageRequest struct {
+	ConversationID string `json:"conversation_id"`
+	LastMessageID  string `json:"last_message_id,omitempty"` // Si vide = récupère les X derniers
+	MessageCount   int    `json:"message_count"`             // Nombre de messages demandés
+	JWTToken       string `json:"jwt_token"`                 // Token JWT pour chiffrement
+}
+
+// ConversationMessage représente un message dans une conversation
+type ConversationMessage struct {
+	ID        string `json:"id"`
+	Content   string `json:"content"`
+	Timestamp int64  `json:"timestamp"`
+	Sender    string `json:"sender"`
+	Type      string `json:"type"`
+}
+
+// MessagePack représente un pack de messages
+type MessagePack struct {
+	ConversationID string                `json:"conversation_id"`
+	Messages       []ConversationMessage `json:"messages"`
+	MessageCount   int                   `json:"message_count"`
+	Timestamp      int64                 `json:"timestamp"`
+}
+
+// EncryptedMessagePack représente un pack de messages chiffré
+type EncryptedMessagePack struct {
+	ConversationID string `json:"conversation_id"`
+	EncryptedData  []byte `json:"encrypted_data"`
+	Nonce          []byte `json:"nonce"`
+	MessageCount   int    `json:"message_count"`
+	Timestamp      int64  `json:"timestamp"`
+}
+
+// ===== CHIFFREMENT AVEC JWT =====
+
+// deriveKeyFromJWT dérive une clé de chiffrement à partir du token JWT
+func deriveKeyFromJWT(jwtToken string) ([32]byte, error) {
+	var key [32]byte
+
+	if jwtToken == "" {
+		return key, errors.New("empty JWT token")
+	}
+
+	// Utiliser HKDF pour dériver une clé stable à partir du JWT
+	salt := []byte("rocher-jwt-messaging-v1")
+	info := []byte("message-encryption-key")
+
+	hkdf := hkdf.New(sha256.New, []byte(jwtToken), salt, info)
+
+	if _, err := io.ReadFull(hkdf, key[:]); err != nil {
+		return key, fmt.Errorf("key derivation failed: %w", err)
+	}
+
+	return key, nil
+}
+
+// ===== FONCTION 1: DEMANDE DE MESSAGES DU CLIENT =====
+
+// RequestMessages - Le client demande des messages (côté client)
+func RequestMessages(conversationID, lastMessageID string, messageCount int, jwtToken string) ([]byte, error) {
+	// Validation des paramètres
+	if conversationID == "" {
+		return nil, errors.New("empty conversation ID")
+	}
+	if jwtToken == "" {
+		return nil, errors.New("empty JWT token")
+	}
+	if messageCount <= 0 || messageCount > 100 {
+		return nil, errors.New("invalid message count (1-100)")
+	}
+
+	// Créer la requête
+	req := &MessageRequest{
+		ConversationID: conversationID,
+		LastMessageID:  lastMessageID,
+		MessageCount:   messageCount,
+		JWTToken:       jwtToken,
+	}
+
+	// Sérialiser la requête
+	data, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("serialization failed: %w", err)
+	}
+
+	return data, nil
+}
+
+// ParseMessageRequest - Parse la requête côté serveur (pour validation JWT externe)
+func ParseMessageRequest(requestData []byte) (*MessageRequest, error) {
+	var req MessageRequest
+	if err := json.Unmarshal(requestData, &req); err != nil {
+		return nil, fmt.Errorf("deserialization failed: %w", err)
+	}
+
+	// Validation de base
+	if req.ConversationID == "" {
+		return nil, errors.New("empty conversation ID")
+	}
+	if req.JWTToken == "" {
+		return nil, errors.New("empty JWT token")
+	}
+	if req.MessageCount <= 0 || req.MessageCount > 100 {
+		return nil, errors.New("invalid message count")
+	}
+
+	return &req, nil
+}
+
+// ===== FONCTION 2: ENVOI AU CLIENT =====
+
+// CreateEncryptedMessagePack - Crée un pack de messages chiffré (côté serveur)
+func CreateEncryptedMessagePack(messages []ConversationMessage, conversationID, jwtToken string) ([]byte, error) {
+	if len(messages) == 0 {
+		return nil, errors.New("no messages provided")
+	}
+	if conversationID == "" {
+		return nil, errors.New("empty conversation ID")
+	}
+	if jwtToken == "" {
+		return nil, errors.New("empty JWT token")
+	}
+
+	// Créer le pack de messages
+	messagePack := &MessagePack{
+		ConversationID: conversationID,
+		Messages:       messages,
+		MessageCount:   len(messages),
+		Timestamp:      time.Now().Unix(),
+	}
+
+	// Sérialiser le pack
+	packData, err := json.Marshal(messagePack)
+	if err != nil {
+		return nil, fmt.Errorf("serialization failed: %w", err)
+	}
+
+	// Dériver la clé de chiffrement du JWT
+	key, err := deriveKeyFromJWT(jwtToken)
+	if err != nil {
+		return nil, fmt.Errorf("key derivation failed: %w", err)
+	}
+	defer secureZeroMemory(key[:])
+
+	// Générer un nonce aléatoire
+	var nonce [24]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return nil, fmt.Errorf("nonce generation failed: %w", err)
+	}
+
+	// Chiffrer avec NaCl secretbox
+	encrypted := secretbox.Seal(nil, packData, &nonce, &key)
+
+	// Créer le pack chiffré
+	encryptedPack := &EncryptedMessagePack{
+		ConversationID: conversationID,
+		EncryptedData:  encrypted,
+		Nonce:          nonce[:],
+		MessageCount:   len(messages),
+		Timestamp:      time.Now().Unix(),
+	}
+
+	// Sérialiser le pack chiffré
+	finalData, err := json.Marshal(encryptedPack)
+	if err != nil {
+		return nil, fmt.Errorf("final serialization failed: %w", err)
+	}
+
+	return finalData, nil
+}
+
+// ===== FONCTION 3: RÉCEPTION ET DÉCHIFFREMENT CÔTÉ CLIENT =====
+
+// DecryptMessagePack - Déchiffre un pack de messages (côté client)
+func DecryptMessagePack(encryptedData []byte, jwtToken string) (*MessagePack, error) {
+	if len(encryptedData) == 0 {
+		return nil, errors.New("empty encrypted data")
+	}
+	if jwtToken == "" {
+		return nil, errors.New("empty JWT token")
+	}
+
+	// Désérialiser le pack chiffré
+	var encryptedPack EncryptedMessagePack
+	if err := json.Unmarshal(encryptedData, &encryptedPack); err != nil {
+		return nil, fmt.Errorf("deserialization failed: %w", err)
+	}
+
+	// Validation du pack chiffré
+	if encryptedPack.ConversationID == "" {
+		return nil, errors.New("empty conversation ID")
+	}
+	if len(encryptedPack.EncryptedData) == 0 {
+		return nil, errors.New("empty encrypted data")
+	}
+	if len(encryptedPack.Nonce) != 24 {
+		return nil, errors.New("invalid nonce size")
+	}
+
+	// Dériver la clé de chiffrement du JWT
+	key, err := deriveKeyFromJWT(jwtToken)
+	if err != nil {
+		return nil, fmt.Errorf("key derivation failed: %w", err)
+	}
+	defer secureZeroMemory(key[:])
+
+	// Copier le nonce dans un tableau de taille fixe
+	var nonce [24]byte
+	copy(nonce[:], encryptedPack.Nonce)
+
+	// Déchiffrer avec NaCl secretbox
+	decrypted, ok := secretbox.Open(nil, encryptedPack.EncryptedData, &nonce, &key)
+	if !ok {
+		return nil, errors.New("decryption failed - invalid JWT or corrupted data")
+	}
+
+	// Désérialiser le pack de messages
+	var messagePack MessagePack
+	if err := json.Unmarshal(decrypted, &messagePack); err != nil {
+		return nil, fmt.Errorf("message pack deserialization failed: %w", err)
+	}
+
+	// Validation finale
+	if messagePack.ConversationID == "" {
+		return nil, errors.New("empty conversation ID in decrypted pack")
+	}
+	if messagePack.MessageCount != len(messagePack.Messages) {
+		return nil, errors.New("message count mismatch")
+	}
+
+	return &messagePack, nil
+}
+
+// ===== FONCTIONS UTILITAIRES =====
+
+// ValidateJWTFormat valide le format du JWT (basique)
+func ValidateJWTFormat(jwtToken string) error {
+	if jwtToken == "" {
+		return errors.New("empty JWT token")
+	}
+	if len(jwtToken) < 20 {
+		return errors.New("JWT token too short")
+	}
+	// Vérifier qu'il y a au moins 2 points (header.payload.signature)
+	dots := 0
+	for _, c := range jwtToken {
+		if c == '.' {
+			dots++
+		}
+	}
+	if dots < 2 {
+		return errors.New("invalid JWT format")
+	}
+	return nil
+}
+
+// CreateTestMessages crée des messages de test
+func CreateTestMessages(count int) []ConversationMessage {
+	messages := make([]ConversationMessage, count)
+	baseTime := time.Now().Unix()
+
+	for i := 0; i < count; i++ {
+		messages[i] = ConversationMessage{
+			ID:        fmt.Sprintf("msg_%d", i+1),
+			Content:   fmt.Sprintf("Message de test %d", i+1),
+			Timestamp: baseTime - int64(count-i)*60, // Messages espacés d'une minute
+			Sender:    fmt.Sprintf("user_%d", (i%2)+1),
+			Type:      "text",
+		}
+	}
+
+	return messages
 }
